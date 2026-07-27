@@ -1,0 +1,21 @@
+# Deno / npm
+node_modules/
+dist/
+.aio/
+
+# Rust build tree (the committed artifact is src/llama-sys.wasm)
+rust/target/
+
+# The aio framework is vendored by symlink to a sibling checkout, so it is not
+# part of this repository. See README.md — "Building from source".
+dep/aio
+
+# The quality specs are shared from ~/.katana as symlinks; the app-specific ones
+# are committed, these two are not resolvable outside the author's machine.
+.katana/_aio.md
+.katana/_universal.md
+
+# Local noise
+*.log
+*.swp
+*.deb
