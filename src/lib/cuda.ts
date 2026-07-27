@@ -37,7 +37,7 @@ const MAX_ARCH: [number, number][] = [
 ];
 
 /** Compute capability an architecture number refers to: 90 → 9.0. */
-export const archToCap = (arch: number): number => arch / 10;
+const archToCap = (arch: number): number => arch / 10;
 
 /** `12.0.140` / `12.0` → 12.0. NaN-free: unparseable → 0. */
 export function parseCudaVersion(version: string): number {

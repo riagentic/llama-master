@@ -22,6 +22,12 @@ export type CfgState = {
    *  Kept apart from `settings.ctxSize` so switching model does not inherit a
    *  number chosen for a different one. */
   ctxOverride: number;
+  /** The model the override was chosen for. An override is an instruction about
+   *  ONE model — carrying 128k onto a model trained for 32k silently caps it,
+   *  with nothing on screen saying why — so it is void for any other model.
+   *  Stored rather than cleared on switch because the reset has to hold however
+   *  the model changed: the picker, the Models tab, `am`, or a restored session. */
+  ctxOverrideFor: string;
   /** Re-tune for the selected model every time the server starts.
    *
    *  On by default: a first-time user should get good settings without knowing
@@ -43,6 +49,7 @@ export const cfg = cell("cfg", {
     // out not to fit (see `applyOptimal`).
     placement: "vram" as Placement,
     ctxOverride: 0,
+    ctxOverrideFor: "",
     autoOptimal: true,
     advanced: false,
     touched: [] as string[],
@@ -91,10 +98,12 @@ export const cfg = cell("cfg", {
     setPlacement(s, placement: Placement) {
       s.placement = placement;
     },
-    /** Pin the context, or pass 0 to go back to "the model's trained maximum".
-     *  The tuner treats a pinned value as an instruction, not a suggestion. */
-    setCtxOverride(s, ctx: number) {
+    /** Pin the context for ONE model, or pass 0 to go back to its trained
+     *  maximum. The tuner treats a pinned value as an instruction, not a
+     *  suggestion — so it must not outlive the model it was typed for. */
+    setCtxOverride(s, ctx: number, forModel = "") {
       s.ctxOverride = Number.isFinite(ctx) && ctx > 0 ? Math.floor(ctx) : 0;
+      s.ctxOverrideFor = s.ctxOverride > 0 ? forModel : "";
     },
     toggleAdvanced(s) {
       s.advanced = !s.advanced;

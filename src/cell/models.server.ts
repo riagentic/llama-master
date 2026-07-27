@@ -9,8 +9,13 @@
 
 import { basename, dirname, join } from "@std/path";
 import type { Model, ModelMeta, ModelSource } from "../lib/types.ts";
-import { isOllamaStore, resolveManifest } from "../lib/ollama.ts";
-import { exists } from "./host.server.ts";
+import {
+  isOllamaStore,
+  manifestSkipReason,
+  nameFromManifestPath,
+  resolveManifest,
+} from "../lib/ollama.ts";
+import { exists, PLATFORM } from "./host.server.ts";
 import { gguf } from "./wasm.server.ts";
 import { DEMO_ENV, demoModels } from "../lib/demo.ts";
 
@@ -21,11 +26,23 @@ import { DEMO_ENV, demoModels } from "../lib/demo.ts";
  *  or to hunt for a path is the wrong first impression. */
 export function defaultDirs(): string[] {
   const home = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? "";
-  const dirs = [
-    // ollama's system-service store (Linux packages install it here).
-    "/usr/share/ollama/.ollama/models",
-  ];
+  // ollama's system-service store. Linux packages install it here; on macOS
+  // and Windows ollama runs as the user, so only the per-user path below
+  // applies and this one simply will not exist.
+  const dirs = PLATFORM === "linux" ? ["/usr/share/ollama/.ollama/models"] : [];
   if (!home) return dirs;
+  const platformDirs = PLATFORM === "darwin"
+    // Where a Mac user actually keeps large files, and LM Studio's own default.
+    ? [
+      join(home, "Documents", "models"),
+      join(home, "Library", "Caches", "llama.cpp"),
+    ]
+    : PLATFORM === "windows"
+    ? [
+      join(home, "Documents", "models"),
+      join(home, "AppData", "Local", "llama.cpp"),
+    ]
+    : [];
   return [
     join(home, "models"),
     join(home, "gguf"),
@@ -38,6 +55,7 @@ export function defaultDirs(): string[] {
     join(home, ".lmstudio", "models"),
     // ollama installed as the current user.
     join(home, ".ollama", "models"),
+    ...platformDirs,
     ...dirs,
   ];
 }
@@ -98,8 +116,16 @@ async function* walk(
  *  business in a list of models you can run. */
 async function walkOllama(
   root: string,
-): Promise<{ path: string; name: string; size: number; mtime: number }[]> {
-  const out: { path: string; name: string; size: number; mtime: number }[] = [];
+): Promise<
+  { path: string; name: string; size: number; mtime: number; error?: string }[]
+> {
+  const out: {
+    path: string;
+    name: string;
+    size: number;
+    mtime: number;
+    error?: string;
+  }[] = [];
   const manifests = join(root, "manifests");
   const blobs = join(root, "blobs");
 
@@ -125,7 +151,23 @@ async function walkOllama(
         continue;
       }
       const m = resolveManifest(p, json);
-      if (!m) continue;
+      if (!m) {
+        // A cloud-only entry has nothing on disk to run and is skipped in
+        // silence. A manifest this app cannot parse is a different thing: a
+        // model the user HAS, which would simply not appear, for a reason the
+        // app knew and kept to itself. Listed with the reason instead — that is
+        // what `metaError` is for.
+        if (manifestSkipReason(p, json) === "unreadable") {
+          out.push({
+            path: p,
+            name: nameFromManifestPath(p) || p,
+            size: 0,
+            mtime: 0,
+            error: "ollama manifest could not be read",
+          });
+        }
+        continue;
+      }
       const blobPath = join(blobs, m.blob);
       try {
         const st = await Deno.stat(blobPath);
@@ -211,6 +253,8 @@ export async function scan(
   // ollama models are keyed by digest, so they carry a name the file system
   // does not know. Collected separately and merged in below.
   const named = new Map<string, string>();
+  // Manifests found but unreadable: listed with the reason rather than dropped.
+  const brokenManifests = new Map<string, string>();
 
   for (const dir of dirs) {
     if (!(await exists(dir))) continue;
@@ -228,6 +272,7 @@ export async function scan(
         if (seen.has(m.path)) continue;
         seen.add(m.path);
         named.set(m.path, m.name);
+        if (m.error) brokenManifests.set(m.path, m.error);
         found.push({ path: m.path, size: m.size, mtime: m.mtime });
       }
       continue;
@@ -257,7 +302,12 @@ export async function scan(
     const f = primary[i];
     if (!f) continue;
     onProgress(i, primary.length, basename(f.path));
-    const { meta, error } = await readMeta(f.path);
+    // A manifest we could not parse has no blob to read a header from, so do
+    // not try — report the manifest problem itself.
+    const broken = brokenManifests.get(f.path);
+    const { meta, error } = broken
+      ? { meta: null, error: broken }
+      : await readMeta(f.path);
     const key = f.path.replace(SHARD, "");
     const ollamaName = named.get(f.path);
     models.push({

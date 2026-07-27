@@ -852,8 +852,13 @@ async function untilReady(ui_: { settle: () => Promise<void> }): Promise<void> {
     // tick. Waiting on the status alone made the health assertion below a coin
     // toss (~1 run in 5).
     if (srv.status === "ready" && srv.healthy) {
+      // Re-check AFTER settling rather than assuming: a state patch computed
+      // before the flush can land during it, so the condition that was true
+      // when we tested it is not necessarily true when the caller reads it.
+      // Asserting on a condition the wait no longer guarantees is how this
+      // became a 1-in-5 flake twice over.
       await ui_.settle();
-      return;
+      if (srv.status === "ready" && srv.healthy) return;
     }
     await new Promise((r) => setTimeout(r, 25));
   }
@@ -964,6 +969,11 @@ testUI(
     const bin = await installStubBuild();
     try {
       await withModel(async (dir) => {
+        // Known slate: `startBlocker()` reports the run lock, so a server left
+        // running by any earlier test would fail this one for an unrelated
+        // reason. Tests share a process and these cells are singletons.
+        await srv.stop();
+        await srv.poll();
         await models.addDir(dir);
         await models.scan();
         await builds.scan();
@@ -1003,6 +1013,8 @@ testUI(
     await ui_.settle();
     const bin = await installStubBuild();
     try {
+      await srv.stop(); // known slate — see the note in the lifecycle test
+      await srv.poll();
       const port = freePort();
       const url = `http://127.0.0.1:${port}`;
       await srv.start([bin, "--port", String(port)], url);
@@ -1137,6 +1149,8 @@ testUI(
     const bin = await installStubBuild();
     try {
       await withModel(async (dir) => {
+        await srv.stop(); // known slate — see the note in the lifecycle test
+        await srv.poll();
         await models.addDir(dir);
         await models.scan();
         await builds.scan();
@@ -1220,5 +1234,51 @@ testUI(
     await ui_.expectCell(cfg, (s) => s.autoOptimal === false);
     ui_.find("OnePage")["one-auto-optimal"].click();
     await ui_.expectCell(cfg, (s) => s.autoOptimal === true);
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: a model whose header cannot be read says so",
+  async (ui_) => {
+    await ui_.settle();
+    // Driven through the real scanner with a real (corrupt) ollama store, so
+    // this covers both halves: the scanner listing an unreadable manifest
+    // instead of dropping it, and the page billed as "everything you need"
+    // explaining it. Before, the model vanished entirely; once listed, the page
+    // showed a bare filename and an empty state reading "select a model" —
+    // while a model WAS selected.
+    const dir = await Deno.makeTempDir({ prefix: "llama-master-ollama-" });
+    try {
+      const man = join(
+        dir,
+        "manifests",
+        "registry.ollama.ai",
+        "library",
+        "brokenmodel",
+      );
+      await Deno.mkdir(man, { recursive: true });
+      await Deno.mkdir(join(dir, "blobs"), { recursive: true });
+      await Deno.writeTextFile(join(man, "latest"), "{ this is not json");
+
+      await models.addDir(dir);
+      await models.scan();
+      await ui_.settle();
+
+      const broken = models.items.find((x) => x.file.includes("brokenmodel"));
+      assertExists(broken, "an unreadable manifest must still be listed");
+      assert(broken.metaError, "with the reason attached");
+
+      models.select(broken.path);
+      await ui_.settle();
+      const html = ui_.html();
+      assertStringIncludes(html, "header could not be read");
+      assert(
+        !html.includes("Select a model to see how it fits"),
+        "must not claim nothing is selected when something is",
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
   },
 );

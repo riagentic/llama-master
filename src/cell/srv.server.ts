@@ -10,6 +10,7 @@
 // One server at a time, by design: two llama-servers on one GPU is a
 // configuration mistake, not a feature.
 
+import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
 import { paths, PLATFORM } from "./host.server.ts";
 
@@ -19,6 +20,13 @@ const BIN_NAME = PLATFORM === "windows" ? "llama-server.exe" : "llama-server";
 function buildsRoot(): string {
   const b = paths().builds;
   return b.endsWith("/") ? b : `${b}/`;
+}
+
+/** Is this path genuinely inside the builds directory, after `..` is resolved? */
+function underBuildsRoot(p: string): boolean {
+  const root = resolve(paths().builds);
+  const target = resolve(p);
+  return target === root || target.startsWith(root + SEP);
 }
 
 type Slot = {
@@ -67,7 +75,10 @@ async function pump(stream: ReadableStream<Uint8Array>): Promise<void> {
 export type Orphan = { pid: number; argv: string };
 
 export async function findOrphans(): Promise<Orphan[]> {
-  if (PLATFORM === "windows") return [];
+  // /proc is Linux-only. Guarding on "not windows" sent macOS down a path that
+  // could only throw, so orphan detection was quietly dead there rather than
+  // deliberately absent.
+  if (PLATFORM !== "linux") return [];
   const out: Orphan[] = [];
   const root = buildsRoot();
   const mine = slot?.pid ?? 0;
@@ -157,7 +168,8 @@ export type Status = {
  */
 export async function rss(): Promise<number> {
   const pid = slot?.pid ?? 0;
-  if (!pid || PLATFORM === "windows") return 0;
+  // Same as findOrphans: /proc/<pid>/statm exists on Linux and nowhere else.
+  if (!pid || PLATFORM !== "linux") return 0;
   try {
     // statm: size resident shared text lib data dt — all in pages.
     const txt = await Deno.readTextFile(`/proc/${pid}/statm`);
@@ -192,7 +204,11 @@ export function start(argv: string[]): { pid: number } {
   // The command comes from the UI (so the preview and the spawn cannot drift),
   // which means the binary must be one this app installed — not an arbitrary
   // path a stray action could smuggle in.
-  if (!bin.startsWith(buildsRoot())) {
+  //
+  // Resolved, not compared as text: `<buildsRoot>/../../../../usr/bin/id`
+  // starts with the root as a STRING and escapes it as a PATH, so a plain
+  // `startsWith` was a rule that looked like a sandbox and was not one.
+  if (!underBuildsRoot(bin)) {
     throw new Error(
       `refusing to run ${bin}: only binaries under ${buildsRoot()} may be started`,
     );
@@ -202,6 +218,7 @@ export function start(argv: string[]): { pid: number } {
   exitedAt = 0;
   buffer = [];
   push(`$ ${argv.join(" ")}`);
+  const startedAtGeneration = stopGeneration;
 
   let child: Deno.ChildProcess;
   try {
@@ -213,6 +230,17 @@ export function start(argv: string[]): { pid: number } {
     }).spawn();
   } catch (e) {
     throw new Error(`cannot start ${bin}: ${e}`);
+  }
+
+  // A stop landed while we were spawning: honour it now, before anyone can be
+  // told this server is up.
+  if (stopGeneration !== startedAtGeneration) {
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already gone */ }
+    void child.status;
+    push("[llama.master] start cancelled — stop was requested while spawning");
+    throw new Error("start cancelled by stop");
   }
 
   const s: Slot = { child, pid: child.pid, startedAt: Date.now(), argv };
@@ -253,8 +281,22 @@ export function stopOwned(pid: number, graceMs = 5000): Promise<void> {
   return stop(graceMs);
 }
 
+/**
+ * Bumped by every `stop()`. `start()` captures it before spawning and checks it
+ * after: if a stop arrived in between, the process it just created is killed
+ * immediately instead of being left running.
+ *
+ * This lives here rather than in the cell because it is process lifecycle, not
+ * UI state — and because the cell's own status is exactly the thing that cannot
+ * be trusted across an await. Pressing Stop while a server was still spawning
+ * used to leave it running: `stop` found no process (there wasn't one yet),
+ * returned, and the spawn completed afterwards.
+ */
+let stopGeneration = 0;
+
 /** SIGTERM, then SIGKILL if it is still there. Resolves once it is gone. */
 export async function stop(graceMs = 5000): Promise<void> {
+  stopGeneration++;
   const s = slot;
   if (!s) return;
   try {

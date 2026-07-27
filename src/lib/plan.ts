@@ -68,6 +68,19 @@ export type Plan = {
 
 const MB = 1024 * 1024;
 
+/**
+ * A byte count that can be reasoned about: finite and not negative.
+ *
+ * Header fields come from a file this app did not write. A truncated or hostile
+ * GGUF can yield NaN or a negative, and one such value poisons every total it
+ * touches — silently, because arithmetic does not complain and NaN comparisons
+ * are all false. Clamping here keeps "we could not read this model" looking like
+ * zero rather than like a plan.
+ */
+function whole(n: number): number {
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 function cacheBytes(type: string): number {
   return CACHE_BYTES[type] ?? 2;
 }
@@ -82,18 +95,23 @@ function cacheBytes(type: string): number {
 export function kvPerToken(meta: ModelMeta, s: Settings): number {
   const bk = cacheBytes(str(s, "cacheTypeK"));
   const bv = cacheBytes(str(s, "cacheTypeV"));
-  // head_dim falls back to n_embd / n_head when the model omits key_length.
-  const headDim = meta.nHead > 0 ? meta.nEmbd / meta.nHead : 0;
-  const kLen = meta.keyLength || headDim;
-  const vLen = meta.valueLength || headDim;
-  const heads = meta.nHeadKv || meta.nHead;
+  // head_dim falls back to n_embd / n_head when the model omits key_length —
+  // and `0 / 0` is NaN, which is why every value below is passed through
+  // `whole`. A header this app cannot make sense of must produce a plan that
+  // says "nothing", not one that says "NaN GB" and defeats every fit check
+  // downstream (NaN comparisons are all false, so `overB === 0` and
+  // `freeB >= margin` both quietly stop meaning anything).
+  const headDim = meta.nHead > 0 ? whole(meta.nEmbd) / meta.nHead : 0;
+  const kLen = whole(meta.keyLength) || headDim;
+  const vLen = whole(meta.valueLength) || headDim;
+  const heads = whole(meta.nHeadKv) || whole(meta.nHead);
   // MLA (DeepSeek-V2/V3) caches one compressed latent per token per layer
   // instead of one entry per head: the rank plus the 64-wide RoPE part. Billing
   // it as 128 heads x (192 + 128) overstates V3's cache by about seventy times.
   if (meta.kvLoraRank > 0) {
-    return meta.nLayer * (meta.kvLoraRank + MLA_ROPE_DIM) * bk;
+    return whole(meta.nLayer * (meta.kvLoraRank + MLA_ROPE_DIM) * bk);
   }
-  return meta.nLayer * heads * (kLen * bk + vLen * bv);
+  return whole(meta.nLayer * heads * (kLen * bk + vLen * bv));
 }
 
 /** The RoPE-carrying part of an MLA cache entry, fixed by the architecture. */
@@ -197,19 +215,24 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   let gpuExperts = 0;
   let cpuWeights = 0;
   for (const l of meta.layers) {
-    const dense = l.bytes - l.expert;
+    // Same reasoning as `kvPerToken`: these come out of the file, and a layer
+    // whose experts are larger than the layer itself would otherwise make the
+    // dense figure negative and every total after it wrong.
+    const bytes = whole(l.bytes);
+    const expert = Math.min(whole(l.expert), bytes);
+    const dense = bytes - expert;
     const onGpu = l.i >= firstGpuLayer;
-    const expertsHere = l.i < moeOnCpu ? 0 : l.expert;
+    const expertsHere = l.i < moeOnCpu ? 0 : expert;
     if (onGpu) {
       gpuDense += dense;
       gpuExperts += expertsHere;
-      cpuWeights += l.expert - expertsHere;
+      cpuWeights += expert - expertsHere;
     } else {
-      cpuWeights += l.bytes;
+      cpuWeights += bytes;
     }
   }
   if (fullOffload) {
-    gpuDense += meta.outputBytes + meta.embdBytes;
+    gpuDense += whole(meta.outputBytes) + whole(meta.embdBytes);
   } else {
     cpuWeights += meta.outputBytes + meta.embdBytes;
   }
@@ -223,7 +246,7 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   // `-ub` tokens at a time. Four activation-sized tensors is the empirical
   // shape of the graph; the backend context is a flat per-process cost.
   const ubatch = Math.max(1, num(s, "ubatchSize"));
-  const activation = ubatch * meta.nEmbd * 4;
+  const activation = ubatch * whole(meta.nEmbd) * 4;
   const usingGpu = layersOnGpu > 0 || fullOffload;
   const gpuCompute = usingGpu
     ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length)

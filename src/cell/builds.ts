@@ -273,9 +273,11 @@ export const builds = cell("builds", {
         lines?: string[];
       }) => {
         // Read the live status (a cancel lands in state, not in `job`), but
-        // build the next value from the PLAIN local — spreading a value read
-        // back out of state hands the store a proxy-derived object, which it
-        // rejects wholesale ("preventExtensions on proxy").
+        // build the next value from the PLAIN local. This used to be forced:
+        // spreading a value read back out of state handed the store a
+        // proxy-derived object and it rejected the whole action. aio alpha38
+        // lifted that, so it is now just the clearer shape — one obvious owner
+        // of the job's fields, and no re-copy of state on every progress tick.
         if (s.job?.status !== "running") return;
         job.step = p.step;
         job.steps = p.steps;

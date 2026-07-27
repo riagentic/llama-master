@@ -212,8 +212,16 @@ export function stripRoot(entries: Entry[]): Entry[] {
 
 /** Does this path stay inside the destination directory? */
 function contained(p: string): boolean {
-  if (p === "" || p.startsWith("/") || /^[A-Za-z]:/.test(p)) return false;
-  return !p.split("/").includes("..");
+  // Backslashes count as separators, not as filename characters. An archive
+  // written on Windows spells the traversal `..\..\evil`, which has no `/`
+  // component and so used to sail straight through this check — harmless on
+  // Linux (it makes one oddly-named file) and an escape on Windows, which this
+  // app supports.
+  const norm = p.replace(/\\/g, "/");
+  if (norm === "" || norm.startsWith("/") || /^[A-Za-z]:/.test(norm)) {
+    return false;
+  }
+  return !norm.split("/").includes("..");
 }
 
 /** Reject entries that would escape the destination directory (zip-slip), and

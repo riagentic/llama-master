@@ -14,15 +14,14 @@ import { cfg } from "../cell/cfg.ts";
 import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
-import { argv, commandLine, serverUrl } from "../lib/command.ts";
-import { plan as computePlan } from "../lib/plan.ts";
-import type { Plan } from "../lib/plan.ts";
+import { argv, serverUrl } from "../lib/command.ts";
 import { bestPlacement, PLACEMENTS, tuneAll } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
 import type { Stability } from "../lib/stability.ts";
 import {
   activeBuild,
+  ctxOverride,
   currentModel,
   hwSnapshot,
   serverRunning,
@@ -37,30 +36,6 @@ export function serverBin(): string {
 
 export function cliBin(): string {
   return activeBuild()?.cliBin ?? "";
-}
-
-/** The memory plan for the current model/settings/machine, or null when there
- *  is nothing to plan yet. */
-export function currentPlan(): Plan | null {
-  const m = currentModel();
-  if (!m?.meta) return null;
-  return computePlan(m.meta, hwSnapshot(), cfg.settings);
-}
-
-export function serverCommand(): string {
-  return commandLine("server", {
-    bin: serverBin() || "llama-server",
-    model: currentModel()?.path ?? "",
-    settings: cfg.settings,
-  });
-}
-
-export function cliCommand(): string {
-  return commandLine("cli", {
-    bin: cliBin() || "llama-cli",
-    model: currentModel()?.path ?? "",
-    settings: cfg.settings,
-  });
 }
 
 export function endpoint(): string {
@@ -104,13 +79,8 @@ export function placements(): Record<Placement, Tuning> | null {
     m.meta,
     hwSnapshot(),
     cfg.settings,
-    cfg.ctxOverride || undefined,
+    ctxOverride() || undefined,
   );
-}
-
-/** What the SELECTED placement gives, or null when there is no model. */
-export function currentTuning(): Tuning | null {
-  return placements()?.[cfg.placement] ?? null;
 }
 
 /**

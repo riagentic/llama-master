@@ -223,6 +223,24 @@ cannot act on is a bug.
   Reporting "not running" early replaced "cudaMalloc failed: out of memory" with
   the generic fallback on precisely the failures that happen fastest.
   `srv.server.ts` awaits both pumps first.
+- **Never early-return from `stop` on a status a pending `start` has not written
+  yet.** `srv.stop()` skipped its work when the status read "stopped" — which is
+  exactly what it reads between a Start being dispatched and its body running.
+  Stop did nothing, the spawn completed a moment later, and a server the user
+  had cancelled sat there holding its VRAM while the UI said "stopped".
+  Cancellation now lives in `srv.server.ts` as `stopGeneration`, which the spawn
+  checks after creating the process: it is the module that owns the process, and
+  it is not subject to cell-state timing. Pinned in `tests/server.test.ts`.
+- **Clamp everything that comes out of a GGUF header.** A truncated or hostile
+  file can yield NaN or a negative, `nHead: 0` makes the head-dim fallback
+  `0 / 0`, and one such value poisons every total it reaches — silently, because
+  NaN comparisons are all FALSE, so `overB === 0` and `freeB >= margin` quietly
+  stop meaning anything and the tuner's fit checks become coin flips.
+  `plan.ts:whole()` is the one gate; a hostile-header test pins it.
+- **Compare paths resolved, never as text.** `bin.startsWith(buildsRoot())`
+  accepted `<buildsRoot>/../../../../usr/bin/id` — a rule that read like a
+  sandbox and was not one. Archive containment had the mirror bug: it split on
+  `/` only, so a Windows-spelled `..\..\evil` walked straight through.
 - **Fail loud.** A missing binary, an unreadable header, a 404 — surface it in
   `lastError` and render it. Never swallow.
 - **`.slice()`, not spread**, on live async state arrays.

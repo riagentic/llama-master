@@ -51,6 +51,7 @@ import { OrphanBanner, ServerLog, StatusPill } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
   canSend,
+  ctxOverride,
   currentModel,
   hwSnapshot,
   memoryIsLive,
@@ -186,7 +187,7 @@ function RunStrip() {
   // settles in one pass because re-tuning does not change the key.
   const tunedFor = useRef("");
   const key =
-    `${models.selected}|${builds.activeId}|${cfg.placement}|${cfg.ctxOverride}`;
+    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}`;
   afterRender(() => {
     if (tunedFor.current === key) return;
     if (!cfg.autoOptimal || serverRunning() || !currentModel()?.meta) return;
@@ -209,7 +210,7 @@ function RunStrip() {
     // field as well as in the tuner — showing 64,000 "of 32,768 trained" was
     // displaying a number that could never be used.
     : Math.min(
-      cfg.ctxOverride || all?.[cfg.placement]?.ctx ||
+      ctxOverride() || all?.[cfg.placement]?.ctx ||
         num(shownSettings(), "ctxSize"),
       target || Infinity,
     );
@@ -323,13 +324,14 @@ function RunStrip() {
               onChange={(e) =>
                 cfg.setCtxOverride(
                   Number((e.currentTarget as HTMLInputElement).value),
+                  models.selected,
                 )}
             />
             {target > 0
               ? (
                 <span class="unit">
                   of {target.toLocaleString()} trained
-                  {cfg.ctxOverride > 0
+                  {ctxOverride() > 0
                     ? (
                       <>
                         {" · "}
@@ -387,6 +389,16 @@ function RunStrip() {
             </button>
           )}
       </div>
+
+      {m?.metaError
+        ? (
+          <div class="error-note" t="one-model-error">
+            <b>{m.file}</b> — header could not be read:{" "}
+            {m.metaError}. Nothing can be planned or started from it; pick
+            another model, or re-download this one.
+          </div>
+        )
+        : null}
 
       {locked
         ? (
@@ -613,8 +625,12 @@ export function OnePage() {
           : (
             <Empty
               icon="▢"
-              title="Select a model to see how it fits"
-              hint="Press Detect if the list is empty."
+              title={shownModel()
+                ? "This model's header could not be read"
+                : "Select a model to see how it fits"}
+              hint={shownModel()
+                ? "Nothing can be measured without it — the Models tab shows why."
+                : "Press Detect if the list is empty."}
             />
           )}
       </Panel>

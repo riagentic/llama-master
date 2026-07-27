@@ -119,14 +119,34 @@ export const srv = cell("srv", {
           },
         }));
       } catch (e) {
+        // A refused duplicate start is not a crash — an impatient double-click
+        // used to leave the cell "crashed" with pid 0 while the first server ran
+        // happily, so the panel showed a dead server that was in fact serving.
+        const msg = String(e);
+        // Stop won the race: the server module killed what it had just spawned
+        // (see `stopGeneration`), so this is a completed cancellation.
+        if (msg.includes("cancelled by stop")) {
+          s.status = "stopped";
+          s.pid = 0;
+          return;
+        }
+        if (msg.includes("already running")) {
+          s.status = "starting"; // the poll below will confirm it is up
+          return;
+        }
         s.status = "crashed";
-        s.lastError = String(e);
+        s.lastError = msg;
         s.pid = 0;
       }
     },
 
     async stop(s): Promise<CellEffect | void> {
-      if (s.status === "stopped") return;
+      // No early return on `status === "stopped"`, however tempting: a Start
+      // that has been dispatched but whose body has not run yet leaves the
+      // status at "stopped", so short-circuiting here meant Stop did nothing
+      // and the server the user cancelled came up a moment later and kept its
+      // memory. Reaching `io.stop()` is what registers the cancellation
+      // (`stopGeneration`), and it is a cheap no-op when nothing is running.
       s.status = "stopping";
       try {
         const io = await import("./srv.server.ts");
@@ -185,6 +205,11 @@ export const srv = cell("srv", {
       // than inside the sync status snapshot.
       const rssB = await io.rss();
       if (rssB !== s.rssB) s.rssB = rssB; // aiol-ok — see the note above
+
+      // Single writer of liveness means the pid too: anything that leaves the
+      // cell's copy stale (a refused duplicate start, a restart) is corrected
+      // here rather than showing pid 0 next to a running server.
+      if (st.pid !== s.pid) s.pid = st.pid; // aiol-ok — see the note above
 
       const h = await io.health(s.url); // aiol-ok — see the note above
       s.healthy = h.ok;

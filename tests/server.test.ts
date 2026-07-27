@@ -15,6 +15,7 @@ import {
   assertEquals,
   assertRejects,
   assertStringIncludes,
+  assertThrows,
 } from "@std/assert";
 import { join } from "@std/path";
 
@@ -277,5 +278,90 @@ Deno.test({
     );
     assertStringIncludes(srv.diagnosis?.reason ?? "", "GPU ran out of memory");
     await srv.clearLog();
+  },
+});
+
+Deno.test({
+  name:
+    "srv: a path that only textually starts with the builds root is refused",
+  fn: () => {
+    // `<buildsRoot>/../../../../usr/bin/id` starts with the root as a STRING
+    // and leaves it as a PATH. The guard compared text, so the rule that reads
+    // like a sandbox ("only binaries this app installed") was not one.
+    const escape = join(
+      paths().builds,
+      "..",
+      "..",
+      "..",
+      "..",
+      "usr",
+      "bin",
+      "id",
+    );
+    assertThrows(
+      () => io.start([escape]),
+      Error,
+      "refusing to run",
+    );
+    // The legitimate case still works: verified by the lifecycle tests above,
+    // which spawn a stub from inside the builds directory.
+  },
+});
+
+Deno.test({
+  name: "srv: Stop during startup cancels it, rather than letting it come up",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // Found by probing an impatient user. `srv.stop()` early-returned when the
+    // status was "stopped" — and a Start that has been dispatched but whose
+    // body has not run yet leaves it exactly there. So Stop did nothing, the
+    // spawn completed afterwards, and a server the user had cancelled was left
+    // running and holding its memory with the UI saying "stopped".
+    const bin = await installStub();
+    const port = freePort();
+    using _boot = await bootCells([srv]);
+
+    const starting = srv.start(
+      [bin, "--port", String(port)],
+      `http://127.0.0.1:${port}`,
+    );
+    await srv.stop();
+    await starting;
+    await srv.poll();
+
+    assertEquals(srv.status, "stopped");
+    assertEquals(srv.pid, 0);
+    assertEquals(io.status().running, false, "nothing may be left running");
+  },
+});
+
+Deno.test({
+  name: "srv: a double Start leaves one server and an accurate pid",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // An impatient double-click: the second start is refused by the process
+    // module, which used to mark the cell "crashed" with pid 0 while the first
+    // server ran happily — a dead-looking panel in front of a live server.
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv]);
+
+    await Promise.all([
+      srv.start([bin, "--port", String(port)], url),
+      srv.start([bin, "--port", String(port)], url),
+    ]);
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.status === "ready";
+    }, "the server to report ready");
+
+    assert(srv.pid > 0, `the pid must be accurate, got ${srv.pid}`);
+    assertEquals(io.status().pid, srv.pid, "and match the real process");
+    assertEquals((await io.findOrphans()).length, 0, "no second process");
+
+    await srv.stop();
   },
 });

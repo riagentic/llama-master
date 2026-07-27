@@ -68,6 +68,7 @@ import {
 import { buildNumber, updateFor, updateTarget } from "../src/lib/update.ts";
 import {
   isOllamaStore,
+  manifestSkipReason,
   nameFromManifestPath,
   resolveManifest,
 } from "../src/lib/ollama.ts";
@@ -2520,4 +2521,101 @@ Deno.test("demo: the demo machine and library are internally consistent", () => 
     );
     assertEquals(bestPlacement(all) in all, true);
   }
+});
+
+Deno.test("plan: a header this app cannot read produces zeros, never NaN", () => {
+  // GGUF headers come from files this app did not write. A truncated or hostile
+  // one can yield NaN, a negative, or `nHead: 0` (which makes the head-dim
+  // fallback `0 / 0`). One such value used to poison every total it touched —
+  // silently, because arithmetic does not complain and NaN comparisons are all
+  // FALSE, so `overB === 0` and `freeB >= margin` quietly stopped meaning
+  // anything and the tuner's fit checks became coin flips.
+  const machine = hw({ gpus: [gpu(24, 0)] });
+  const broken = [
+    meta({ nEmbd: Number.NaN }),
+    meta({ nHead: 0, nHeadKv: 0, keyLength: 0, valueLength: 0 }),
+    meta({ nLayer: 1, layers: [{ i: 0, bytes: -100, expert: -5 }] }),
+    // Experts larger than the layer that holds them: dense would go negative.
+    meta({ nLayer: 1, layers: [{ i: 0, bytes: 100, expert: 500 }] }),
+    meta({ nLayer: 0, layers: [] }),
+    meta({ embdBytes: Number.NaN, outputBytes: Number.NaN }),
+  ];
+  for (const m of broken) {
+    const p = plan(m, machine, { ...defaults(), ngl: 999 });
+    for (
+      const [label, v] of [
+        ["vram.usedB", p.vram.usedB],
+        ["ram.usedB", p.ram.usedB],
+        ["kvTotalB", p.kvTotalB],
+        ["kvPerTokenB", p.kvPerTokenB],
+        ["vram.freeB", p.vram.freeB],
+        ["vram.overB", p.vram.overB],
+      ] as const
+    ) {
+      assert(Number.isFinite(v), `${m.name}: ${label} = ${v}`);
+      assert(v >= 0, `${m.name}: ${label} is negative (${v})`);
+    }
+    // And the tuner still returns a usable answer rather than throwing.
+    const t = tune(m, machine, defaults(), "vram");
+    assert(Number.isFinite(t.ctx), `${m.name}: ctx = ${t.ctx}`);
+  }
+});
+
+Deno.test("archive: a Windows-spelled traversal does not escape either", () => {
+  // `contained` split on "/" only, so an archive written on Windows spelling
+  // the traversal `..\..\evil` had no ".." component and sailed through —
+  // harmless on Linux (one oddly-named file), an escape on Windows.
+  const e = (name: string, link?: string) => ({
+    name,
+    link,
+    mode: 0o644,
+    size: 0,
+    data: new Uint8Array(),
+    type: "file" as const,
+  });
+  const kept = safeEntries([
+    e("../../evil"),
+    e("..\\..\\evil"),
+    e("a/..\\../evil"),
+    e("/etc/passwd"),
+    e("C:\\Windows\\evil"),
+    e("link", "../../etc/passwd"),
+    e("link2", "..\\..\\etc\\shadow"),
+    e("ok/file"),
+  ] as never).map((x) => x.name);
+  assertEquals(kept, ["ok/file"], "only the contained entry survives");
+});
+
+Deno.test("ollama: a broken manifest is distinguished from a cloud-only one", () => {
+  // Both used to return null, so the scanner could not tell them apart and
+  // dropped both in silence. A cloud entry has nothing on disk and SHOULD be
+  // skipped; an unparseable manifest is a model the user has that would simply
+  // never appear — the exact "silent absence" this app promises not to do.
+  const path = "/x/manifests/registry.ollama.ai/library/demo/latest";
+
+  const good = JSON.stringify({
+    layers: [{
+      mediaType: "application/vnd.ollama.image.model",
+      digest: "sha256:abc",
+      size: 10,
+    }],
+  });
+  assertEquals(manifestSkipReason(path, good), null, "a real model is no skip");
+
+  const cloud = JSON.stringify({ layers: null });
+  assertEquals(manifestSkipReason(path, cloud), "cloud-only");
+  assertEquals(
+    manifestSkipReason(path, JSON.stringify({ layers: [] })),
+    "cloud-only",
+  );
+
+  assertEquals(manifestSkipReason(path, "{not json"), "unreadable");
+  // Parses, has layers, but none of them are the model blob.
+  const odd = JSON.stringify({
+    layers: [{
+      mediaType: "application/vnd.ollama.image.license",
+      digest: "sha256:z",
+    }],
+  });
+  assertEquals(manifestSkipReason(path, odd), "unreadable");
 });

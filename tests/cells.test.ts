@@ -354,4 +354,27 @@ Deno.test("cfg: optimal-automatically is on by default and can be switched off",
   assertEquals(cfg.autoOptimal, false, "and it can be switched off");
   await cfg.toggleAutoOptimal();
   assertEquals(cfg.autoOptimal, true);
+
+  // Same boot, because a cell def binds to exactly one app per process: a
+  // second bootCells([cfg]) in this file is an error, not a style choice.
+  //
+  // The leak this covers: `ctxOverride` persists, and only the All-in-one
+  // dropdown cleared it — so selecting a model from the Models tab, from `am`,
+  // or restoring a session carried a number chosen for a different model. On a
+  // model trained shorter it silently capped the context, with nothing on
+  // screen saying why.
+  await cfg.setCtxOverride(128000, "/models/big.gguf");
+  assertEquals(cfg.ctxOverride, 128000);
+  assertEquals(cfg.ctxOverrideFor, "/models/big.gguf");
+
+  // Clearing forgets which model it belonged to, so it cannot come back.
+  await cfg.setCtxOverride(0);
+  assertEquals(cfg.ctxOverride, 0);
+  assertEquals(cfg.ctxOverrideFor, "");
+
+  // Rubbish is rejected rather than stored as NaN.
+  await cfg.setCtxOverride(Number.NaN, "/models/big.gguf");
+  assertEquals(cfg.ctxOverride, 0);
+  await cfg.setCtxOverride(-5, "/models/big.gguf");
+  assertEquals(cfg.ctxOverride, 0);
 });

@@ -54,6 +54,33 @@ export function nameFromManifestPath(path: string): string | null {
  * a **cloud** model (`"layers": null`), which ollama registers locally but runs
  * remotely. There is nothing on disk to load, so it must not be listed.
  */
+/**
+ * Why a manifest produced no model.
+ *
+ * The distinction is the point: a cloud-only entry SHOULD be skipped in
+ * silence — there is nothing on disk to run — while a manifest this app cannot
+ * parse means a model the user has, that they will not see, for a reason the
+ * app knows and used to keep to itself. Returning both as `null` made those two
+ * indistinguishable to the caller.
+ */
+export type ManifestSkip = "cloud-only" | "unreadable";
+
+export function manifestSkipReason(
+  path: string,
+  json: string,
+): ManifestSkip | null {
+  if (resolveManifest(path, json)) return null;
+  try {
+    const m = JSON.parse(json) as Manifest;
+    // Parsed fine, but carries no local weights: an ollama cloud entry.
+    return (m.layers ?? []).length === 0 || !m.layers
+      ? "cloud-only"
+      : "unreadable";
+  } catch {
+    return "unreadable";
+  }
+}
+
 export function resolveManifest(
   path: string,
   json: string,

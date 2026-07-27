@@ -28,14 +28,7 @@ import { str } from "../lib/params.ts";
 import { updateFor } from "../lib/update.ts";
 import type { UpdateCheck } from "../lib/update.ts";
 import type { FixPlan } from "../lib/fixplan.ts";
-import type {
-  Build,
-  Hw,
-  Model,
-  ParamValue,
-  Prereq,
-  Settings,
-} from "../lib/types.ts";
+import type { Build, Hw, Model, Prereq, Settings } from "../lib/types.ts";
 
 // ── models ─────────────────────────────────────────────────────────────────
 
@@ -116,11 +109,6 @@ export function prereqById(id: string): Prereq | null {
   return prereq.items.find((i) => i.id === id) ?? null;
 }
 
-export function canBuildFromSource(): boolean {
-  const ok = (id: string) => prereqById(id)?.found === true;
-  return ok("cmake") && ok("compiler");
-}
-
 /** Ids of every prerequisite that was detected — the input `canCompile` wants. */
 export function foundPrereqs(): Set<string> {
   return new Set(prereq.items.filter((i) => i.found).map((i) => i.id));
@@ -138,10 +126,6 @@ export function fixablePrereqs(): Prereq[] {
 }
 
 // ── settings ───────────────────────────────────────────────────────────────
-
-export function settingValue(key: string): ParamValue | undefined {
-  return cfg.settings[key];
-}
 
 export function isTouched(key: string): boolean {
   return cfg.touched.includes(key);
@@ -173,6 +157,17 @@ export function shownModel(): Model | null {
     return models.items.find((m) => m.path === path) ?? currentModel();
   }
   return currentModel();
+}
+
+/**
+ * The pinned context, or 0.
+ *
+ * An override belongs to the model it was typed for; for any other model it is
+ * void. Without this, a 128k pin chosen for a 262k model silently capped a 32k
+ * model, and nothing on screen said why.
+ */
+export function ctxOverride(): number {
+  return cfg.ctxOverrideFor === models.selected ? cfg.ctxOverride : 0;
 }
 
 /** Is the memory view describing a live process rather than a plan? */
