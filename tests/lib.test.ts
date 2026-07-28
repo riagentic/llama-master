@@ -39,11 +39,20 @@ import {
   withoutOurUsage,
 } from "../src/lib/plan.ts";
 import {
+  drift,
+  HEADROOM_FRACTION,
+  headroomBucket,
+  headroomKey,
+} from "../src/lib/adapt.ts";
+import {
   bestPlacement,
+  CTX_BANDS,
   CTX_PRESETS,
+  ctxBands,
   ctxLabel,
   MIN_CTX,
   optimalCtx,
+  pinnedCtx,
   tune,
   tuneAll,
 } from "../src/lib/tune.ts";
@@ -2777,4 +2786,312 @@ Deno.test("disk: a filesystem too full for a source build is flagged", () => {
   assertEquals(tooFullToBuild(roomy), false);
   assertEquals(tooFullToBuild(tight), true, "2 GB will not hold a cmake tree");
   assertEquals(tooFullToBuild(null), false, "unknown is not a failure");
+});
+
+Deno.test("tune: a pinned context is clamped the same way everywhere", () => {
+  // This clamp used to exist twice — once in the tuner, once inline in the
+  // all-in-one page — and the UI copy had dropped the floor. A pin of 512
+  // therefore RENDERED as 512 and RAN as 2048, which is the one thing a "what you
+  // see is what runs" app must not do.
+  assertEquals(
+    pinnedCtx(512, 32768),
+    MIN_CTX,
+    "below the floor comes up to it",
+  );
+  assertEquals(pinnedCtx(64000, 32768), 32768, "above the model comes down");
+  assertEquals(pinnedCtx(16384, 32768), 16384, "in range is left alone");
+  // No model header yet: the ceiling is unknown, so only the floor applies.
+  assertEquals(pinnedCtx(16384, 0), 16384);
+  assertEquals(pinnedCtx(100, 0), MIN_CTX);
+});
+
+Deno.test("tune: with no memory reading yet, nothing is proposed", () => {
+  // The boot race, which shipped: `models.scan()` and `hw.refresh()` resolve
+  // within milliseconds of each other, and when models won the tuner was asked to
+  // plan against a machine of unknown size. It answered "yes, 131,072 tokens" for
+  // a plan needing 78 GB of host RAM, `cfg.setPlacement` PERSISTED the CPU
+  // fallback, and the GPU then sat idle for good. Refusing costs one poll.
+  const big = meta({
+    name: "70B",
+    nLayer: 80,
+    nHeadKv: 8,
+    nCtxTrain: 131072,
+    layers: layers(80, 420 * 1024 * 1024),
+  });
+  for (const placement of ["vram", "hybrid", "cpu"] as const) {
+    const t = tune(big, hw({ mem: null }), defaults(), placement);
+    assertEquals(t.possible, false, `${placement} must not claim to fit`);
+    assertStringIncludes(
+      t.blocker,
+      "memory reading has not arrived",
+      "and it says WHY, not 'needs more RAM than is free'",
+    );
+  }
+  // And the moment the reading lands, the same call succeeds.
+  assertEquals(tune(big, hw(), defaults(), "cpu").possible, true);
+});
+
+Deno.test("tune: a quantised cache is also taken to keep work off the host", () => {
+  // It used to be taken only when it bought CONTEXT. A long-context MoE that
+  // reaches its full trained length either way can still be paying for it with
+  // gigabytes of experts and cache in system RAM — which cross PCIe on every
+  // single token. Halving the cache brings some of that back onto the card at the
+  // same context, and that is worth more than the quality q8_0 costs.
+  const MB = 1024 * 1024;
+  const m = meta({
+    name: "Long MoE",
+    nLayer: 41,
+    nCtxTrain: 65536,
+    nHeadKv: 2,
+    keyLength: 256,
+    valueLength: 256,
+    nExpert: 128,
+    nExpertUsed: 8,
+    layers: layers(41, 900 * MB, 820 * MB),
+  });
+  const machine = hw({ gpus: [gpu(12, 0.5), gpu(12, 0.5)], backend: "cuda" });
+
+  const chosen = tune(m, machine, defaults(), "hybrid");
+
+  assertEquals(chosen.settings.cacheTypeK, "q8_0");
+  assertEquals(chosen.settings.cacheTypeV, "q8_0");
+  // It was not the context that motivated it: the full trained length is reached
+  // either way, so the only thing q8_0 can be buying here is residency.
+  assertEquals(chosen.ctx, optimalCtx(m), "full trained context is reached");
+  assert(
+    chosen.reasons.some((r) => r.includes("back onto the GPU")),
+    `and the reason says residency, not context: ${chosen.reasons.join(" | ")}`,
+  );
+  // The counterfactual: this exact placement with a full-precision cache does
+  // NOT fit the cards, which is what q8_0 is paying for.
+  const asF16 = plan(m, machine, {
+    ...chosen.settings,
+    cacheTypeK: "f16",
+    cacheTypeV: "f16",
+  });
+  assert(
+    asF16.vram.overB > 0,
+    `f16 at the same placement must overflow VRAM, got ${asF16.vram.overB}`,
+  );
+});
+
+Deno.test("tune: the context bands are ordered, clamped, and honest about Max", () => {
+  // The kata asks for Min / Opt / Big / Max. Only Max is a fact — `nCtxTrain`,
+  // the length the model was actually trained for. Opt and Big are estimates and
+  // the UI marks them; what this pins is that they are always ORDERED and never
+  // past Max, including for the awkward models where the whole range collapses.
+  for (const trained of [128, 512, 2048, 8192, 32768, 131072, 1048576]) {
+    const b = ctxBands(meta({ nCtxTrain: trained }));
+    const target = optimalCtx(meta({ nCtxTrain: trained }));
+    assertEquals(b.max, target, `Max is the trained length for ${trained}`);
+    assert(
+      b.min <= b.opt && b.opt <= b.big && b.big <= b.max,
+      `ordered at ${trained}: ${JSON.stringify(b)}`,
+    );
+    assert(b.min > 0, `every band is usable at ${trained}`);
+    for (const [k, v] of Object.entries(b)) {
+      assert(
+        Number.isFinite(v) && v > 0 && v <= b.max,
+        `${k}=${v} must be finite and within Max at ${trained}`,
+      );
+    }
+  }
+
+  // A tiny model collapses to its own ceiling rather than producing a range that
+  // runs past what it can do.
+  const tiny = ctxBands(meta({ nCtxTrain: 256 }));
+  assertEquals(tiny.max, 256);
+  assertEquals(tiny.min, 256, "nothing below Max is offered for a 256 model");
+
+  // And the shape on a normal long-context model is the documented one.
+  const long = ctxBands(meta({ nCtxTrain: 131072 }));
+  assertEquals(long, { min: 4096, opt: 32768, big: 65536, max: 131072 });
+
+  // Exactly one band is presented as measured.
+  assertEquals(
+    CTX_BANDS.filter((b) => !b.estimated).map((b) => b.id),
+    ["max"],
+    "Max is read from the model; the rest are estimates and must say so",
+  );
+});
+
+Deno.test("adapt: headroom buckets react to real change and ignore jitter", () => {
+  const GB = 1024 ** 3;
+  const cap = 48 * GB;
+
+  // The whole point: a game taking VRAM crosses a boundary, telemetry noise does
+  // not. These machines are workstations where the raw number never holds still,
+  // and keying a re-tune on it would rewrite the user's settings every second.
+  const quiet = headroomBucket(40 * GB, cap);
+  assertEquals(headroomBucket(40 * GB - 200 * 1024 ** 2, cap), quiet, "jitter");
+  assertEquals(headroomBucket(39.8 * GB, cap), quiet, "still jitter");
+  assert(
+    headroomBucket(20 * GB, cap) < quiet,
+    "a game taking 20 GB is news",
+  );
+  // And the other direction — it has to notice memory coming BACK, or the app
+  // keeps running at a third of the card because a game was open when it planned.
+  assert(
+    headroomBucket(46 * GB, cap) > headroomBucket(20 * GB, cap),
+    "memory freed is news too",
+  );
+
+  // Both pools, in one key, and either moving is enough.
+  const base = {
+    vramFreeB: 40 * GB,
+    vramCapacityB: cap,
+    ramFreeB: 120 * GB,
+    ramCapacityB: 186 * GB,
+  };
+  assertEquals(headroomKey(base), headroomKey({ ...base }), "stable");
+  assert(
+    headroomKey({ ...base, vramFreeB: 8 * GB }) !== headroomKey(base),
+    "VRAM alone moves the key",
+  );
+  assert(
+    headroomKey({ ...base, ramFreeB: 10 * GB }) !== headroomKey(base),
+    "RAM alone moves the key",
+  );
+
+  // Hostile and unread inputs give a stable answer, not NaN — this is a cache
+  // key, and a NaN in it would re-tune forever.
+  for (
+    const [free, capacity] of [[NaN, cap], [1, 0], [-5, cap], [cap * 9, cap]]
+  ) {
+    const b = headroomBucket(free as number, capacity as number);
+    assert(Number.isInteger(b) && b >= 0, `bucket(${free},${capacity}) = ${b}`);
+  }
+  // Bounded, so a re-tune can only fire a few times across a pool's whole range.
+  assert(headroomBucket(cap, cap) <= 1 / HEADROOM_FRACTION, "few buckets");
+});
+
+Deno.test("adapt: a running model is told about drift, in both directions", () => {
+  const GB = 1024 ** 3;
+  const running = { startedVramB: 10 * GB, startedRamB: 4 * GB };
+
+  // Nothing happening.
+  assertEquals(
+    drift({
+      ...running,
+      vramOverB: 0,
+      ramOverB: 0,
+      vramFreeB: 1 * GB,
+      ramFreeB: 1 * GB,
+    })
+      .kind,
+    "none",
+  );
+  // Someone else took memory this server depends on — either pool counts.
+  const squeezedV = drift({
+    ...running,
+    vramOverB: 3 * GB,
+    ramOverB: 0,
+    vramFreeB: 0,
+    ramFreeB: 1 * GB,
+  });
+  assertEquals(squeezedV.kind, "squeezed");
+  assertEquals(
+    drift({
+      ...running,
+      vramOverB: 0,
+      ramOverB: 2 * GB,
+      vramFreeB: 1 * GB,
+      ramFreeB: 0,
+    })
+      .kind,
+    "squeezed",
+    "RAM pressure counts as much as VRAM",
+  );
+  // Memory came back, and enough of it to be worth a restart.
+  assertEquals(
+    drift({
+      ...running,
+      vramOverB: 0,
+      ramOverB: 0,
+      vramFreeB: 9 * GB,
+      ramFreeB: 0,
+    })
+      .kind,
+    "roomier",
+  );
+  // But a sliver is not worth interrupting anyone over.
+  assertEquals(
+    drift({
+      ...running,
+      vramOverB: 0,
+      ramOverB: 0,
+      vramFreeB: 0.3 * GB,
+      ramFreeB: 0.2 * GB,
+    }).kind,
+    "none",
+    "3% more is not news",
+  );
+  // Squeezed always wins over roomier — one pool starving is the urgent fact.
+  assertEquals(
+    drift({
+      ...running,
+      vramOverB: 2 * GB,
+      ramOverB: 0,
+      vramFreeB: 0,
+      ramFreeB: 80 * GB,
+    })
+      .kind,
+    "squeezed",
+  );
+});
+
+Deno.test("tune: a refusal names the constraint that actually binds", () => {
+  // The reported bug, in the message layer. This used to say "does not fit in
+  // 47.8 GB of VRAM" — the card's CAPACITY — when the real reason was that only
+  // 4.8 GB of it was free. That reads as a claim about the model, sends the user
+  // looking for a smaller quantisation, and is not what happened.
+  const GB = 1024 ** 3;
+  const big = meta({
+    name: "35B MoE",
+    nLayer: 41,
+    nCtxTrain: 262144,
+    nHeadKv: 2,
+    keyLength: 256,
+    valueLength: 256,
+    nExpert: 256,
+    nExpertUsed: 8,
+    layers: layers(41, 880 * 1024 ** 2, 840 * 1024 ** 2),
+  });
+  // Two 24 GB cards with 21.5 GB each already taken by something else.
+  const crowded = hw({
+    gpus: [gpu(24, 21.5), gpu(24, 21.5)],
+    backend: "cuda",
+  });
+  const t = tune(big, crowded, defaults(), "vram");
+  assertEquals(t.possible, false, "it genuinely does not fit right now");
+
+  // It must name what is available, who has the rest, and stay arithmetically
+  // coherent — available + held must not exceed capacity.
+  assertStringIncludes(t.blocker, "available of");
+  assertStringIncludes(t.blocker, "other processes hold");
+  const nums = [...t.blocker.matchAll(/([\d.]+) GB/g)].map((m) => Number(m[1]));
+  assert(nums.length >= 4, `expected the numbers: ${t.blocker}`);
+  const [, available, capacity, held] = nums;
+  assert(
+    (available ?? 0) + (held ?? 0) <= (capacity ?? 0) + 0.2,
+    `available ${available} + held ${held} must not exceed capacity ${capacity}`,
+  );
+  // And it must NOT claim the capacity is the constraint.
+  assert(
+    !t.blocker.includes(`does not fit in ${capacity}`),
+    `naming capacity as the limit is the bug: ${t.blocker}`,
+  );
+
+  // Give the same machine its memory back and the same model fits — proving the
+  // refusal was about occupancy, not about the model.
+  const free = hw({ gpus: [gpu(24, 1.2), gpu(24, 1.2)], backend: "cuda" });
+  const ok = tune(big, free, defaults(), "vram");
+  assertEquals(ok.possible, true, "same model, same cards, memory returned");
+  assert(ok.ctx > 0, "and it reaches a real context");
+  assert(
+    plan(big, free, ok.settings).vram.overB === 0,
+    "without overflowing",
+  );
+  assert(big.nLayer === plan(big, free, ok.settings).layersOnGpu, "all on GPU");
+  assert(GB > 0);
 });

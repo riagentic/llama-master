@@ -27,6 +27,8 @@ export type HwState = {
   /** Last 60 samples, for the sparklines. */
   cpuHistory: number[];
   gpuHistory: number[];
+  vramUsedHistory: number[];
+  ramUsedHistory: number[];
   lastRefresh: number;
   refreshing: boolean;
   /** Pauses the scheduled poll; a manual refresh still works. */
@@ -49,6 +51,10 @@ export const hw = cell("hw", {
     prevCoreStats: [] as string[],
     cpuHistory: [] as number[],
     gpuHistory: [] as number[],
+    /** Bytes held by everything INCLUDING our own server, sampled per poll.
+     *  Device-wide, so it is not a measure of anyone else's demand. */
+    vramUsedHistory: [] as number[],
+    ramUsedHistory: [] as number[],
     lastRefresh: 0,
     refreshing: false,
     paused: false,
@@ -70,7 +76,9 @@ export const hw = cell("hw", {
       try {
         const found = await io.disks([...paths, ...models]);
         // Compare before writing: this runs on a schedule and an equal value
-        // would re-render the page for nothing.
+        // would re-render the page for nothing. Reading `s.disks` after the
+        // await is deliberate — the comparison is against whatever is current
+        // now, not against a snapshot taken before the `df`. // aiol-ok
         const same = found.length === s.disks.length &&
           found.every((d, i) =>
             // aiol-ok
@@ -108,6 +116,19 @@ export const hw = cell("hw", {
           ? Math.max(...snap.gpus.map((g) => g.utilPct))
           : 0;
         s.gpuHistory = pushHistory(s.gpuHistory.slice(), gpuUtil);
+
+        // Device-wide memory use, sampled over the last minute. Note "device
+        // wide": our own llama-server is inside these numbers, which is why they
+        // must never drive a fit decision (see `src/lib/adapt.ts`). They exist so
+        // the UI can show what the machine has been doing.
+        const vramUsed = snap.gpus.reduce((a, g) => a + g.vramUsedB, 0);
+        const ramUsed = snap.mem ? snap.mem.totalB - snap.mem.availableB : 0;
+        // Appending to whatever the series is NOW is the intent, exactly as for
+        // the two sparkline histories above: if another poll landed while this
+        // one was suspended, its sample belongs in the series too. // aiol-ok
+        s.vramUsedHistory = pushHistory(s.vramUsedHistory.slice(), vramUsed);
+        // aiol-ok — same reasoning as the line above
+        s.ramUsedHistory = pushHistory(s.ramUsedHistory.slice(), ramUsed);
 
         s.cpu = snap.cpu;
         s.mem = snap.mem;

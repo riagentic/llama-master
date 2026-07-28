@@ -36,10 +36,12 @@ export type Paths = {
 /**
  * Where the app home lives, when it must not be `~/.llama-master`.
  *
- * Two callers: a user relocating the app's data (builds are gigabytes), and the
- * tests — which otherwise write fixture builds into the real install, because
- * `bootCells` does not redirect the app home the way `testServer` does and aio
- * exports no `registerAppDirs` (reported in dep/aio/feedback/llama-master.md).
+ * Two callers, and the first is the reason this exists: a user relocating the
+ * app's data, because what lands here is gigabytes of llama.cpp checkouts, cmake
+ * trees and release archives, and that has to be movable onto another disk. The
+ * second is the tests, which otherwise write fixture builds into the real
+ * install — `start()` refuses any binary outside the builds root, so a fixture
+ * build has to live inside one.
  */
 export const HOME_ENV = "LLAMA_MASTER_HOME";
 

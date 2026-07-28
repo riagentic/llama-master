@@ -258,6 +258,29 @@ Deno.test("guard: every append-at-the-bottom box follows its newest line", async
   );
 });
 
+Deno.test("guard: every chat surface shows that it is waiting", async () => {
+  // The sibling of the rule above, and it shipped violated the same way — in
+  // BOTH chat surfaces at once. Between Send and the first token there is
+  // nothing to render, so a local model thinking for eight seconds looked
+  // exactly like a dead server. Whoever adds the third chat surface must not be
+  // able to forget, which is what this checks: react to `chat.streaming` and you
+  // owe the user an indicator.
+  const files = await filesUnder(join(ROOT, "src", "ui"), [".tsx"]);
+  const offenders: string[] = [];
+  for (const f of files) {
+    const src = await read(f);
+    const hasBox = /class="(chat-log|one-chatlog)"/.test(src);
+    if (hasBox && !src.includes("<Waiting />")) {
+      offenders.push(relative(ROOT, f));
+    }
+  }
+  assertEquals(
+    offenders,
+    [],
+    "these render a chat box with no waiting indicator",
+  );
+});
+
 Deno.test("guard: the icon PNG is present and current with the SVG", async () => {
   // src/icon.svg is the source of the app mark; src/icon.png is what the
   // Electron and Android packagers actually read

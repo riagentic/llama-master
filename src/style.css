@@ -468,6 +468,68 @@ body {
   background: var(--accent-soft);
 }
 
+/* Whether a model is running is the headline on any page with a Start button,
+   not one chip among several — so it gets the largest type in the app and a
+   colour block, and inherits the pill's tone vocabulary so the two agree. */
+.status-big {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+  font-size: var(--fs-xl);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  color: var(--text-dim);
+  background: var(--panel-2);
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.status-big.tone-ok {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+
+.status-big.tone-bad {
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 14%, transparent);
+}
+
+.status-big.tone-busy {
+  color: var(--busy);
+  background: color-mix(in srgb, var(--busy) 14%, transparent);
+}
+
+/* A running server also pulses, so "running" reads at a glance even in
+   monochrome or peripheral vision. */
+.status-big.tone-ok .status-dot,
+.status-big.tone-busy .status-dot {
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+/* Colour and size already carry every one of these meanings; the motion is only
+   an extra channel, so it is the first thing to drop. */
+@media (prefers-reduced-motion: reduce) {
+  .status-big .status-dot,
+  .chat-wait i,
+  .bar-fill.indeterminate {
+    animation: none;
+  }
+
+  .chat-wait i {
+    opacity: 0.6;
+  }
+}
+
 .dim {
   color: var(--text-dim);
 }
@@ -745,6 +807,43 @@ input[type="checkbox"] {
   }
   to {
     transform: translateX(100%);
+  }
+}
+
+/* Waiting for the first token. Three dots, because the honest message is
+   "something is happening and I cannot say how long" — a progress bar would
+   imply a fraction nobody knows. */
+.chat-wait {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  padding: 8px 2px;
+}
+
+.chat-wait i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--busy);
+  animation: blink 1.2s ease-in-out infinite;
+}
+
+.chat-wait i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.chat-wait i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.2;
+  }
+  40% {
+    opacity: 1;
   }
 }
 
@@ -2054,6 +2153,34 @@ input[type="checkbox"] {
   flex: 1;
 }
 
+/* The whole flag catalog on the all-in-one page — present, but folded, because
+   this page exists so most sessions never open it. */
+.one-allsettings {
+  margin-top: 10px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 8px;
+}
+
+.one-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.one-settings-actions .spacer {
+  flex: 1;
+}
+
+.one-settings {
+  display: grid;
+  gap: 10px;
+}
+
+.one-settings-group > .sub-label {
+  margin-bottom: 4px;
+}
+
 .projected-note {
   font-size: var(--fs-sm);
   margin-bottom: 8px;
@@ -2142,10 +2269,86 @@ input[type="checkbox"] {
   min-width: 0;
 }
 
-.ctx-presets {
+.ctx-presets,
+.ctx-bands {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+}
+
+/* The estimated marker. Small, but never hidden: three of the four bands are
+   inferred rather than read, and the UI has to keep saying so. */
+.ctx-bands .est {
+  margin-left: 3px;
+  opacity: 0.7;
+}
+
+.ctx-bands .btn.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* The usable range: one bar from zero to the trained length, cut where quality
+   is expected to change, with a needle at what is actually configured. */
+.ctx-range {
+  display: grid;
+  gap: 3px;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.ctx-range-track {
+  position: relative;
+  display: flex;
+  height: 10px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+}
+
+.ctx-band {
+  height: 100%;
+  min-width: 1px;
+}
+
+.ctx-band.tone-short {
+  background: var(--seg-other);
+}
+
+.ctx-band.tone-full {
+  background: var(--ok);
+}
+
+.ctx-band.tone-good {
+  background: var(--warn);
+}
+
+.ctx-band.tone-thin {
+  background: var(--bad);
+}
+
+.ctx-needle {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text);
+  box-shadow: 0 0 0 1px var(--panel);
+}
+
+.ctx-range-ticks {
+  position: relative;
+  height: 1.1em;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+.ctx-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
 }
 
 .ctx-presets .btn.on {
@@ -2477,4 +2680,29 @@ input[type="checkbox"] {
 
 .about a:hover {
   text-decoration: underline;
+}
+
+/* "Your GPU is idle and it does not have to be." A persisted placement outlives
+   the information it was chosen on, so the advice sits with the picker. */
+.placement-advice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+}
+
+/* The machine moved after a model was loaded — memory taken or given back. Sits
+   directly above Start/Stop, because the way out is a restart. */
+.drift-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+  margin-top: 8px;
+}
+
+.drift-note .spacer {
+  flex: 1;
 }

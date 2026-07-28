@@ -14,8 +14,8 @@ import { Bar, Empty, ErrorNote, KV, Panel, Pill } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
 import {
   currentModel,
-  hwSnapshot,
   modelsSizeB,
+  planningHw,
   visibleModels,
 } from "./derive.ts";
 
@@ -120,7 +120,7 @@ function Details() {
               )
               : null}
             <MemoryPlan
-              plan={computePlan(meta, hwSnapshot(), cfg.settings)}
+              plan={computePlan(meta, planningHw(), cfg.settings)}
               compact
             />
           </>

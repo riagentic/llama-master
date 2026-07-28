@@ -24,6 +24,9 @@ export type BuildsState = {
   refsLoading: boolean;
   ref: string;
   backend: Backend;
+  /** True once the user has picked a backend by hand. Until then the boot seed
+   *  may match `backend` to the hardware. */
+  backendChosen: boolean;
   origin: Origin;
   /** `-j` for the compile step. 0 = auto, which is cores − 2 (see below). */
   jobs: number;
@@ -69,13 +72,24 @@ export const builds = cell("builds", {
   // The chosen ref/backend and the active build are worth remembering; the
   // volatile fields are excluded so a restart never resumes a dead job.
   persist: {
-    include: ["ref", "backend", "origin", "jobs", "native", "activeId"],
+    include: [
+      "ref",
+      "backend",
+      "backendChosen",
+      "origin",
+      "jobs",
+      "native",
+      "activeId",
+    ],
   },
   state: {
     refs: [] as string[],
     refsLoading: false,
     ref: "master",
     backend: "cpu" as Backend,
+    /** Has the user picked a backend themselves? Until they have, the boot seed
+     *  is free to match it to the hardware. */
+    backendChosen: false,
     origin: "release" as Origin,
     jobs: 0,
     native: true,
@@ -106,6 +120,21 @@ export const builds = cell("builds", {
       if (s.origin === "release") builds.loadAssets();
     },
     setBackend(s, backend: Backend) {
+      s.backend = backend;
+      s.backendChosen = true;
+      s.assetName = "";
+    },
+    /**
+     * Seed the backend from the hardware — but never over a deliberate choice.
+     *
+     * The stored default has to be *something*, and `cpu` is the only value that
+     * is always installable; on a machine with a GPU that made the one-click
+     * default the wrong build. This is called at boot with what the hardware
+     * wants, and does nothing once the user has picked for themselves — a chosen
+     * `cpu` on a CUDA box is a legitimate answer, not a stale default.
+     */
+    suggestBackend(s, backend: Backend) {
+      if (s.backendChosen || s.backend === backend) return;
       s.backend = backend;
       s.assetName = "";
     },

@@ -92,10 +92,11 @@
 ## Performance
 
 - App provides optimall llama-cpp peformance
-- Auto-settings has three modes: maximum performance, balanced and power mode
-  (maximum performanc is default)
-- Even on maximum performance, PC is usable and not frozen by llama-cpp running
-- Each mode allows comfortable work during llama-cpp processing
+- Auto-settings has ONE set of optimal settings, offered for three placements:
+  "VRAM only", "Hybrid" and "CPU only" (superseded the earlier maximum /
+  balanced / power modes)
+- Whichever placement is chosen, the PC stays usable and is not frozen by
+  llama-cpp running
 - User is able to tweak settings futher but stability warning will be shown
 - Build will run in optimal way, it will utilize as many CPU cores as possible -
   2 (those two cores should be left aside so PC is still usable during the build

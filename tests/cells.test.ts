@@ -378,3 +378,27 @@ Deno.test("cfg: optimal-automatically is on by default and can be switched off",
   await cfg.setCtxOverride(-5, "/models/big.gguf");
   assertEquals(cfg.ctxOverride, 0);
 });
+
+testCell(
+  builds,
+  "the backend default follows the hardware, not a stored guess",
+  (t) => {
+    // "Build with one click" and "build the optimal thing for this PC" have to
+    // be the same click. The stored default is `cpu` — the only value that is
+    // always installable — so on a machine with a GPU it has to be corrected
+    // once the hardware is known. What must NOT happen is overriding a
+    // deliberate choice: picking the least capable backend on a CUDA box is a
+    // legitimate answer, not a stale default.
+    t.init();
+    t.expect.state((s) => s.backend === "cpu" && s.backendChosen === false);
+
+    t.send.suggestBackend("cuda");
+    t.expect.state((s) => s.backend === "cuda");
+    t.expect.state((s) => s.backendChosen === false);
+
+    t.send.setBackend("cpu");
+    t.expect.state((s) => s.backendChosen === true);
+    t.send.suggestBackend("cuda");
+    t.expect.state((s) => s.backend === "cpu");
+  },
+);

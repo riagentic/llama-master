@@ -47,6 +47,10 @@ export const ui = cell("ui", {
     fontPx: 14,
     /** Collapses the command preview strip at the bottom of the window. */
     showCommand: true,
+    /** Is the full flag catalog unfolded on the all-in-one page? Closed by
+     *  default, and the controls are not rendered at all while it is — 49 of
+     *  them on the page most sessions never leave is a cost for nothing. */
+    showAllSettings: false,
   },
   methods: {
     go(s, tab: Tab) {
@@ -62,6 +66,9 @@ export const ui = cell("ui", {
     },
     toggleCommand(s) {
       s.showCommand = !s.showCommand;
+    },
+    toggleAllSettings(s) {
+      s.showAllSettings = !s.showAllSettings;
     },
   },
 });

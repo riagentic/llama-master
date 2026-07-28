@@ -19,9 +19,11 @@ import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
 import { CPU_TJMAX, GPU_TJMAX, tempTone } from "../lib/thermal.ts";
 import { bytes, tps } from "../lib/format.ts";
-import { num } from "../lib/params.ts";
+import { GROUPS, num, PARAMS } from "../lib/params.ts";
+import { ParamControl } from "./TunePanel.tsx";
 import {
   applyOptimal,
+  betterPlacement,
   currentStability,
   endpoint,
   LOCK_REASON,
@@ -31,14 +33,9 @@ import {
   startServer,
   stopServer,
 } from "./actions.ts";
-import {
-  CTX_PRESETS,
-  ctxLabel,
-  MIN_CTX,
-  optimalCtx,
-  PLACEMENTS,
-} from "../lib/tune.ts";
+import { optimalCtx, pinnedCtx, PLACEMENTS } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
+import { CtxControls } from "./CtxControls.tsx";
 import { MemoryDetail } from "./MemoryDetail.tsx";
 import {
   Bar,
@@ -49,16 +46,20 @@ import {
   Ring,
   Spark,
   Toggle,
+  Waiting,
 } from "./kit.tsx";
 import { MemoryMap } from "./Memory.tsx";
 import { Guidance } from "./Guidance.tsx";
-import { OrphanBanner, ServerLog, StatusPill } from "./ServerPanel.tsx";
+import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
   canSend,
+  changedCount,
   ctxOverride,
   currentModel,
   currentStatePlan,
+  driftNow,
+  headroomNow,
   memoryIsLive,
   projectedStatePlan,
   serverRunning,
@@ -192,10 +193,27 @@ function RunStrip() {
   // is a reaction to state rather than a side effect during render, and it
   // settles in one pass because re-tuning does not change the key.
   const tunedFor = useRef("");
+  // Whether the machine has been measured is part of the key, because tuning
+  // before it has is not a tuning. `models.scan()` and `hw.refresh()` race at
+  // boot — measured at 45 ms against 48 ms on the author's machine, i.e. a coin
+  // flip — and when models won, the tuner saw no RAM and no GPUs, fell back to
+  // CPU placement, and `cfg.setPlacement` PERSISTED it. The card then sat idle
+  // for the rest of the session, and forever after, with nothing on screen to
+  // explain why. Booleans and a count only: `availableB` moves on every poll and
+  // would re-tune once a second.
+  //
+  // `headroomNow()` is what makes this adaptive: a game taking 20 GB of VRAM, a
+  // compile taking 8 GB of RAM, or either of those FINISHING, all change the
+  // right answer — in both directions. It is deliberately coarse (eighths of each
+  // pool, `src/lib/adapt.ts`) because these machines are workstations where the
+  // raw numbers never hold still: keying on `availableB` itself would rewrite the
+  // user's settings on every 1 s poll and fight their typing.
+  const hwReady = hw.lastRefresh > 0 && hw.mem !== null;
   const key =
-    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}`;
+    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}|${hwReady}|${hw.gpus.length}|${headroomNow()}`;
   afterRender(() => {
     if (tunedFor.current === key) return;
+    if (!hwReady) return; // nothing measured yet — a tune now would be a guess
     if (!cfg.autoOptimal || serverRunning() || !currentModel()?.meta) return;
     tunedFor.current = key;
     applyOptimal();
@@ -212,13 +230,13 @@ function RunStrip() {
   // happened to press Optimal.
   const ctxNow = locked
     ? num(shownSettings(), "ctxSize")
-    // A pinned context is capped at what the model was trained for, in the
-    // field as well as in the tuner — showing 64,000 "of 32,768 trained" was
-    // displaying a number that could never be used.
-    : Math.min(
+    // A pinned context is clamped exactly as the tuner clamps it — showing
+    // 64,000 "of 32,768 trained" was displaying a number that could never be
+    // used, and the clamp is `pinnedCtx` so the two cannot drift.
+    : pinnedCtx(
       ctxOverride() || all?.[cfg.placement]?.ctx ||
         num(shownSettings(), "ctxSize"),
-      target || Infinity,
+      target,
     );
 
   return (
@@ -308,47 +326,28 @@ function RunStrip() {
 
         <div class="run-row">
           <span class="run-label">Runs on</span>
-          <PlacementPicker all={all} locked={locked} />
+          <div class="ctx-controls">
+            <PlacementPicker all={all} locked={locked} />
+            <PlacementAdvice all={all} locked={locked} />
+          </div>
         </div>
 
         <label class="run-row">
           <span class="run-label">Context</span>
-          <div class="ctx-controls">
-            <div class="field-inline">
-              <input
-                type="number"
-                class="one-ctx"
-                aria-label="Context size"
-                t="one-ctx"
-                min={MIN_CTX}
-                max={target || undefined}
-                step="256"
-                disabled={locked}
-                title={locked
-                  ? LOCK_REASON
-                  : `Any value from ${MIN_CTX.toLocaleString()} up to the ${
-                    (target || 0).toLocaleString()
-                  } this model was trained for.`}
-                value={String(ctxNow)}
-                onChange={(e) =>
-                  cfg.setCtxOverride(
-                    Number((e.currentTarget as HTMLInputElement).value),
-                    models.selected,
-                  )}
-              />
-              <span class="unit">
-                tokens{target > 0
-                  ? ` · ${target.toLocaleString()} trained`
-                  : ""}
-              </span>
-            </div>
-            <CtxPresets ctxNow={ctxNow} target={target} locked={locked} />
-          </div>
+          <CtxControls
+            ctxNow={ctxNow}
+            target={target}
+            locked={locked}
+            meta={m?.meta ?? null}
+            t="one-ctx"
+          />
         </label>
       </div>
 
+      <DriftNote />
+
       <div class="run-actions">
-        <StatusPill />
+        <StatusBig />
         <Toggle
           checked={cfg.autoOptimal}
           label="Optimal automatically"
@@ -421,67 +420,114 @@ function RunStrip() {
 }
 
 /**
- * One click each for the context sizes people actually use, plus the model's own
- * optimum.
- *
- * The optimum is a first-class button rather than something that appears only
- * once you have overridden the context: "put it back the way the app would have
- * chosen" is the most likely thing anyone wants from this row, and a control
- * that is missing until you have already made a mess is no help.
- *
- * A preset larger than the model's trained context is shown disabled. Hiding it
- * would leave the row a different length per model; offering it live would be a
- * button that silently does nothing, since the tuner caps at the trained value.
- */
-function CtxPresets(
-  props: { ctxNow: number; target: number; locked: boolean },
-) {
-  const pinned = ctxOverride() > 0;
-  return (
-    <div class="ctx-presets" t="ctx-presets">
-      {CTX_PRESETS.map((n) => {
-        const tooBig = props.target > 0 && n > props.target;
-        return (
-          <button
-            key={String(n)}
-            type="button"
-            class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
-            t={`ctx-${ctxLabel(n)}`}
-            disabled={props.locked || tooBig}
-            title={props.locked
-              ? LOCK_REASON
-              : tooBig
-              ? `This model was trained for ${props.target.toLocaleString()} tokens — past that, answers degrade rather than improve.`
-              : `Set the context to ${n.toLocaleString()} tokens`}
-            onClick={() => cfg.setCtxOverride(n, models.selected)}
-          >
-            {ctxLabel(n)}
-          </button>
-        );
-      })}
-      <button
-        type="button"
-        class={`btn tiny${pinned ? "" : " on"}`}
-        t="ctx-optimal"
-        disabled={props.locked || props.target === 0}
-        title={props.target > 0
-          ? `The most this model can take without degrading: ${props.target.toLocaleString()} tokens, the length it was trained for. Each placement then fits as much of that as its memory allows.`
-          : "Select a model with a readable header first"}
-        onClick={() => cfg.setCtxOverride(0)}
-      >
-        optimal
-      </button>
-    </div>
-  );
-}
-
-/**
  * The three placements, each showing what it would actually give.
  *
  * Not a blind radio group: a placement that cannot run this model says so
  * instead of failing at Start, and one that can says how much context it
  * reaches — which is the whole basis for choosing between them.
  */
+/**
+ * The machine moved after this model was loaded.
+ *
+ * A running model cannot be re-placed — its weights are where they are — so the
+ * only honest thing left is to say so. Two directions, both real on a workstation:
+ * something else took memory this server is relying on (a game, another tool's
+ * model, a compile), or enough came back that a restart would get materially more.
+ *
+ * Not shown while idle: there the settings simply re-tune themselves, silently and
+ * correctly, and an alarm about memory that has already been adapted to would be
+ * noise.
+ */
+function DriftNote() {
+  const d = driftNow();
+  if (d.kind === "none") return null;
+  const squeezed = d.kind === "squeezed";
+  return (
+    <div
+      class={squeezed ? "error-note drift-note" : "warn-note drift-note"}
+      t="drift-note"
+    >
+      <span>
+        {squeezed
+          ? (
+            <>
+              Something else has taken memory since this model started —{" "}
+              <b>
+                {[
+                  d.vramOverB > 0 ? `${bytes(d.vramOverB)} over on VRAM` : "",
+                  d.ramOverB > 0 ? `${bytes(d.ramOverB)} over on RAM` : "",
+                ].filter(Boolean).join(" and ")}
+              </b>. It may fail on the next long prompt, or slow to a crawl.
+            </>
+          )
+          : (
+            <>
+              Memory has come free since this model started —{" "}
+              <b>
+                {[
+                  d.vramFreeB > 0 ? `${bytes(d.vramFreeB)} of VRAM` : "",
+                  d.ramFreeB > 0 ? `${bytes(d.ramFreeB)} of RAM` : "",
+                ].filter(Boolean).join(" and ")}
+              </b>{" "}
+              is idle. A restart would use it.
+            </>
+          )}
+      </span>
+      <span class="spacer" />
+      <button
+        type="button"
+        class={squeezed ? "btn tiny danger" : "btn tiny"}
+        t="restart-for-drift"
+        title="Stop the server, re-tune for the machine as it is now, and start again"
+        onClick={async () => {
+          await stopServer();
+          applyOptimal();
+          await startServer();
+        }}
+      >
+        Restart for this machine
+      </button>
+    </div>
+  );
+}
+
+/**
+ * "Your GPU is idle and it does not have to be."
+ *
+ * A persisted placement outlives the reason it was chosen. When the choice on
+ * file is beaten by one that actually fits, say so once, with the number that
+ * makes the case and the button that takes it — and leave the choice alone
+ * otherwise, because CPU only is a legitimate thing to want.
+ */
+function PlacementAdvice(
+  props: { all: Record<Placement, Tuning> | null; locked: boolean },
+) {
+  const better = betterPlacement();
+  if (!better || props.locked) return null;
+  const label = PLACEMENTS.find((p) => p.id === better)?.label ?? better;
+  const gain = props.all?.[better];
+  return (
+    <div class="warn-note placement-advice" t="placement-advice">
+      <b>{label}</b> would run this model
+      {gain && gain.ctx > 0
+        ? ` at ${gain.ctx.toLocaleString()} tokens of context`
+        : ""} — the current choice leaves the GPU out.
+      <button
+        type="button"
+        class="btn tiny"
+        t="use-better-placement"
+        title={`Switch to ${label} and re-tune`}
+        onClick={() => {
+          cfg.setPlacement(better);
+          applyOptimal();
+        }}
+      >
+        Use {label}
+      </button>
+    </div>
+  );
+}
+
 function PlacementPicker(
   props: { all: Record<Placement, Tuning> | null; locked: boolean },
 ) {
@@ -518,6 +564,89 @@ function PlacementPicker(
   );
 }
 
+/**
+ * The whole catalog, folded away.
+ *
+ * The all-in-one page is meant to hold most of the settings, not just the four
+ * that matter most — but 49 flags open by default is the Tune tab, and this page
+ * exists so most sessions never need it. So: closed, one line, and everything is
+ * there when it is wanted. Rendered with the SAME `ParamControl` the Tune tab
+ * uses, from the same catalog, so the two cannot disagree about what a flag is or
+ * what it emits.
+ *
+ * Disabled while a server is up, for the reason the rest of the strip is: the
+ * command on screen has to keep describing the process that is running.
+ */
+function AllSettings() {
+  const changed = changedCount();
+  const locked = runLocked();
+  const open = ui.showAllSettings;
+  return (
+    <div class="one-allsettings">
+      <div class="one-settings-actions">
+        <button
+          type="button"
+          class="btn small"
+          t="one-allsettings"
+          onClick={() => ui.toggleAllSettings()}
+        >
+          {open ? "\u25be" : "\u25b8"} Every llama.cpp setting
+          <span class="dim">
+            {changed > 0
+              ? ` \u00b7 ${changed} changed from default`
+              : " \u00b7 all default"}
+          </span>
+        </button>
+        {open
+          ? (
+            <>
+              <Toggle
+                checked={cfg.advanced}
+                label="Advanced"
+                tip="Show the rarely-needed flags"
+                t="one-advanced"
+                onChange={() => cfg.toggleAdvanced()}
+              />
+              <span class="spacer" />
+              <button
+                type="button"
+                class="btn small"
+                disabled={locked || changed === 0}
+                title="Return every flag to the llama.cpp default"
+                onClick={() => cfg.reset()}
+              >
+                Reset all
+              </button>
+            </>
+          )
+          : null}
+      </div>
+      {!open
+        ? null
+        : locked
+        ? <p class="param-tip">{LOCK_REASON}</p>
+        : (
+          <div class="one-settings">
+            {GROUPS.map((g) => {
+              const list = PARAMS.filter(
+                (p) => p.group === g.id && (cfg.advanced || !p.advanced),
+              );
+              if (list.length === 0) return null;
+              return (
+                <div class="one-settings-group" key={g.id}>
+                  <div class="sub-label">{g.label}</div>
+                  <div class="params">
+                    {list.map((p) => <ParamControl key={p.key} p={p} />)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+    </div>
+  );
+}
+
 /** The same chat as the Chat tab, sized for a shared page. */
 function MiniChat() {
   const ready = srv.status === "ready";
@@ -527,7 +656,7 @@ function MiniChat() {
   return (
     <>
       <div class="one-chatlog" t="one-chat" ref={log}>
-        {chat.messages.length === 0 && !chat.partial
+        {chat.messages.length === 0 && !chat.partial && !chat.streaming
           ? (
             <Empty
               icon="✉"
@@ -553,6 +682,7 @@ function MiniChat() {
                   </div>
                 )
                 : null}
+              {chat.streaming && !chat.partial ? <Waiting /> : null}
             </>
           )}
       </div>
@@ -671,6 +801,7 @@ export function OnePage() {
           : null}
       >
         <RunStrip />
+        <AllSettings />
       </Panel>
 
       {

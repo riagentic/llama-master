@@ -84,6 +84,95 @@ export function optimalCtx(meta: ModelMeta): number {
  *  that cannot reach it is reported impossible rather than proposed. */
 export const MIN_CTX = 2048;
 
+/** The four context sizes worth naming, in order. */
+export type CtxBandId = "min" | "opt" | "big" | "max";
+
+export type CtxBands = Record<CtxBandId, number>;
+
+/**
+ * The named bands of a model's usable context range.
+ *
+ * ONLY `max` is read from the model. `nCtxTrain` is the length it was actually
+ * trained for; past that RoPE extrapolates and the output degrades hard, so it is
+ * the real outer edge and the honest answer to "the most it can handle".
+ *
+ * `opt` and `big` are ESTIMATES and the UI says so. A GGUF header carries no
+ * quality signal — no eval scores, nothing about where attention starts to
+ * thin — while published long-context measurements (needle-in-a-haystack and
+ * RULER-style suites) consistently find effective length well under the
+ * advertised one. So `big` sits at half the trained length and `opt` at a
+ * quarter: defensible places to look, not measurements. The only way to turn
+ * them into facts is to probe THIS model at THIS quantisation, which the app is
+ * equipped to do (it owns a server and a chat client) and does not do yet.
+ *
+ * `min` is a usability floor rather than a model property: any autoregressive
+ * model "works" at one token, and what a user needs is room for a system prompt
+ * and a few turns.
+ *
+ * Monotonic and clamped by construction, so a 512-token model still yields four
+ * ordered values rather than a scrambled range.
+ */
+export function ctxBands(meta: ModelMeta): CtxBands {
+  const max = optimalCtx(meta);
+  const step = (n: number) =>
+    Math.max(CTX_STEP, Math.floor(n / CTX_STEP) * CTX_STEP);
+  const min = Math.min(step(Math.min(4096, max)), max);
+  const big = Math.min(Math.max(step(max / 2), min), max);
+  const opt = Math.min(Math.max(step(max / 4), min), big);
+  return { min, opt, big, max };
+}
+
+/** Label and rationale per band, so the buttons and the range visual cannot
+ *  describe the same number two different ways. `estimated` drives the honesty
+ *  marker in the UI. */
+export const CTX_BANDS: readonly {
+  id: CtxBandId;
+  label: string;
+  estimated: boolean;
+  tip: string;
+}[] = [
+  {
+    id: "min",
+    label: "Min",
+    estimated: true,
+    tip:
+      "The smallest context worth running: room for a system prompt and a few turns. A usability floor, not a limit of the model.",
+  },
+  {
+    id: "opt",
+    label: "Opt",
+    estimated: true,
+    tip:
+      "Where the model should still answer at full quality. ESTIMATED at a quarter of its trained length — published long-context measurements consistently find effective length well below the advertised one, but nothing in a GGUF header says where it is for this model.",
+  },
+  {
+    id: "big",
+    label: "Big",
+    estimated: true,
+    tip:
+      "Long, with some quality given up. ESTIMATED at half the trained length, for the same reason as Opt — a defensible place to look, not a measurement.",
+  },
+  {
+    id: "max",
+    label: "Max",
+    estimated: false,
+    tip:
+      "The full length this model was trained for. Read from the model, not estimated. Past it RoPE extrapolates and answers degrade sharply, so this is the outer edge.",
+  },
+];
+
+/**
+ * What a user-pinned context actually becomes.
+ *
+ * One rule, one home: the tuner clamps a pin to `[MIN_CTX, target]`, and the UI
+ * has to display the same number or it is promising something that will not run.
+ * It lived in both places once, and the UI copy had dropped the floor — a pin of
+ * 512 rendered as 512 and ran as 2048.
+ */
+export function pinnedCtx(override: number, target: number): number {
+  return Math.max(MIN_CTX, Math.min(override, target || Infinity));
+}
+
 /**
  * The context sizes worth one click.
  *
@@ -125,7 +214,23 @@ const CTX_STEP = 256;
  */
 const QUANT_KV_BACKENDS: readonly string[] = ["cuda", "metal"];
 
-/** VRAM we refuse to plan into: drivers, the desktop, and fragmentation. */
+/**
+ * VRAM we refuse to plan into: drivers, the desktop, and fragmentation.
+ *
+ * This was briefly widened by the machine's observed memory "churn", to reserve
+ * more on a busy workstation. That is removed, and the reason is worth keeping:
+ * the only churn signal available is the DEVICE-WIDE usage series, and our own
+ * llama-server is inside it — so starting a 39 GB model registered as 39 GB of
+ * volatility, inflated the reserve, and made the app report "will not fit" for
+ * models that fit comfortably. A reserve driven by a signal that cannot separate
+ * our own allocation from everyone else's produces false refusals, which is worse
+ * than a reserve that is merely fixed.
+ *
+ * Adapting to memory that moves is still done, by the two mechanisms that CAN be
+ * measured honestly: the auto-tune re-runs when real headroom changes
+ * (`src/lib/adapt.ts:headroomKey`), and a running model that gets squeezed or
+ * given room says so (`drift`).
+ */
 function marginB(vramTotalB: number): number {
   return Math.max(512 * 1024 * 1024, vramTotalB * 0.05);
 }
@@ -141,16 +246,31 @@ function ramMarginB(availB: number): number {
   return Math.max(1024 ** 3, availB * 0.10);
 }
 
+/** Bytes as GB, for the sentences the tuner writes. `src/lib/format.ts` is the
+ *  UI's formatter; this stays here so `src/lib` needs no cross-import. */
+function gb(bytes: number): string {
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
 function fitsVram(meta: ModelMeta, hw: Hw, s: Settings): boolean {
   const p = plan(meta, hw, s);
   const total = hw.gpus.reduce((a, g) => a + g.vramTotalB, 0);
   return p.vram.overB === 0 && p.vram.freeB >= marginB(total);
 }
 
-/** Does the host side of this placement leave the OS room to breathe? */
+/**
+ * Does the host side of this placement leave the OS room to breathe?
+ *
+ * With no memory reading at all the answer is NO, not "sure, why not". This used
+ * to return true — inventing no limit — which sounds humble and is the opposite:
+ * during the boot window, before the first `hw.refresh` lands, it let the tuner
+ * hand back a 78 GB plan as optimal on a machine whose size it had not read yet.
+ * Refusing is recoverable (the next poll is a second away and re-tunes);
+ * proposing a plan the machine cannot hold is an OOM kill.
+ */
 function fitsRam(meta: ModelMeta, hw: Hw, s: Settings): boolean {
   const availB = hw.mem?.availableB ?? 0;
-  if (availB === 0) return true; // nothing known about RAM: invent no limit
+  if (availB === 0) return false;
   const p = plan(meta, hw, s);
   return p.ram.overB === 0 && p.ram.freeB >= ramMarginB(availB);
 }
@@ -351,7 +471,11 @@ export function tune(
   s.flashAttn = quantKvOk ? "on" : "auto";
   if (quantKvOk) {
     reasons.push(
-      "Flash attention on — less KV memory, faster long contexts, and a prerequisite for a quantised cache.",
+      // Deliberately does NOT claim "less KV memory": the cache is the same size
+      // either way, and `plan.ts` has no flash-attention term, so a bar on screen
+      // would not move. What it actually buys is smaller attention scratch and
+      // the ability to quantise the cache at all.
+      "Flash attention on — smaller attention buffers, faster long contexts, and a prerequisite for a quantised cache.",
     );
   }
   if (!quantKvOk && placement !== "cpu" && hw.gpus.length > 0) {
@@ -363,22 +487,46 @@ export function tune(
   }
 
   const ceiling = ctxOverride !== undefined
-    ? Math.max(MIN_CTX, Math.min(ctxOverride, target))
+    ? pinnedCtx(ctxOverride, target)
     : target;
 
-  // f16 first: a quantised cache costs a little quality, so it is only worth
-  // taking when it buys context the full-precision cache could not reach.
+  // Host-side bytes for a candidate. Every one of them crosses the PCIe bus on
+  // every token, so at equal context the candidate with fewer is the faster one.
+  // This is the honest measure because it covers all three ways a full-precision
+  // cache pushes work off the card — whole layers, routed experts, and the cache
+  // itself — where a layer count sees only the first.
+  const hostB = (t: Settings, c: number): number => {
+    const p = place(meta, hw, t, placement, c);
+    return p ? plan(meta, hw, p.settings).ram.usedB : Infinity;
+  };
+  const usesGpu = placement !== "cpu" && hw.gpus.length > 0;
+
+  // f16 first: a quantised cache costs a little quality, so it has to buy
+  // something. It buys one of two things — context the full cache could not
+  // reach, or residency the full cache spent on the host. The second used not to
+  // count, and it can be the bigger prize: a long-context MoE that reaches its
+  // full trained length either way can still be paying for it with several GB of
+  // experts and cache in system RAM, which q8_0 brings back onto the card.
   const f16 = bestCtx(meta, hw, s, placement, ceiling);
   let ctx = f16;
-  if (quantKvOk && f16 < ceiling) {
+  const f16Host = f16 > 0 ? hostB(s, f16) : 0;
+  const spilling = usesGpu && f16 > 0 && f16Host > 0;
+  if (quantKvOk && (f16 < ceiling || spilling)) {
     const q8s: Settings = { ...s, cacheTypeK: "q8_0", cacheTypeV: "q8_0" };
     const q8 = bestCtx(meta, hw, q8s, placement, ceiling);
-    if (q8 > f16) {
+    const q8Host = q8 > 0 ? hostB(q8s, q8) : Infinity;
+    const buysContext = q8 > f16;
+    const buysResidency = spilling && q8 === f16 && q8Host < f16Host;
+    if (buysContext || buysResidency) {
       s.cacheTypeK = "q8_0";
       s.cacheTypeV = "q8_0";
       ctx = q8;
       reasons.push(
-        `KV cache quantised to q8_0 — it halves the cache, and here that is what lifts the context from ${f16.toLocaleString()} to ${q8.toLocaleString()}.`,
+        buysContext
+          ? `KV cache quantised to q8_0 — it halves the cache, and here that is what lifts the context from ${f16.toLocaleString()} to ${q8.toLocaleString()}.`
+          : `KV cache quantised to q8_0 — it halves the cache, and here that is what brings ${
+            gb(f16Host - q8Host)
+          } back onto the GPU that would otherwise have run from system RAM, at the same ${q8.toLocaleString()} context.`,
       );
     }
   }
@@ -394,7 +542,7 @@ export function tune(
       ctxSize: floor,
       ngl: placement === "cpu" ? 0 : 999,
     };
-    const blocker = blockerFor(hw, placement);
+    const blocker = blockerFor(meta, hw, placement);
     return {
       settings: fallback,
       reasons: [...reasons, `${label} is not possible here: ${blocker}`],
@@ -429,19 +577,55 @@ export function tune(
 }
 
 /** Why a placement is unavailable, in the user's terms. */
-function blockerFor(hw: Hw, placement: Placement): string {
+function blockerFor(
+  meta: ModelMeta,
+  hw: Hw,
+  placement: Placement,
+): string {
   const floor = MIN_CTX.toLocaleString();
+  // Distinguish "does not fit" from "nothing has been measured yet". The second
+  // is a half-second condition at boot, and reporting it as the first sent the
+  // user off to close browser tabs over a number that had not been read.
+  if ((hw.mem?.availableB ?? 0) === 0) {
+    return "The memory reading has not arrived yet — this will settle on the next sample.";
+  }
+  if (hw.gpus.length === 0 && placement !== "cpu") {
+    return "No GPU was detected on this machine.";
+  }
+
+  // Name the constraint that actually binds, with the numbers behind it.
+  //
+  // This used to say "does not fit in 47.8 GB of VRAM" — the card's CAPACITY —
+  // when the real reason was that only 6 GB of it was free. That reads as a claim
+  // about the model, sends the user looking for a smaller quantisation, and is
+  // simply not what happened. What they need to know is how much room there is
+  // and who has the rest.
+  const at = plan(meta, hw, { ...defaults(), ctxSize: MIN_CTX, ngl: 999 });
+  const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
+  const need = (pool: "vram" | "ram") =>
+    `${gb(at[pool].usedB)} at a ${floor}-token context`;
+  // Room available to US: capacity minus what everything else holds. NOT
+  // `freeB + usedB`, which is incoherent once the plan overflows.
+  const have = (pool: "vram" | "ram") => {
+    const room = Math.max(0, at[pool].capacityB - at[pool].otherB);
+    return at[pool].otherB > 0
+      ? `${gb(room)} available of ${
+        gb(at[pool].capacityB)
+      } (other processes hold ${gb(at[pool].otherB)})`
+      : `${gb(room)}`;
+  };
+
   if (placement === "cpu") {
-    return `Needs more RAM than is free, even at a ${floor}-token context.`;
+    return `Needs ${need("ram")}, and there is ${have("ram")} of system RAM.`;
   }
-  if (hw.gpus.length === 0) return "No GPU was detected on this machine.";
-  const total = hw.gpus.reduce((a, g) => a + g.vramTotalB, 0);
   if (placement === "vram") {
-    return `The whole model does not fit in ${
-      (total / 1024 ** 3).toFixed(1)
-    } GB of VRAM, even at a ${floor}-token context. Hybrid will run it.`;
+    return `Every layer on the GPU needs ${need("vram")}, and there is ${
+      have("vram")
+    }. Hybrid will run it.`;
   }
-  return `Even split across GPU and RAM this does not fit at a ${floor}-token context. Try a smaller quantisation.`;
+  return `Even split across GPU and RAM this does not fit at a ${floor}-token context: ${
+    have("vram")
+  } of VRAM and ${have("ram")} of RAM. Try a smaller quantisation.`;
 }
 
 /** Everything that follows from the final placement rather than driving it. */

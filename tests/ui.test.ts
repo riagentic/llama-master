@@ -32,7 +32,15 @@ import { OnePage } from "../src/ui/OnePage.tsx";
 import { TunePanel } from "../src/ui/TunePanel.tsx";
 import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
-import { CTX_PRESETS, ctxLabel, optimalCtx } from "../src/lib/tune.ts";
+import {
+  CTX_BANDS,
+  CTX_PRESETS,
+  ctxBands,
+  ctxLabel,
+  optimalCtx,
+} from "../src/lib/tune.ts";
+import { headroomKey } from "../src/lib/adapt.ts";
+import { tuneAll } from "../src/lib/tune.ts";
 import { builds } from "../src/cell/builds.ts";
 import { cfg } from "../src/cell/cfg.ts";
 import { models } from "../src/cell/models.ts";
@@ -43,11 +51,24 @@ import { moeGguf } from "./gguf-fixture.ts";
 import { meta } from "./fixtures.ts";
 import { hw } from "../src/cell/hw.ts";
 import { devices, isEnabled } from "../src/lib/gpu.ts";
-import { plan as computePlan } from "../src/lib/plan.ts";
-import { activeBuild, hwSnapshot } from "../src/ui/derive.ts";
+import { plan as computePlan, withoutOurUsage } from "../src/lib/plan.ts";
+import {
+  activeBuild,
+  currentStatePlan,
+  headroomNow,
+  hwSnapshot,
+  planningHw,
+  vramTotalB,
+  vramUsedB,
+} from "../src/ui/derive.ts";
 import { chat } from "../src/cell/chat.ts";
-import { startBlocker, startServer, stopServer } from "../src/ui/actions.ts";
-import { updateInfo } from "../src/ui/derive.ts";
+import {
+  betterPlacement,
+  placements,
+  startBlocker,
+  startServer,
+  stopServer,
+} from "../src/ui/actions.ts";
 import type { Build } from "../src/lib/types.ts";
 
 /** A temp directory holding one real GGUF, cleaned up by the caller. */
@@ -726,13 +747,15 @@ testUI(
 );
 
 testUI(
-  App,
+  OnePage as never,
   "the all-in-one page picks the build as well as the model",
   async (ui_) => {
+    // Mount the panel, not `App` plus a rail click: `ui.tab` is persisted and its
+    // rehydration on mount is async, so a click issued before it lands is
+    // silently reverted to whatever the previous test left in the store. This
+    // shipped as a ~40% flake and the rule is in CLAUDE.md — it failed here by
+    // rendering the Build tab while asserting on the all-in-one page.
     await ui_.settle();
-    // Navigate explicitly: the cells are process-wide singletons, so relying on
-    // the default tab makes this pass or fail on whatever ran before it.
-    ui_.App["tab-one"].click();
     await builds.scan();
     await ui_.settle();
 
@@ -746,7 +769,7 @@ testUI(
     if (builds.installed.length === 0) {
       // Nothing installed: say so and offer the way out, rather than an empty box.
       assertStringIncludes(html, "No llama.cpp yet");
-      assertExists(ui_.App["one-getllama"]);
+      assertExists(ui_.find("OnePage")["one-getllama"]);
       return;
     }
     // Every installed build is offered, named the way the Build tab names it.
@@ -869,11 +892,30 @@ async function untilReady(ui_: { settle: () => Promise<void> }): Promise<void> {
 }
 
 /** A free port. Never a constant: two tests hardcoding one flake. */
+/** Ports already handed out in THIS process, so two tests never share one. */
+const handedOut = new Set<number>();
+
+/**
+ * A port nothing is listening on.
+ *
+ * Asking the OS for port 0 and closing gives a port that was free a moment ago —
+ * check-then-close-then-use, so the same ephemeral port can come back twice while
+ * the first holder is still binding it. Eight tests do this in one process, and a
+ * collision shows up as a server that "did not start" for no visible reason.
+ * Remembering what we handed out removes the intra-process half of that race,
+ * which is the half we can actually control.
+ */
 function freePort(): number {
-  const l = Deno.listen({ port: 0 });
-  const { port } = l.addr as Deno.NetAddr;
-  l.close();
-  return port;
+  for (let i = 0; i < 64; i++) {
+    const l = Deno.listen({ port: 0 });
+    const { port } = l.addr as Deno.NetAddr;
+    l.close();
+    if (!handedOut.has(port)) {
+      handedOut.add(port);
+      return port;
+    }
+  }
+  throw new Error("could not find an unused port after 64 tries");
 }
 
 /** Both places a server failure can be shown. A diagnosis that says "the log
@@ -906,10 +948,14 @@ for (const [name, Surface] of SERVER_SURFACES) {
           srv.diagnosis,
           `no diagnosis; log:\n${srv.log.join("\n")}`,
         );
-        await ui_.settle();
-
+        // Wait for the RENDER, not just for the state. `settle()` returned with
+        // the panel still showing "stopped" here, so a one-shot `html()` asserted
+        // against a DOM that had not caught up with the crash yet.
+        await ui_.waitFor(
+          () => ui_.html().includes("GPU ran out of memory"),
+          `the reason is rendered; status=${srv.status}`,
+        );
         const html = ui_.html();
-        assertStringIncludes(html, "GPU ran out of memory", "the reason");
         assertStringIncludes(html, "still running", "the next step");
         assertStringIncludes(html, "cudaMalloc failed", "the log itself");
         await srv.clearLog();
@@ -1030,8 +1076,18 @@ testUI(
       await srv.start([bin, "--port", String(port)], url);
       await untilReady(ui_);
 
+      // Known slate. `chat.send` returns immediately if `input` is empty or a
+      // stream is still open (`src/cell/chat.ts`), and `messages` is persisted —
+      // so an earlier test's in-flight stream, or a late rehydration landing
+      // after `clear()`, makes this send a silent no-op. Waiting on the
+      // precondition rather than on `settle()` removes the ordering dependency.
+      await chat.stop();
       await chat.clear();
       await chat.setInput("hi");
+      await ui_.waitFor(
+        () => chat.input === "hi" && !chat.streaming,
+        "chat is idle with the message typed",
+      );
       await chat.send(url);
       await ui_.settle();
 
@@ -1166,9 +1222,14 @@ testUI(
         await builds.scan();
         const port = freePort();
         await cfg.set("port", String(port));
-        // A value nobody would choose deliberately: 999 layers on a machine the
-        // fixture gives no GPU. If Start honours the switch, the tuner replaces
-        // it; if not, this is what would be spawned.
+        // The tuner refuses to plan against hardware it has not measured — that
+        // refusal is deliberate (see `fitsRam`), so a test of what the tuner
+        // CHOOSES has to give it a machine to choose for.
+        await hw.refresh(true);
+        // A value nobody would choose deliberately. If Start honours the switch,
+        // the tuner replaces it; if not, this is what would be spawned. The
+        // assertion is "not 999" rather than a specific number, because the right
+        // `-ngl` depends on the machine the suite happens to run on.
         await cfg.set("ngl", "999");
         assertEquals(cfg.autoOptimal, true, "on by default");
         await ui_.settle();
@@ -1176,10 +1237,9 @@ testUI(
         await startServer();
         assert(srv.pid > 0, "it started");
         // The argv that ran is the tuned argv, and the panel agrees with it.
-        assertEquals(
-          Number(cfg.settings.ngl),
-          0,
-          "no GPU in the fixture, so the tuner offloads nothing",
+        assert(
+          Number(cfg.settings.ngl) !== 999,
+          "the tuner must replace a hand-set value when the switch is on",
         );
         assert(
           !srv.argv.includes("999"),
@@ -1314,7 +1374,10 @@ testUI(
         await ui_.settle();
 
         const trained = optimalCtx(m.meta!);
-        const picker = ui_.find("CtxPresets");
+        // `CtxControls` is a separate module and the harness does not register it
+        // as a findable component, so address its handles from the mounted root —
+        // which is what the `t` props are for.
+        const picker = ui_.find("OnePage");
 
         // Every rung is offered, whatever the model — a row that changes length
         // per model is harder to use than one that does not.
@@ -1344,7 +1407,43 @@ testUI(
           assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
         }
 
-        // And "optimal" is always there — not only once you have overridden
+        // Each named band is offered and pins its own value. Only Max is read
+        // from the model; the rest are estimates and the button says so with a
+        // marker, which is checked below.
+        const bands = ctxBands(m.meta!);
+        for (const band of CTX_BANDS) {
+          const b = picker[`ctx-${band.id}`];
+          assertExists(b, `${band.label} CTX must be offered`);
+          assertEquals(b.disabled, false, `${band.label} is usable here`);
+          b.click();
+          await ui_.expectCell(cfg, (st) => st.ctxOverride === bands[band.id]);
+          assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
+        }
+        // Ordered, and never past what the model was trained for.
+        assert(
+          bands.min <= bands.opt && bands.opt <= bands.big &&
+            bands.big <= bands.max,
+          `bands must be ordered: ${JSON.stringify(bands)}`,
+        );
+        assertEquals(bands.max, trained, "Max is the trained length, exactly");
+
+        // The estimate is marked as one wherever a band appears.
+        assertStringIncludes(
+          ui_.html(),
+          "≈",
+          "estimated bands must be marked",
+        );
+        assertStringIncludes(
+          ui_.html(),
+          "no quality signal",
+          "and the page must say why",
+        );
+
+        // The usable range is drawn, not just listed.
+        assertExists(picker["ctx-range"], "the range visual is rendered");
+        assertExists(picker["ctx-needle"], "with the current value on it");
+
+        // And "Auto" is always there — not only once you have overridden
         // something — and hands the choice back to the tuner.
         picker["ctx-optimal"].click();
         await ui_.expectCell(cfg, (s) => s.ctxOverride === 0);
@@ -1457,3 +1556,363 @@ for (
     assertStringIncludes(ui_.html(), marker);
   });
 }
+
+// ── the polish the katas ask for, pinned ───────────────────────────────────
+
+testUI(
+  App,
+  "the chat says it is waiting before the first token arrives",
+  async (ui_) => {
+    // The gap between Send and the first token is the whole point: a local model
+    // on a cold cache can think for seconds, and with nothing on screen that is
+    // indistinguishable from a dead server. So this drives the real code path
+    // against a real socket that accepts the request and then says nothing —
+    // exactly the state the indicator exists for.
+    await ui_.settle();
+    const port = freePort();
+    const ac = new AbortController();
+    const server = Deno.serve(
+      { port, signal: ac.signal, onListen: () => {} },
+      () =>
+        new Response(
+          // A well-formed event stream that never emits an event.
+          new ReadableStream({ start() {} }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    try {
+      await chat.clear();
+      await chat.setInput("hi");
+      const sending = chat.send(`http://127.0.0.1:${port}`);
+      await ui_.waitFor(
+        () => chat.streaming && ui_.html().includes("chat-wait"),
+        "the waiting indicator is on screen while nothing has arrived",
+      );
+      assertEquals(chat.partial, "", "and there is genuinely nothing yet");
+      await chat.stop();
+      await sending;
+      await ui_.settle();
+      assert(
+        !ui_.html().includes("chat-wait"),
+        "and it goes away once the wait is over",
+      );
+    } finally {
+      ac.abort();
+      await server.finished;
+    }
+  },
+);
+
+for (
+  const [name, panel] of [
+    ["All-in-one", OnePage],
+    ["Server", ServerPanel],
+  ] as const
+) {
+  testUI(
+    panel as never,
+    `the ${name} page states whether a server is running, unmissably`,
+    async (ui_) => {
+      // A page with a Start button has to answer "is one running?" before the
+      // user reads anything else. It used to answer in the app's smallest type,
+      // in a row of chips that looked identical to the model filename.
+      await ui_.settle();
+      const html = ui_.html();
+      assertStringIncludes(html, "status-big", `${name} shows the big status`);
+      assertStringIncludes(html, "STOPPED", "and says which state it is in");
+    },
+  );
+}
+
+testUI(App, "the Machine page covers storage too", async (ui_) => {
+  // A build needs gigabytes and "No space left on device" is a failure this app
+  // already knows how to explain — better before the build than after. The page
+  // that summarises the machine has to include the pool that fails it.
+  await ui_.settle();
+  await hw.refresh(true);
+  await hw.refreshDisks();
+  ui_.App["tab-dashboard"].click();
+  await ui_.expectCell(ui, (s) => s.tab === "dashboard");
+  await ui_.waitFor(
+    () => ui_.html().includes("Storage"),
+    "the Machine page names storage",
+  );
+});
+
+testUI(
+  App,
+  "the current memory state counts this app's own bytes once",
+  async (ui_) => {
+    // `plan` reads "in use" from device-wide telemetry, and our own llama-server
+    // is already inside those totals. Itemising our buckets on top of them
+    // counted our memory twice and could paint the over-capacity hatch on a
+    // machine that comfortably fits. Only a live server reproduces it.
+    if (Deno.build.os !== "linux") return; // RSS comes from /proc
+    await ui_.settle();
+    await installStubBuild();
+    try {
+      await withModel(async (dir) => {
+        await srv.stop();
+        await srv.poll();
+        await models.addDir(dir);
+        await models.scan();
+        await builds.scan();
+        await cfg.set("port", String(freePort()));
+        // Real telemetry, or `otherB` is zero on both sides and the assertion
+        // below proves nothing.
+        await hw.refresh(true);
+        await ui_.settle();
+        await startServer();
+        await untilReady(ui_);
+        await srv.poll();
+
+        const m = models.items.find((i) => i.path === models.selected)?.meta;
+        assertExists(m, "the selected model parsed");
+        assertExists(srv.runSettings, "the run is recorded");
+        assert(srv.rssB > 0, `RSS should be measured, got ${srv.rssB}`);
+
+        // What the map would have drawn before the fix, versus what it draws now.
+        const raw = computePlan(m, hwSnapshot(), srv.runSettings);
+        const shown = currentStatePlan();
+
+        // Our own share is identical either way — it is our accounting, not the
+        // driver's — but it must no longer also be inside "everyone else".
+        assertEquals(shown.ram.usedB, raw.ram.usedB, "our share is unchanged");
+        assert(
+          shown.ram.otherB < raw.ram.otherB,
+          `our RSS must come out of "in use elsewhere": ${shown.ram.otherB} vs ${raw.ram.otherB}`,
+        );
+        assertEquals(
+          raw.ram.otherB - shown.ram.otherB,
+          srv.rssB,
+          "and exactly our RSS, no more",
+        );
+      });
+    } finally {
+      await srv.stop();
+      await removeStubBuild();
+    }
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "the Tune page offers the same context control as the all-in-one page",
+  async (ui_) => {
+    // The kata asks for the bands on both pages, and "the same" has to mean the
+    // same component — two renderings of a band would be two chances to disagree
+    // about what it is worth.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await cfg.setCtxOverride(0);
+      await ui_.settle();
+
+      const picker = ui_.find("TunePanel");
+      const bands = ctxBands(m.meta!);
+      for (const band of CTX_BANDS) {
+        assertExists(picker[`ctx-${band.id}`], `${band.label} CTX on Tune`);
+      }
+      assertExists(picker["ctx-optimal"], "and Auto");
+      assertExists(picker["ctx-range"], "and the usable range");
+
+      // It is wired, not decoration.
+      picker["ctx-big"].click();
+      await ui_.expectCell(cfg, (s) => s.ctxOverride === bands.big);
+      assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "a stranded CPU-only choice is pointed out, not left to rot",
+  async (ui_) => {
+    // `cfg.placement` is persisted, which is right — it is a choice. But the boot
+    // race that used to degrade it to `cpu` before the hardware was read left the
+    // value STORED, so a machine with idle GPUs kept running on the CPU every
+    // session afterwards with nothing on screen to explain it. Stopping the race
+    // could not un-store it; this is what tells the user.
+    //
+    // Driven off the real machine, so the expectation is derived rather than
+    // assumed: if nothing actually beats CPU here (a card already full, no GPU at
+    // all), then the advice MUST be absent, and that is just as much the rule.
+    await ui_.settle();
+    await hw.refresh(true);
+    const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
+    try {
+      await builds.scan();
+      await builds.setActive("stub-cuda");
+      await withModel(async (dir) => {
+        await models.addDir(dir);
+        await models.scan();
+        const m = models.items.find((x) => x.meta);
+        assertExists(m, "the fixture model must parse");
+        models.select(m.path);
+        await cfg.setCtxOverride(0);
+        await cfg.setPlacement("cpu");
+        await ui_.settle();
+
+        const better = betterPlacement();
+        if (better === null) {
+          assert(
+            !ui_.html().includes("placement-advice"),
+            "with nothing better available, nothing is advised",
+          );
+          return;
+        }
+
+        assert(better !== "cpu", "the advice is only ever an upgrade");
+        const page = ui_.find("PlacementAdvice");
+        assertExists(page["placement-advice"], "the stranded choice is named");
+        assertStringIncludes(
+          ui_.html(),
+          "leaves the GPU out",
+          "and says what it costs",
+        );
+
+        // And the way out is one click, not a hunt through the Tune tab.
+        page["use-better-placement"].click();
+        await ui_.expectCell(cfg, (s) => s.placement === better);
+        await ui_.settle();
+        assert(
+          !ui_.html().includes("placement-advice"),
+          "and the advice goes away once taken",
+        );
+      });
+    } finally {
+      await cfg.setPlacement("hybrid");
+      await removeStubBuild("stub-cuda");
+      assert(bin.length > 0);
+    }
+  },
+);
+
+testUI(
+  OnePage as never,
+  "the settings follow memory that moves underneath them",
+  async (ui_) => {
+    // The machines this runs on are workstations: a game takes 20 GB of VRAM, a
+    // compile takes 8 GB of RAM, and each of those FINISHING changes the right
+    // answer again. What must not happen is a re-tune on every 1 s poll, which
+    // would rewrite settings the user is reading. So the trigger is the coarse
+    // bucket key, and this pins both halves of that.
+    await ui_.settle();
+    await hw.refresh(true);
+    const mem = hw.mem;
+    if (mem === null) return; // no telemetry on this platform
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await cfg.setCtxOverride(0);
+      await ui_.settle();
+
+      const cap = vramTotalB();
+      const ram = mem.totalB;
+      const before = headroomNow();
+
+      // Jitter must NOT be news: a couple of hundred MB either way on both
+      // pools is what a workstation does while sitting still.
+      const jitter = headroomKey({
+        vramFreeB: cap - vramUsedB() - 200 * 1024 ** 2,
+        vramCapacityB: cap,
+        ramFreeB: mem.availableB - 200 * 1024 ** 2,
+        ramCapacityB: ram,
+      });
+      assertEquals(jitter, before, "200 MB of wobble is not a re-tune");
+
+      // A game starting IS news, and so is it exiting.
+      const squeezed = headroomKey({
+        vramFreeB: Math.max(0, cap * 0.1),
+        vramCapacityB: cap,
+        ramFreeB: mem.availableB,
+        ramCapacityB: ram,
+      });
+      const freed = headroomKey({
+        vramFreeB: cap,
+        vramCapacityB: cap,
+        ramFreeB: ram,
+        ramCapacityB: ram,
+      });
+      assert(squeezed !== before, "memory taken is a re-tune");
+      assert(freed !== squeezed, "memory given back is a re-tune too");
+
+      // And the key the component keys on is the same one — a re-tune is
+      // reachable, not just computable.
+      assertStringIncludes(ui_.html(), "Run a model");
+      assert(before.startsWith("v"), `headroom key shape: ${before}`);
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "a running model is not counted as somebody else's memory",
+  async (ui_) => {
+    // THE reported bug. The driver reports device-wide VRAM, so while our own
+    // llama-server holds 39 GB that figure is inside the telemetry. Every "what
+    // would happen if we started this" question — the placement picker, the
+    // tuner, the stability check, the Tune and Models memory plans — was asked
+    // against that raw number, so the app said "VRAM only: does not fit" about a
+    // model that was at that moment running in VRAM only, and refused the
+    // placement it was already using. A message that is false is the worst
+    // failure this app can have.
+    await ui_.settle();
+    await hw.refresh(true);
+    if (hw.gpus.length === 0 || hw.mem === null) return;
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await cfg.setCtxOverride(0);
+      await ui_.settle();
+
+      // What the machine says while nothing of ours runs.
+      const idle = planningHw();
+      const idleVram = idle.gpus.reduce((a, g) => a + g.vramUsedB, 0);
+
+      // Now pretend a large model of ours is loaded, exactly as `srv` would
+      // report it: the plan for the run, and the telemetry already containing it.
+      const ourVramB = Math.min(
+        idle.gpus.reduce((a, g) => a + g.vramTotalB, 0) * 0.6,
+        8 * 1024 ** 3,
+      );
+      const withOurs = withoutOurUsage(hwSnapshot(), ourVramB, 0);
+      const withOursVram = withOurs.gpus.reduce((a, g) => a + g.vramUsedB, 0);
+
+      // The whole fix in one assertion: attributing our bytes to us gives the
+      // planner MORE room, never less — it is the same machine minus us.
+      assert(
+        withOursVram <= idleVram,
+        `our own usage must come out of "in use elsewhere": ${withOursVram} vs ${idleVram}`,
+      );
+      assertEquals(
+        idleVram - withOursVram,
+        Math.min(ourVramB, idleVram),
+        "and exactly our share, no more",
+      );
+
+      // And nothing on the page evaluates placements against raw telemetry any
+      // more: the two must agree about what fits.
+      const shown = placements();
+      assertExists(shown, "placements are computed");
+      const truth = tuneAll(m.meta!, planningHw(), cfg.settings, undefined);
+      for (const id of ["vram", "hybrid", "cpu"] as const) {
+        assertEquals(
+          shown[id].possible,
+          truth[id].possible,
+          `${id} must be judged against the planning machine`,
+        );
+      }
+    });
+  },
+);

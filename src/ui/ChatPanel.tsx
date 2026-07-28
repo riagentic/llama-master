@@ -10,7 +10,7 @@ import { srv } from "../cell/srv.ts";
 import { num } from "../lib/params.ts";
 import { tps } from "../lib/format.ts";
 import { endpoint } from "./actions.ts";
-import { Empty, ErrorNote, Panel, Pill } from "./kit.tsx";
+import { Empty, ErrorNote, Panel, Pill, Waiting } from "./kit.tsx";
 import { canSend } from "./derive.ts";
 import { useStickyBottom } from "./sticky.ts";
 
@@ -59,7 +59,7 @@ export function ChatPanel() {
             chat.setSystem((e.currentTarget as HTMLInputElement).value)}
         />
         <div class="chat-log" t="chat-log" ref={log}>
-          {chat.messages.length === 0 && !chat.partial
+          {chat.messages.length === 0 && !chat.partial && !chat.streaming
             ? (
               <Empty
                 icon="✉"
@@ -82,6 +82,7 @@ export function ChatPanel() {
                 {chat.partial
                   ? <Message role="assistant" content={chat.partial} />
                   : null}
+                {chat.streaming && !chat.partial ? <Waiting /> : null}
               </>
             )}
         </div>

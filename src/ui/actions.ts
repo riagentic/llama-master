@@ -11,10 +11,14 @@
 
 import { builds } from "../cell/builds.ts";
 import { cfg } from "../cell/cfg.ts";
+import { hw } from "../cell/hw.ts";
 import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
 import { argv, serverUrl } from "../lib/command.ts";
+import { availableBackends } from "../lib/assets.ts";
+import { compilableBackends, preferredBackends } from "../lib/backend.ts";
+import type { Backend } from "../lib/types.ts";
 import { bestPlacement, PLACEMENTS, tuneAll } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
@@ -23,12 +27,72 @@ import {
   activeBuild,
   ctxOverride,
   currentModel,
-  hwSnapshot,
+  foundPrereqs,
+  planningHw,
   serverRunning,
 } from "./derive.ts";
 
 // Re-exported so panels have one import for "the current thing".
 export { activeBuild, currentModel };
+
+/**
+ * Which backend this machine can actually run, so the default is not a lie.
+ *
+ * When the asset list has been fetched, a backend with no prebuilt binary is
+ * skipped — upstream ships CUDA for Windows only, and suggesting it on Linux
+ * would send the user down a dead end.
+ *
+ * Which backend suits this hardware is a decision, so it lives in `src/lib`
+ * where it is tested (`preferredBackends`); this only intersects it with what is
+ * obtainable by the route the user has chosen.
+ */
+export function suggestedBackend(): Backend {
+  const wish = preferredBackends(
+    new Set(hw.gpus.map((g) => g.vendor)),
+    hw.os || "linux",
+  );
+
+  if (builds.origin === "release" && builds.assets.length > 0) {
+    const have = availableBackends(
+      builds.assets,
+      hw.os || "linux",
+      hw.arch || "x86_64",
+    );
+    return wish.find((b) => have.includes(b)) ?? "cpu";
+  }
+  if (builds.origin === "source") {
+    // Suggesting a backend whose toolchain is missing sends the user into a
+    // cmake failure four minutes from now.
+    const have = compilableBackends(foundPrereqs(), hw.os || "linux");
+    return wish.find((b) => have.includes(b)) ?? wish[0] ?? "cpu";
+  }
+  return wish[0] ?? "cpu";
+}
+
+/** One click: the backend this hardware wants, tuned for this exact CPU, with
+ *  two cores left to the OS so the machine stays usable during the build. */
+export function optimalForThisPc(): void {
+  builds.setBackend(suggestedBackend());
+  builds.setNative(true);
+  builds.setJobs(0);
+}
+
+/**
+ * Make the first-run default match the hardware.
+ *
+ * "Build with one click" and "build the optimal thing for this PC" have to be
+ * the same click, and they were not: the stored default is `cpu`, so on an
+ * NVIDIA machine the one-click Install fetched a CPU release and the user had to
+ * know to press "Optimal for this PC" first. This runs once at boot and only
+ * while the user has never picked a backend themselves — `suggestBackend`
+ * enforces that, so a deliberate choice of `cpu` on a CUDA box is never
+ * overridden. Skipped entirely once a build is installed: then the backend
+ * follows the build that is active, which is the real state.
+ */
+export function seedBackend(): void {
+  if (builds.installed.length > 0) return;
+  builds.suggestBackend(suggestedBackend());
+}
 
 export function serverBin(): string {
   return activeBuild()?.serverBin ?? "";
@@ -77,10 +141,39 @@ export function placements(): Record<Placement, Tuning> | null {
   if (!m?.meta) return null;
   return tuneAll(
     m.meta,
-    hwSnapshot(),
+    // NOT raw telemetry: while our own server is up its VRAM is inside the
+    // driver's device-wide figure, and planning against that reported "VRAM only:
+    // does not fit" for the model that was running in VRAM only at the time.
+    planningHw(),
     cfg.settings,
     ctxOverride() || undefined,
   );
+}
+
+/**
+ * A placement that would clearly beat the one currently selected, if there is
+ * one.
+ *
+ * `cfg.placement` is persisted, which is right — it is a choice. But it means a
+ * choice made under bad information OUTLIVES the information: the boot race that
+ * used to degrade this to `cpu` before the hardware was read left the value
+ * stored, so a machine with three idle GPUs kept running on the CPU for every
+ * session afterwards with nothing on screen to explain it. The fix stopped it
+ * happening; it could not un-store it.
+ *
+ * So this is advice, not a correction — the user is told and offered the switch,
+ * and "CPU only" stays a legitimate thing to want.
+ */
+export function betterPlacement(): Placement | null {
+  const all = placements();
+  if (!all) return null;
+  const best = bestPlacement(all);
+  if (best === cfg.placement) return null;
+  // Only advise upgrades. Falling back when the choice cannot run is already
+  // handled at Start (`tunedForStart`), and saying so twice is nagging.
+  const rank: Record<Placement, number> = { vram: 2, hybrid: 1, cpu: 0 };
+  if (rank[best] <= rank[cfg.placement]) return null;
+  return all[best].possible ? best : null;
 }
 
 /**
@@ -122,7 +215,7 @@ export function applyOptimal(): void {
 /** Is the current configuration going to hurt? Recomputed on every render, so
  *  the warning appears the moment a control is changed. */
 export function currentStability(): Stability {
-  return stability(currentModel()?.meta ?? null, hwSnapshot(), cfg.settings);
+  return stability(currentModel()?.meta ?? null, planningHw(), cfg.settings);
 }
 
 /**

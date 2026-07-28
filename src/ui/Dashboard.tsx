@@ -8,6 +8,7 @@ import { hw } from "../cell/hw.ts";
 import { prereq } from "../cell/prereq.ts";
 import { CPU_TJMAX, GPU_TJMAX, tempTone } from "../lib/thermal.ts";
 import { describe, scriptPreview } from "../lib/fixplan.ts";
+import { tooFullToBuild } from "../lib/disk.ts";
 import { fixablePrereqs, fixPlanFor } from "./derive.ts";
 import { bytes, duration, pctLabel, stamp } from "../lib/format.ts";
 import {
@@ -233,6 +234,47 @@ function MemoryPanel() {
   );
 }
 
+/**
+ * Storage — the third pool this app fills, and the one that fails a build.
+ *
+ * A llama.cpp checkout plus a CUDA build tree runs to several GB and models to
+ * tens, so "how full is this disk" belongs on the page that summarises the
+ * machine — not only on the Memory page. The Build tab already refuses when the
+ * headroom is gone; this is where the user sees it coming.
+ */
+function DiskPanel() {
+  const disks = hw.disks;
+  return (
+    <Panel title="Storage" icon="▣">
+      {disks.length === 0
+        ? <Empty title="Free space is not reported on this platform" />
+        : (
+          <>
+            {disks.map((d) => (
+              <div class="disk" key={d.mount}>
+                <div class="disk-head">
+                  <b class="mono">{d.mount}</b>
+                  {tooFullToBuild(d)
+                    ? <Pill tone="warn">tight for a build</Pill>
+                    : null}
+                </div>
+                <Bar
+                  value={d.usedB}
+                  max={d.totalB}
+                  tone={tooFullToBuild(d) ? "warn" : "ok"}
+                  height={7}
+                />
+                <div class="dim mono">
+                  {bytes(d.availB)} free of {bytes(d.totalB)}
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+    </Panel>
+  );
+}
+
 /** One "Fix" per unmet prerequisite. The tooltip is the exact command that
  *  will run — nothing privileged happens without the user seeing it first. */
 function FixButton(props: { id: string; found: boolean }) {
@@ -439,6 +481,7 @@ export function Dashboard() {
         <CpuPanel />
         <GpuPanel />
         <MemoryPanel />
+        <DiskPanel />
         <PrereqPanel />
       </div>
     </div>

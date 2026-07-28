@@ -10,6 +10,6 @@ export const ABOUT = {
   license: "MIT",
   repo: "https://github.com/riagentic/llama-master",
   /** Keep in step with `version` in deno.json — a guard test checks it. */
-  version: "0.1.0",
+  version: "0.1.1",
   upstream: "https://github.com/ggml-org/llama.cpp",
 } as const;

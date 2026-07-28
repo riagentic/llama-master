@@ -10,18 +10,29 @@
 // panel.
 
 import { cfg } from "../cell/cfg.ts";
-import { GROUPS, PARAMS } from "../lib/params.ts";
+import { GROUPS, num, PARAMS } from "../lib/params.ts";
 import { DevicePicker } from "./DevicePicker.tsx";
 import type { Param } from "../lib/types.ts";
 import { plan as computePlan } from "../lib/plan.ts";
-import { PLACEMENTS } from "../lib/tune.ts";
-import { applyOptimal, currentStability } from "./actions.ts";
+import { optimalCtx, pinnedCtx, PLACEMENTS } from "../lib/tune.ts";
+import { applyOptimal, currentStability, runLocked } from "./actions.ts";
 import { Empty, ErrorNote, Panel, Pill, Segmented, Toggle } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
-import { changedCount, currentModel, hwSnapshot, isTouched } from "./derive.ts";
+import { CtxControls } from "./CtxControls.tsx";
+import {
+  changedCount,
+  ctxOverride,
+  currentModel,
+  isTouched,
+  planningHw,
+} from "./derive.ts";
 
-/** One control, chosen by the parameter's declared kind. */
-function Control(props: { p: Param }) {
+/** One control, chosen by the parameter's declared kind.
+ *
+ *  Exported because the all-in-one page carries the whole catalog too, and two
+ *  renderings of the same flag would be two chances to disagree with the command
+ *  builder. */
+export function ParamControl(props: { p: Param }) {
   const p = props.p;
   const value = cfg.settings[p.key] ?? p.def;
   const touched = isTouched(p.key);
@@ -124,7 +135,7 @@ function Group(props: { id: string; label: string }) {
         : null}
     >
       <div class="params">
-        {list.map((p) => <Control key={p.key} p={p} />)}
+        {list.map((p) => <ParamControl key={p.key} p={p} />)}
       </div>
     </Panel>
   );
@@ -161,6 +172,13 @@ function StabilityNote() {
 export function TunePanel() {
   const m = currentModel();
   const meta = m?.meta ?? null;
+  const target = meta ? optimalCtx(meta) : 0;
+  // The same clamp the tuner applies, so the number shown is the number that
+  // would run (`pinnedCtx`, src/lib/tune.ts).
+  const ctxNow = pinnedCtx(
+    ctxOverride() || num(cfg.settings, "ctxSize"),
+    target,
+  );
   return (
     <div class="tab-body">
       <div class="tune-head">
@@ -222,6 +240,20 @@ export function TunePanel() {
       <div class="tune-cols">
         <div class="tune-plan">
           <StabilityNote />
+          {
+            /* Context is the setting people actually reach for, so it gets the
+              same control here as on the all-in-one page — bands, presets and
+              the usable range — rather than being one number lost among 49. */
+          }
+          <Panel title="Context" icon="⇥">
+            <CtxControls
+              ctxNow={ctxNow}
+              target={target}
+              locked={runLocked()}
+              meta={meta}
+              t="tune-ctx"
+            />
+          </Panel>
           <Panel
             title="Memory plan"
             icon="▤"
@@ -230,7 +262,7 @@ export function TunePanel() {
             {meta
               ? (
                 <MemoryPlan
-                  plan={computePlan(meta, hwSnapshot(), cfg.settings)}
+                  plan={computePlan(meta, planningHw(), cfg.settings)}
                 />
               )
               : (

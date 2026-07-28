@@ -21,9 +21,10 @@ import { join } from "@std/path";
 
 // Point the app home at a temp dir BEFORE anything resolves paths: `start()`
 // refuses to run a binary outside its own builds directory, and this is how the
-// fixture binary gets to live inside one. `bootCells` does NOT redirect the app
-// home (only `testServer` does), so without this the fixtures land in the real
-// ~/.llama-master — which they did until this was fixed.
+// fixture binary gets to live inside one. This app resolves its home itself
+// (`LLAMA_MASTER_HOME`, see `host.server.ts`), so redirecting it is the test's
+// job — without this the fixtures land in the real ~/.llama-master, which they
+// did until it was fixed.
 const HOME = await Deno.makeTempDir({ prefix: "llama-master-srv-" });
 Deno.env.set("LLAMA_MASTER_HOME", HOME);
 

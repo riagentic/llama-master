@@ -335,6 +335,31 @@ export function LogView(props: { lines: string[]; t?: string; rows?: number }) {
   );
 }
 
+/**
+ * "It is working" — the only honest thing to show between Send and the first
+ * token.
+ *
+ * A local model on a cold cache can take seconds to produce its first token, and
+ * until it does there is nothing to render: the user sees their own message, a
+ * gap, and no way to tell a slow prompt from a dead server. One component, used
+ * by every chat surface, so the two cannot disagree about what waiting looks
+ * like.
+ */
+export function Waiting() {
+  return (
+    <div
+      class="chat-wait"
+      t="chat-wait"
+      role="status"
+      aria-label="Waiting for a reply"
+    >
+      <i />
+      <i />
+      <i />
+    </div>
+  );
+}
+
 // ── inputs ─────────────────────────────────────────────────────────────────
 
 export function Toggle(props: {

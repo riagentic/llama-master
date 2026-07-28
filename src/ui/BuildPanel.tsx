@@ -7,11 +7,7 @@
 import { builds } from "../cell/builds.ts";
 import { hw } from "../cell/hw.ts";
 import { availableBackends, pickAsset } from "../lib/assets.ts";
-import {
-  compilableBackends,
-  preferredBackends,
-  targetReadiness,
-} from "../lib/backend.ts";
+import { targetReadiness } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
 import { bytes, duration, stamp } from "../lib/format.ts";
 import {
@@ -25,6 +21,7 @@ import {
   Toggle,
 } from "./kit.tsx";
 import { buildBusy, buildsSizeB, foundPrereqs, prereqById } from "./derive.ts";
+import { optimalForThisPc } from "./actions.ts";
 import { Guidance } from "./Guidance.tsx";
 
 const BACKENDS: readonly { id: Backend; label: string; tip: string }[] = [
@@ -38,44 +35,6 @@ const BACKENDS: readonly { id: Backend; label: string; tip: string }[] = [
   { id: "hip", label: "ROCm", tip: "AMD's native stack on Linux." },
   { id: "metal", label: "Metal", tip: "Apple silicon." },
 ];
-
-/** Which backend this machine can actually run, so the default is not a lie.
- *  When the asset list has been fetched, a backend with no prebuilt binary is
- *  skipped — upstream ships CUDA for Windows only, and suggesting it on Linux
- *  would send the user down a dead end. */
-function suggestedBackend(): Backend {
-  // Which backend suits this hardware is a decision, so it lives in src/lib
-  // where it is tested; this function only intersects it with what is
-  // obtainable by the route the user has chosen.
-  const wish = preferredBackends(
-    new Set(hw.gpus.map((g) => g.vendor)),
-    hw.os || "linux",
-  );
-
-  if (builds.origin === "release" && builds.assets.length > 0) {
-    const have = availableBackends(
-      builds.assets,
-      hw.os || "linux",
-      hw.arch || "x86_64",
-    );
-    return wish.find((b) => have.includes(b)) ?? "cpu";
-  }
-  if (builds.origin === "source") {
-    // Suggesting a backend whose toolchain is missing sends the user into a
-    // cmake failure four minutes from now.
-    const have = compilableBackends(foundPrereqs(), hw.os || "linux");
-    return wish.find((b) => have.includes(b)) ?? wish[0] ?? "cpu";
-  }
-  return wish[0] ?? "cpu";
-}
-
-/** One click: the backend this hardware wants, tuned for this exact CPU, with
- *  two cores left to the OS so the machine stays usable during the build. */
-function optimalForThisPc(): void {
-  builds.setBackend(suggestedBackend());
-  builds.setNative(true);
-  builds.setJobs(0);
-}
 
 function Chooser() {
   const source = builds.origin === "source";

@@ -1,20 +1,19 @@
 // src/ui/derive.ts — the values the UI derives from cell state.
 //
-// WHY THIS FILE EXISTS, and why components must not call cell selectors:
+// WHY THIS FILE EXISTS: one list of everything the UI derives from cell state.
 //
-// In AIR, reading a cell PROPERTY (`models.items`) subscribes the component to
-// that slice, so it re-renders when the slice changes. Calling a cell SELECTOR
-// (`models.current()`) returns a correct, fresh value but registers NO
-// dependency. A component whose only read is a selector call therefore renders
-// once and then never updates — the data is right, the screen is stale, and
-// nothing warns you. It cost an afternoon here (the all-in-one page kept
-// showing "no model" while the model dropdown beside it showed the model),
-// and it is reported upstream in dep/aio/feedback/llama-master.md.
+// It began as a workaround. Calling a cell SELECTOR (`models.current()`) used to
+// return a correct, fresh value while registering NO reactive dependency, so a
+// component whose only read was a selector rendered once and then never updated
+// — the data right, the screen stale, and nothing warning you. It cost an
+// afternoon (the all-in-one page kept showing "no model" while the dropdown
+// beside it showed the model). Reported upstream, and FIXED in aio
+// 1.0.0-alpha38: selector calls are reactive in a render now, verified here.
 //
-// So: every derived value the UI needs is a plain function over cell
-// PROPERTIES, and `tests/guards.test.ts` fails the build if a component calls a
-// selector instead. The cells keep their selectors — they are correct and
-// useful on the server and in tests; they are just not reactive in a render.
+// The file stays, as a convention rather than a workaround. Every value the UI
+// derives is a plain function over cell PROPERTIES, in one place, so "where does
+// this number come from" has one answer — and one convention beats two that both
+// work. `tests/guards.test.ts` still enforces it, and says the same thing.
 
 import { builds } from "../cell/builds.ts";
 import { cfg } from "../cell/cfg.ts";
@@ -24,6 +23,8 @@ import { models } from "../cell/models.ts";
 import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
+import { drift, headroomKey } from "../lib/adapt.ts";
+import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
 import { str } from "../lib/params.ts";
@@ -95,6 +96,45 @@ export function hwSnapshot(): Hw {
     // backend, not just how much VRAM it can see.
     backend,
   };
+}
+
+/**
+ * "The machine's memory is materially as it was."
+ *
+ * Coarse on purpose — see `src/lib/adapt.ts`. This is a cache key for the
+ * auto-tune, so it has to change when a game takes 20 GB or a compile finishes
+ * and gives 8 GB back, and NOT change when the number wobbles by 200 MB. On a
+ * workstation the wobble is constant and the difference is the whole design.
+ */
+export function headroomNow(): string {
+  const vramCapacityB = vramTotalB();
+  const ramCapacityB = hw.mem?.totalB ?? 0;
+  return headroomKey({
+    vramFreeB: vramCapacityB - vramUsedB(),
+    vramCapacityB,
+    ramFreeB: hw.mem?.availableB ?? 0,
+    ramCapacityB,
+  });
+}
+
+/**
+ * Has the machine moved under a model that is already running?
+ *
+ * A loaded model cannot be re-placed, so this never re-tunes — it decides what to
+ * TELL the user: something else is now competing for memory this server depends
+ * on, or enough has come back that a restart would buy a real improvement.
+ */
+export function driftNow(): Drift {
+  if (!memoryIsLive()) return { kind: "none" };
+  const p = currentStatePlan();
+  return drift({
+    vramOverB: p.vram.overB,
+    ramOverB: p.ram.overB,
+    vramFreeB: p.vram.freeB,
+    ramFreeB: p.ram.freeB,
+    startedVramB: p.vram.usedB,
+    startedRamB: p.ram.usedB,
+  });
 }
 
 export function vramTotalB(): number {
@@ -188,7 +228,19 @@ export function memoryIsLive(): boolean {
 export function currentStatePlan(): Plan {
   const m = shownModel()?.meta;
   if (memoryIsLive() && m && srv.runSettings) {
-    return computePlan(m, hwSnapshot(), srv.runSettings);
+    // `plan` reads "in use" from device-wide telemetry — the driver's VRAM
+    // figure and MemAvailable — and our own llama-server is already inside both.
+    // Itemising our buckets on top of that would count our bytes twice and can
+    // paint the over-capacity hatch on a machine that comfortably fits, so take
+    // our share out of "everyone else" first. Our buckets do not depend on what
+    // anyone else holds, so the first pass is only there to size us.
+    const raw = computePlan(m, hwSnapshot(), srv.runSettings);
+    const base = withoutOurUsage(
+      hwSnapshot(),
+      raw.vram.usedB,
+      srv.rssB || raw.ram.usedB,
+    );
+    return computePlan(m, base, srv.runSettings);
   }
   return computePlan(NO_MODEL, hwSnapshot(), { ...cfg.settings, ngl: 0 });
 }
@@ -205,6 +257,31 @@ export function ourUsageB(): { vramB: number; ramB: number } {
 }
 
 /**
+ * The machine to PLAN against: everything except our own running model.
+ *
+ * This is the base for every "what would happen if we started this" question —
+ * the placement picker, the tuner, the stability check, every projected memory
+ * plan. It must not be raw telemetry, and getting that wrong produced the worst
+ * class of bug this app can have: a message that is false.
+ *
+ * The driver reports device-wide VRAM, so while our own llama-server is up its
+ * 39 GB is inside that number. Planning against it asks "could we start this on a
+ * machine that has 6 GB free" and answers, correctly for the question asked and
+ * absurdly for the user, **"VRAM only: does not fit"** — while VRAM only is
+ * exactly what is running. Same for `stability`, which then warns about an
+ * overflow that is its own model, and for the Tune and Models memory plans.
+ *
+ * Attributing our bytes to us turns that back into the real question: what could
+ * we start if we swapped what is loaded now for this. One model runs at a time,
+ * so that is always the right question.
+ */
+export function planningHw(): Hw {
+  const ours = ourUsageB();
+  if (ours.vramB === 0 && ours.ramB === 0) return hwSnapshot();
+  return withoutOurUsage(hwSnapshot(), ours.vramB, ours.ramB);
+}
+
+/**
  * The machine as it WILL look once the selected model runs.
  *
  * Current state, minus whatever llama.master is holding now, plus the selected
@@ -215,9 +292,7 @@ export function ourUsageB(): { vramB: number; ramB: number } {
 export function projectedStatePlan(): Plan | null {
   const m = currentModel()?.meta;
   if (!m) return null;
-  const ours = ourUsageB();
-  const base = withoutOurUsage(hwSnapshot(), ours.vramB, ours.ramB);
-  return computePlan(m, base, cfg.settings);
+  return computePlan(m, planningHw(), cfg.settings);
 }
 
 export function serverRunning(): boolean {

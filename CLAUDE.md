@@ -131,6 +131,38 @@ Data flow worth knowing:
   strategy exactly when it is worth most: a Mixtral-shaped layer is ~40 MB of
   attention against ~720 MB of experts, so holding the experts back buys ~16x
   more layers. Measured on a 3 GB card: 2 of 32 layers before, 32 of 32 after.
+- **Memory moves under the app, so the plan adapts — coarsely on purpose.** This
+  runs on workstations where a game takes 20 GB of VRAM, another tool loads a
+  model, or a compile finishes and gives 8 GB of RAM back. Every one of those
+  changes the right answer, in **both** directions and in **both** pools, so
+  `src/lib/adapt.ts` drives three things. (1) `headroomKey` — eighths of each
+  pool — is part of the auto-tune key in `OnePage`, so a real change re-tunes
+  and 200 MB of jitter does not; keying on `availableB` itself would rewrite the
+  user's settings on every 1 s poll and fight their typing. (2) `volatilityB`
+  feeds `Hw.volatility`, and `tune.ts:marginB`/`ramMarginB` ADD the observed
+  swing to the reserve — a fixed 5% is not a margin on a machine that regularly
+  moves 6 GB, and what dies is weights the kernel cannot page out. Measured: a
+  131k model on a 12 GB card plans 99k of context on a quiet machine and 53k
+  while it churns; capped so a volatile machine can still run something. (3)
+  `drift` — a loaded model cannot be re-placed, so while a server runs the app
+  does not re-tune, it TELLS you: squeezed (someone took memory this run depends
+  on) or roomier (enough came back that a restart would get more), each with the
+  restart button.
+- **Of the four context bands, only Max is a fact.** `.katana/context.md` asks
+  for Min / Opt / Big / Max buttons and a picture of the usable range
+  (`src/lib/tune.ts:ctxBands`, `src/ui/CtxControls.tsx`, on both the all-in-one
+  and Tune pages). `max` is `nCtxTrain` — the length the model was trained for,
+  read from the header, and the real edge because RoPE extrapolates past it.
+  `opt` (¼) and `big` (½) are **estimates**: a GGUF header carries no quality
+  signal at all, while published long-context suites consistently find effective
+  length well under the advertised one. So they are marked `≈` on every button
+  and the range explains itself in words — the same honesty the compute-buffer
+  estimate gets. The auto-tuner still aims at `max`; quietly quartering
+  everyone's context on the strength of a chosen fraction would be worse than
+  the gap. The only way to make Opt and Big facts is to probe THIS model at THIS
+  quantisation with a needle-in-a-haystack run and cache it — the app owns a
+  server, a chat client and an SSE parser, so it is equipped to, and does not
+  yet.
 - **KV-cache size is per-architecture.** One uniform formula overestimated
   Gemma-3-class sliding-window attention ~3.7x and DeepSeek MLA ~71x, while the
   UI labelled the figure exact. `rust/src/gguf.rs` reads
@@ -195,10 +227,11 @@ cannot act on is a bug.
   was created for. This shipped: after any crash, the next Start came up and was
   SIGTERMed a moment later (`exited with code 143`), and the app looked like it
   simply could not start a server. The close must be conditional on identity
-  (`io.stopOwned(pid)`). `testUI`/`bootCells` print _"own effects are ignored in
-  standalone/test mode"_ and stay green — only `testServer` reproduces it, and
-  only when the previous run **crashed** rather than being stopped (`stop`
-  disposes the effect cleanly). Pinned by `tests/runtime.test.ts`.
+  (`io.stopOwned(pid)`). Reproducing it needs `testServer` **and** a previous
+  run that **crashed** rather than being stopped (`stop` disposes the effect
+  cleanly). Pinned by `tests/runtime.test.ts`. (aio ≤ alpha37 also ignored `own`
+  effects in the in-process harnesses, which hid it entirely; alpha38 acquires
+  and disposes them for real and warns once per replaced key.)
 - **"The log below" must actually be below.** Every diagnosis this app writes
   points at the log; a page that shows a diagnosis therefore renders
   `ServerLog`/`LogView` itself rather than pointing at another tab.
@@ -208,15 +241,16 @@ cannot act on is a bug.
   test left in the store. That is a ~40% flake, not a rare one. Rendering
   `ServerPanel`/`OnePage` directly tests the same thing deterministically. The
   rail itself has one test, and that is where navigation belongs.
-- **A test that writes app files must set `LLAMA_MASTER_HOME` first.**
-  `testServer` redirects the app home; **`bootCells` and `testUI` do not**, and
-  aio exports no `registerAppDirs`. So `paths()` honours `LLAMA_MASTER_HOME`
-  (`src/cell/host.server.ts`) and every test that installs a fixture build sets
-  it to a temp dir **before** the first `paths()` call. This shipped wrong: the
-  server tests left a `test-build/` directory inside the developer's real
-  `~/.llama-master`, and two UI tests silently passed only because that home had
-  an app-managed CMake in it. `AIO_DATA_DIR` looks like the override and is not
-  one.
+- **A test that writes app files must set `LLAMA_MASTER_HOME` first.** This app
+  owns its home directory rather than using aio's app dirs, because what lands
+  there is gigabytes — llama.cpp checkouts, cmake trees, release archives — and
+  a user has to be able to find it, back it up and delete it. So `paths()`
+  honours `LLAMA_MASTER_HOME` (`src/cell/host.server.ts`) and every test that
+  installs a fixture build sets it to a temp dir **before** the first `paths()`
+  call — the static imports are hoisted, so "before" means at the top of the
+  file. This shipped wrong: the server tests left a `test-build/` directory
+  inside the developer's real `~/.llama-master`, and two UI tests silently
+  passed only because that home had an app-managed CMake in it.
 - **Drain the child's output before reporting that it exited.** `child.status`
   resolves when the process is reaped, which can beat the last of its stderr
   through the pipe — and `srv.poll` diagnoses an exit from exactly those lines.

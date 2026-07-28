@@ -20,6 +20,9 @@ import { models } from "./cell/models.ts";
 import { prereq } from "./cell/prereq.ts";
 import { srv } from "./cell/srv.ts";
 import { ui } from "./cell/ui.ts";
+// A cross-cell gesture, so it lives with the others in `ui/actions.ts` rather
+// than being reimplemented here; boot is just another caller.
+import { seedBackend } from "./ui/actions.ts";
 
 await aio.run({
   appId: "llama-master",
@@ -67,20 +70,33 @@ await aio.run({
   ],
   onStart: () => {
     // Fill the window before the first scheduled tick, and find out what this
-    // machine already has — the app should be useful on the first frame.
-    hw.refresh(true);
-    prereq.scan();
-    builds.scan();
+    // machine already has — the app should be useful on the first frame. These
+    // are deliberately not awaited in sequence: each panel renders as its own
+    // scan lands, rather than the window staying empty until the slowest one is
+    // done.
     models.scan();
     builds.checkUpdates();
+    hw.refreshDisks();
+    // Before anything else: is memory still held by a previous run?
+    srv.scanOrphans();
+
     // The release route is the default, and it cannot answer "will this
     // produce a build?" without the asset list — `targetReadiness` reports
     // `pending` until it lands, which leaves Install disabled. `assets` is
     // deliberately not persisted (a stale list is worse than none), so the
     // only way it is there on the first frame is to fetch it here.
-    builds.loadAssets();
-    hw.refreshDisks();
-    // Before anything else: is memory still held by a previous run?
-    srv.scanOrphans();
+    //
+    // These four are the ones the backend seed reads, so it waits for them.
+    // "Build with one click" and "build what is optimal for this PC" have to be
+    // the same click: the stored default backend is `cpu` — the only value that
+    // is always installable — so on a machine with a GPU it has to be corrected
+    // once the hardware is known. `seedBackend` does nothing if the user has
+    // ever chosen a backend, and nothing once a build is installed.
+    Promise.all([
+      hw.refresh(true),
+      prereq.scan(),
+      builds.scan(),
+      builds.loadAssets(),
+    ]).then(() => seedBackend());
   },
 });

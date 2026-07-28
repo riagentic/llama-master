@@ -84,6 +84,42 @@ export function StatusPill() {
   return <Pill tone={tone} title={srv.healthDetail}>{label}</Pill>;
 }
 
+/**
+ * The same fact as `StatusPill`, at the size it deserves.
+ *
+ * "Is a model running right now" is the one thing a page with a Start button
+ * must answer before the user reads anything else — and a 12px chip in a row of
+ * ambient chips does not. This is the same tone and the same words, large enough
+ * to register from across the room. The pill stays for places where the status
+ * is context rather than the headline.
+ */
+export function StatusBig() {
+  const s = srv.status;
+  const tone = s === "ready"
+    ? "ok"
+    : s === "starting" || s === "stopping"
+    ? "busy"
+    : s === "crashed"
+    ? "bad"
+    : "idle";
+  const label = s === "ready"
+    ? "running"
+    : s === "starting"
+    ? (srv.pid ? "loading model" : "starting")
+    : s;
+  return (
+    <div
+      class={`status-big tone-${tone}`}
+      t="status-big"
+      role="status"
+      title={srv.healthDetail}
+    >
+      <i class="status-dot" />
+      {label.toUpperCase()}
+    </div>
+  );
+}
+
 function Props() {
   const p = srv.props;
   if (!p) return null;
@@ -122,7 +158,7 @@ export function ServerPanel() {
           wide
           right={
             <>
-              <StatusPill />
+              <StatusBig />
               {srv.orphans.length > 0 && !running
                 ? (
                   <button
