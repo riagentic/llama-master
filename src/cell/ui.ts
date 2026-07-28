@@ -9,6 +9,9 @@ import { cell } from "aio";
 export type Tab =
   | "one"
   | "dashboard"
+  | "cpu"
+  | "gpu"
+  | "memory"
   | "build"
   | "models"
   | "settings"
@@ -20,6 +23,12 @@ export const TABS: readonly { id: Tab; label: string; icon: string }[] = [
   // First and default: most sessions never need to leave it.
   { id: "one", label: "All-in-one", icon: "◎" },
   { id: "dashboard", label: "Machine", icon: "▦" },
+  // The three "tell me about one pool" pages. Machine summarises all of them;
+  // these answer each on its own terms, including storage, which is the third
+  // thing this app fills.
+  { id: "cpu", label: "CPU", icon: "⚙" },
+  { id: "gpu", label: "GPU", icon: "◈" },
+  { id: "memory", label: "Memory", icon: "▤" },
   { id: "build", label: "Build", icon: "⚒" },
   { id: "models", label: "Models", icon: "◈" },
   { id: "settings", label: "Tune", icon: "⚙" },

@@ -1403,3 +1403,57 @@ testUI(
     }
   },
 );
+
+Deno.test("guard: every page the kata lists is reachable", async () => {
+  // .katana/pages.md enumerates the pages this app has. A page that exists as a
+  // component but is not in TABS is unreachable, and a tab with no case in the
+  // router silently falls through to All-in-one — both look fine in isolation.
+  const { TABS } = await import("../src/cell/ui.ts");
+  const labels = TABS.map((t) => t.label);
+  for (
+    const want of [
+      "All-in-one",
+      "Machine",
+      "CPU",
+      "GPU",
+      "Memory",
+      "Build",
+      "Models",
+      "Tune",
+      "Server",
+      "Chat",
+      "About",
+    ]
+  ) {
+    assert(labels.includes(want), `no tab labelled "${want}" (have ${labels})`);
+  }
+  // And every tab is routed, not silently falling through to the default.
+  const app = await Deno.readTextFile(
+    new URL("../src/App.tsx", import.meta.url),
+  );
+  for (const t of TABS) {
+    if (t.id === "one") continue; // the default case
+    assert(
+      app.includes(`case "${t.id}":`),
+      `tab "${t.id}" has no case in the router`,
+    );
+  }
+});
+
+for (
+  const [name, tab, marker] of [
+    ["CPU", "cpu", "What llama.cpp is told to use"],
+    ["GPU", "gpu", "Which GPUs llama.cpp may use"],
+    ["Memory", "memory", "Storage"],
+  ] as const
+) {
+  testUI(App, `the ${name} page renders its own detail`, async (ui_) => {
+    // Settle first: `ui.tab` is persisted and its rehydration on mount is
+    // async, so a rail click issued before it lands is silently reverted.
+    await ui_.settle();
+    await hw.refresh(true);
+    ui_.App[`tab-${tab}`].click();
+    await ui_.expectCell(ui, (s) => s.tab === tab);
+    assertStringIncludes(ui_.html(), marker);
+  });
+}

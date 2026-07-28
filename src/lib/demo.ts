@@ -16,7 +16,7 @@
 //
 // Pure data: no I/O, so it is safe to import anywhere.
 
-import type { Build, Cpu, Gpu, Mem, ModelMeta } from "./types.ts";
+import type { Build, Cpu, Disk, Gpu, Mem, ModelMeta } from "./types.ts";
 
 const GB = 1024 ** 3;
 
@@ -155,4 +155,24 @@ export function demoBuilds(): Build[] {
     createdAt: 0,
     sizeB: 512 * 1024 * 1024,
   }];
+}
+
+/** Filesystems that do not exist, so a screenshot carries nobody's mount table. */
+export function demoDisks(): Disk[] {
+  return [
+    {
+      filesystem: "/dev/example1",
+      mount: "/",
+      totalB: 1_000 * GB,
+      usedB: 220 * GB,
+      availB: 780 * GB,
+    },
+    {
+      filesystem: "/dev/example2",
+      mount: "/models",
+      totalB: 2_000 * GB,
+      usedB: 1_400 * GB,
+      availB: 600 * GB,
+    },
+  ];
 }

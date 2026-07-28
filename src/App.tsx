@@ -12,6 +12,9 @@ import { commandLine } from "./lib/command.ts";
 import { Pill } from "./ui/kit.tsx";
 import { MemoryMini } from "./ui/Memory.tsx";
 import { Dashboard } from "./ui/Dashboard.tsx";
+import { CpuPanel } from "./ui/CpuPanel.tsx";
+import { GpuPanel } from "./ui/GpuPanel.tsx";
+import { MemoryPanel } from "./ui/MemoryPanel.tsx";
 import { BuildPanel } from "./ui/BuildPanel.tsx";
 import { ModelsPanel } from "./ui/ModelsPanel.tsx";
 import { TunePanel } from "./ui/TunePanel.tsx";
@@ -261,6 +264,12 @@ function Panel() {
       return <About />;
     case "dashboard":
       return <Dashboard />;
+    case "cpu":
+      return <CpuPanel />;
+    case "gpu":
+      return <GpuPanel />;
+    case "memory":
+      return <MemoryPanel />;
     default:
       return <OnePage />;
   }

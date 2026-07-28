@@ -87,6 +87,7 @@ import {
 } from "../src/lib/backend.ts";
 import { diagnoseFailure, diagnoseNoAsset } from "../src/lib/diagnose.ts";
 import { isNearBottom, stickToBottom } from "../src/lib/scroll.ts";
+import { parseDf, tooFullToBuild } from "../src/lib/disk.ts";
 import { demoCpu, demoGpus, demoMem, demoModels } from "../src/lib/demo.ts";
 import {
   devices,
@@ -2730,4 +2731,50 @@ Deno.test("plan: an idle machine is not given advice about a model it has no", (
     ngl: 0,
   });
   assert(loaded.notes.some((n) => n.includes("GPU layers is 0")));
+});
+
+// ── storage ────────────────────────────────────────────────────────────────
+
+Deno.test("disk: df output parses, and one filesystem is counted once", () => {
+  // Verbatim `df -kP` from the development machine, which is the spec: `-P` is
+  // what keeps the columns aligned when a device name is long.
+  const out =
+    `Filesystem            1024-blocks       Used  Available Capacity Mounted on
+/dev/nvme0n1p4         1572096000  187242512 1384853488      12% /
+/dev/mapper/cryptHome  2353905664 2261927900   88748452      97% /home
+/dev/mapper/cryptHome  2353905664 2261927900   88748452      97% /home`;
+  const d = parseDf(out);
+  assertEquals(d.length, 2, "the repeated mount is counted once");
+  assertEquals(d[0]!.mount, "/");
+  assertEquals(d[0]!.filesystem, "/dev/nvme0n1p4");
+  assertEquals(d[0]!.totalB, 1572096000 * 1024);
+  assertEquals(d[1]!.mount, "/home");
+  // `available` is not `total - used`: the reserved blocks are root's.
+  assert(d[1]!.availB < d[1]!.totalB - d[1]!.usedB + 1024 * 1024 * 1024);
+
+  // A mount point with spaces keeps them.
+  const spaced = parseDf(
+    `Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/sdb1 1000 500 500 50% /media/my drive`,
+  );
+  assertEquals(spaced[0]!.mount, "/media/my drive");
+
+  // Junk is skipped rather than producing NaN rows.
+  assertEquals(parseDf("").length, 0);
+  assertEquals(parseDf("Filesystem\nnot a row at all").length, 0);
+});
+
+Deno.test("disk: a filesystem too full for a source build is flagged", () => {
+  const GB = 1024 ** 3;
+  const roomy = {
+    filesystem: "a",
+    mount: "/",
+    totalB: 500 * GB,
+    usedB: 100 * GB,
+    availB: 400 * GB,
+  };
+  const tight = { ...roomy, availB: 2 * GB };
+  assertEquals(tooFullToBuild(roomy), false);
+  assertEquals(tooFullToBuild(tight), true, "2 GB will not hold a cmake tree");
+  assertEquals(tooFullToBuild(null), false, "unknown is not a failure");
 });

@@ -2,6 +2,8 @@
 // planners, and the UI. Types only: importing this file pulls in no runtime and
 // no platform API, so it is safe on both sides of the wire.
 
+import type { Disk } from "./disk.ts";
+
 /** One transformer block's byte footprint, as measured from the GGUF header. */
 export type LayerBytes = {
   i: number;
@@ -102,10 +104,15 @@ export type Mem = {
 };
 
 /** Everything the tuner is allowed to reason about. */
+export type { Disk };
+
 export type Hw = {
   cpu: Cpu | null;
   mem: Mem | null;
   gpus: Gpu[];
+  /** Filesystems this app writes to. The third memory pool: builds and models
+   *  are gigabytes, and "no space left on device" is a real build failure. */
+  disks?: Disk[];
   os: string;
   arch: string;
   /** Backend of the build that will actually run this — part of the machine as

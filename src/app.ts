@@ -54,6 +54,9 @@ await aio.run({
     // 5 s: a llama-server left behind by a crash keeps its VRAM, and that is
     // the usual reason the next Start fails. Cheap /proc scan.
     { id: "srv.orphans", every: 5000, action: srv.scanOrphans.action() },
+    // 30 s: free disk space. `df` is a subprocess and space does not move
+    // second to second, but a build that runs out part-way wastes minutes.
+    { id: "hw.disks", every: 30_000, action: hw.refreshDisks.action() },
     // 5 min: has llama.cpp moved on? Two HTTP calls, and the answer drives the
     // Update button. Cheap enough to run forever, slow enough to be polite.
     {
@@ -76,6 +79,7 @@ await aio.run({
     // deliberately not persisted (a stale list is worse than none), so the
     // only way it is there on the first frame is to fetch it here.
     builds.loadAssets();
+    hw.refreshDisks();
     // Before anything else: is memory still held by a previous run?
     srv.scanOrphans();
   },

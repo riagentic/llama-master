@@ -2059,6 +2059,82 @@ input[type="checkbox"] {
   margin-bottom: 8px;
 }
 
+/* ── the CPU / GPU / Memory detail pages ────────────────────────────────── */
+
+.cpu-head,
+.gpu-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.cpu-head .kv-grid {
+  flex: 1;
+  min-width: 0;
+}
+
+/* One row per core: index, bar, percentage. Reads as a bar chart without being
+   one, and stays legible at 32 cores. */
+.cores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 3px 12px;
+}
+
+.core {
+  display: grid;
+  grid-template-columns: 2.5ch 1fr 4ch;
+  align-items: center;
+  gap: 6px;
+}
+
+.core-n,
+.core-pct {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.core-pct {
+  text-align: right;
+}
+
+.gpu-cards {
+  display: grid;
+  gap: 12px;
+}
+
+.gpu-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+
+.gpu-name {
+  font-weight: 600;
+}
+
+.disks {
+  display: grid;
+  gap: 12px;
+}
+
+.disk {
+  display: grid;
+  gap: 4px;
+}
+
+.disk-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-sm);
+}
+
 /* The context row: a number, then one click each for the usual sizes. */
 .ctx-controls {
   display: grid;

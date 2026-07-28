@@ -9,13 +9,16 @@
 // one timer for every connected client, not one per open window.
 
 import { cell } from "aio";
-import type { Cpu, Gpu, Hw, Mem } from "../lib/types.ts";
+import type { Cpu, Disk, Gpu, Hw, Mem } from "../lib/types.ts";
 import { coresUtilPct, pushHistory, utilPct } from "../lib/procstat.ts";
 
 export type HwState = {
   cpu: Cpu | null;
   mem: Mem | null;
   gpus: Gpu[];
+  /** Filesystems this app writes to. Refreshed on its own slow schedule: it
+   *  shells out to `df`, and free space does not move second to second. */
+  disks: Disk[];
   os: string;
   arch: string;
   /** Previous `/proc/stat` samples — the other half of the utilization delta. */
@@ -39,6 +42,7 @@ export const hw = cell("hw", {
     cpu: null as Cpu | null,
     mem: null as Mem | null,
     gpus: [] as Gpu[],
+    disks: [] as Disk[],
     os: "",
     arch: "",
     prevStat: "",
@@ -51,6 +55,32 @@ export const hw = cell("hw", {
     lastError: "",
   } as HwState,
   methods: {
+    /** Free space on the filesystems this app writes to. Its own method, on a
+     *  30 s schedule (src/app.ts) — `df` is a subprocess, and the 1 s poll has
+     *  no business spawning one. */
+    async refreshDisks(s) {
+      const io = await import("./hw.server.ts");
+      const paths = await import("./host.server.ts").then((h) => {
+        const p = h.paths();
+        return [p.home, p.builds, p.cache];
+      });
+      const models = await import("./models.server.ts").then((m) =>
+        m.defaultDirs()
+      );
+      try {
+        const found = await io.disks([...paths, ...models]);
+        // Compare before writing: this runs on a schedule and an equal value
+        // would re-render the page for nothing.
+        const same = found.length === s.disks.length &&
+          found.every((d, i) =>
+            // aiol-ok
+            d.mount === s.disks[i]?.mount && d.availB === s.disks[i]?.availB
+          );
+        if (!same) s.disks = found;
+      } catch (e) {
+        s.lastError = `disk usage: ${e}`;
+      }
+    },
     async refresh(s, force?: boolean) {
       if (s.refreshing) return; // re-entrancy guard: polls can overlap on load
       if (s.paused && !force) return;

@@ -14,7 +14,15 @@ import { exec, PLATFORM } from "./host.server.ts";
 // Re-exported so the cell can stamp them into state without importing the
 // host module twice.
 export { ARCH, PLATFORM } from "./host.server.ts";
-import { DEMO_ENV, demoCpu, demoGpus, demoMem } from "../lib/demo.ts";
+import {
+  DEMO_ENV,
+  demoCpu,
+  demoDisks,
+  demoGpus,
+  demoMem,
+} from "../lib/demo.ts";
+import { parseDf } from "../lib/disk.ts";
+import type { Disk } from "../lib/disk.ts";
 import { cpuJson, gpuJson, memJson } from "./wasm.server.ts";
 
 async function read(path: string): Promise<string> {
@@ -196,6 +204,35 @@ export async function gpus(): Promise<Gpu[]> {
 }
 
 /** One shot of everything, read in parallel. */
+/**
+ * The filesystems this app writes to, and how much room is left on them.
+ *
+ * `df -kP` on POSIX; nothing on Windows yet, where the equivalent is a
+ * PowerShell call and this app has never been run. Deliberately a separate
+ * reader rather than part of `snapshot()`: it shells out, and disk space does
+ * not change on a one-second cadence, so it gets its own slower schedule.
+ */
+export async function disks(paths: string[]): Promise<Disk[]> {
+  if (Deno.env.get(DEMO_ENV) === "1") return demoDisks();
+  if (PLATFORM === "windows") return [];
+  // Only paths that exist: most of the default model locations do not, and `df`
+  // exits non-zero when ANY argument is missing. Passing them all and then
+  // trusting the exit code threw away every valid row — the first version of
+  // this returned nothing at all on a normal machine.
+  const live: string[] = [];
+  for (const p of paths) {
+    try {
+      await Deno.stat(p);
+      live.push(p);
+    } catch { /* not there — nothing to measure */ }
+  }
+  if (live.length === 0) return [];
+  const r = await exec("df", ["-kP", ...live]);
+  // Parse stdout regardless of the exit code: `df` still prints the rows it
+  // could resolve, and a partial answer beats none.
+  return parseDf(r.stdout);
+}
+
 export async function snapshot(): Promise<{
   cpu: Cpu | null;
   mem: Mem | null;
