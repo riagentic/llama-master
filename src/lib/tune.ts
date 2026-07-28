@@ -289,11 +289,17 @@ function bestCtx(
   placement: Placement,
   ceiling: number,
 ): number {
-  const top = Math.max(MIN_CTX, Math.floor(ceiling / CTX_STEP) * CTX_STEP);
+  // The model's ceiling wins over our usability floor. A model trained for 128
+  // tokens cannot be handed 2,048 just because that is the shortest context we
+  // would normally propose — that would break the one rule this whole search
+  // exists to keep, which is never to exceed what the model was trained for.
+  const floor = Math.min(MIN_CTX, ceiling);
+  const rounded = Math.floor(ceiling / CTX_STEP) * CTX_STEP;
+  const top = Math.max(floor, rounded);
   if (place(meta, hw, base, placement, top)) return top;
-  if (!place(meta, hw, base, placement, MIN_CTX)) return 0;
+  if (!place(meta, hw, base, placement, floor)) return 0;
   // Invariant: lo fits, hi does not.
-  let lo = MIN_CTX;
+  let lo = floor;
   let hi = top;
   while (hi - lo > CTX_STEP) {
     const mid = Math.floor((lo + hi) / 2 / CTX_STEP) * CTX_STEP;
@@ -382,9 +388,10 @@ export function tune(
   if (ctx === 0) {
     // Nothing fits. Return an honest attempt so the UI still has numbers to
     // show, and say plainly that this placement is not available here.
-    const fallback = place(meta, hw, s, placement, MIN_CTX)?.settings ?? {
+    const floor = Math.min(MIN_CTX, ceiling);
+    const fallback = place(meta, hw, s, placement, floor)?.settings ?? {
       ...s,
-      ctxSize: MIN_CTX,
+      ctxSize: floor,
       ngl: placement === "cpu" ? 0 : 999,
     };
     const blocker = blockerFor(hw, placement);

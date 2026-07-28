@@ -1355,3 +1355,51 @@ testUI(
     }
   },
 );
+
+testUI(
+  OnePage as never,
+  "OnePage: both memory states are shown at once, and told apart",
+  async (ui_) => {
+    await ui_.settle();
+    const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
+    try {
+      await builds.scan();
+      await builds.setActive("stub-cuda");
+      await withModel(async (dir) => {
+        await models.addDir(dir);
+        await models.scan();
+        await ui_.settle();
+
+        // Both, simultaneously — they answer different questions, and showing
+        // one with a mode switch meant whichever you were not asking about was
+        // simply unavailable.
+        const html = ui_.html();
+        assertStringIncludes(html, "Current Memory State");
+        assertStringIncludes(html, "Projected Memory State");
+
+        // And llama.cpp's own share is distinguishable from everyone else's and
+        // from free space, in words as well as colour.
+        assertStringIncludes(html, "In use elsewhere");
+        assertStringIncludes(html, "KV cache");
+        assertStringIncludes(html, "Weights");
+
+        // Each table says which question it answers. The current state of an
+        // idle machine is not a projection, and calling it one was wrong.
+        assertStringIncludes(html, "as it is now");
+        assertStringIncludes(html, "What these settings would use.");
+
+        // And the page reads in decision order: state, settings, consequence.
+        const iCur = html.indexOf("Current Memory State");
+        const iRun = html.indexOf("Run a model");
+        const iProj = html.indexOf("Projected Memory State");
+        assert(
+          iCur < iRun && iRun < iProj,
+          `order should be current -> settings -> projected, got ${iCur}/${iRun}/${iProj}`,
+        );
+      });
+    } finally {
+      await removeStubBuild("stub-cuda");
+      assert(bin.length > 0);
+    }
+  },
+);

@@ -183,6 +183,77 @@ function pool(
   };
 }
 
+/**
+ * A model-shaped nothing.
+ *
+ * Lets the "what does the machine look like right now" view go through the same
+ * `plan` as everything else: every llama.cpp bucket comes out zero, and the
+ * pools still report what other processes hold and what is free. One code path
+ * for both states beats a second, subtly different one.
+ */
+export const NO_MODEL: ModelMeta = {
+  version: 0,
+  arch: "",
+  name: "",
+  quant: "",
+  nLayer: 0,
+  nCtxTrain: 0,
+  nEmbd: 0,
+  nHead: 0,
+  nHeadKv: 0,
+  keyLength: 0,
+  valueLength: 0,
+  swaWindow: 0,
+  swaPattern: 1,
+  kvLoraRank: 0,
+  nExpert: 0,
+  nExpertUsed: 0,
+  ropeFreqBase: 0,
+  nTensors: 0,
+  tensorBytes: 0,
+  embdBytes: 0,
+  outputBytes: 0,
+  unknownTypes: 0,
+  layers: [],
+};
+
+/**
+ * The machine with llama.master's own current usage taken back out.
+ *
+ * Needed for an honest projection. `plan` reads "in use by others" straight off
+ * the telemetry, which includes a llama-server this app is running — so
+ * projecting a model while one is already loaded counted the running one TWICE:
+ * once as other people's memory, once as the new plan. Removing our share first
+ * makes the projection what it claims to be: the machine as it will look once
+ * this model replaces whatever is loaded now.
+ *
+ * The VRAM subtraction is spread across cards in proportion to what each is
+ * holding. Per-process VRAM attribution is not available from the telemetry this
+ * app collects, and proportional is the honest approximation — the total is
+ * exact, only its split across cards is inferred.
+ */
+export function withoutOurUsage(hw: Hw, ourVramB: number, ourRamB: number): Hw {
+  const usedTotal = sum(hw.gpus.map((g) => g.vramUsedB));
+  const takeVram = Math.max(0, Math.min(ourVramB, usedTotal));
+  const gpus = hw.gpus.map((g) => ({
+    ...g,
+    vramUsedB: usedTotal > 0
+      ? Math.max(0, g.vramUsedB - takeVram * (g.vramUsedB / usedTotal))
+      : g.vramUsedB,
+  }));
+  const mem = hw.mem
+    ? {
+      ...hw.mem,
+      usedB: Math.max(0, hw.mem.usedB - Math.max(0, ourRamB)),
+      availableB: Math.min(
+        hw.mem.totalB,
+        hw.mem.availableB + Math.max(0, ourRamB),
+      ),
+    }
+    : hw.mem;
+  return { ...hw, gpus, mem };
+}
+
 /** VRAM currently held by anything other than the run we are planning. */
 function vramInUse(gpus: Gpu[]): number {
   return sum(gpus.map((g) => g.vramUsedB));
@@ -291,9 +362,13 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
       } — the OS will swap or the load will be killed.`,
     );
   }
+  // Advice needs something to advise about. With no model (the "what is the
+  // machine doing right now" view goes through here as NO_MODEL) a note telling
+  // the user to raise their GPU layers is noise attached to an idle machine.
+  const haveModel = nLayer > 0;
   if (hw.gpus.length === 0) {
     notes.push("No GPU detected — everything runs on the CPU.");
-  } else if (layersOnGpu === 0 && !fullOffload) {
+  } else if (haveModel && layersOnGpu === 0 && !fullOffload) {
     notes.push(
       "GPU layers is 0, so the GPU is idle. Raise it to use the card.",
     );

@@ -33,8 +33,10 @@ import {
   effectiveCtx,
   kvPerToken,
   kvTotal,
+  NO_MODEL,
   plan,
   swaSplit,
+  withoutOurUsage,
 } from "../src/lib/plan.ts";
 import {
   bestPlacement,
@@ -2644,4 +2646,88 @@ Deno.test("context: the preset ladder is the one people recognise", () => {
   assertEquals(ctxLabel(2048), "2k");
   assertEquals(ctxLabel(1_048_576), "1M");
   assertEquals(ctxLabel(512), "512");
+});
+
+Deno.test("plan: a projection does not count our own running model twice", () => {
+  // The bug rule visuals#3 names. `plan` reads "in use by others" straight off
+  // the telemetry, and that includes a llama-server THIS app is running — so
+  // projecting a model while one was loaded charged the running one twice: once
+  // as somebody else's memory, once as the new plan. The projection has to be
+  // "current state, minus what we hold, plus the new model".
+  const GB = 1024 ** 3;
+  const machine = hw({
+    gpus: [{ ...gpu(24), vramUsedB: 9 * GB }],
+    mem: {
+      totalB: 64 * GB,
+      availableB: 40 * GB,
+      usedB: 24 * GB,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+  });
+
+  // 8 of those 9 GB are ours, and 6 GB of RAM.
+  const base = withoutOurUsage(machine, 8 * GB, 6 * GB);
+  assertEquals(
+    Math.round(base.gpus[0]!.vramUsedB / GB),
+    1,
+    "only the 1 GB that is not ours remains",
+  );
+  assertEquals(Math.round(base.mem!.availableB / GB), 46, "our RAM comes back");
+
+  // The projection is therefore smaller than one made without the subtraction.
+  const m = meta();
+  const naive = plan(m, machine, { ...defaults(), ngl: 999 });
+  const honest = plan(m, base, { ...defaults(), ngl: 999 });
+  assert(
+    honest.vram.otherB < naive.vram.otherB,
+    "the running model must not appear as other people's memory",
+  );
+  assert(
+    honest.vram.freeB > naive.vram.freeB,
+    "and its VRAM is available again",
+  );
+
+  // Never removes more than is there, and never invents free memory.
+  const over = withoutOurUsage(machine, 999 * GB, 999 * GB);
+  assert(over.gpus[0]!.vramUsedB >= 0);
+  assert(over.mem!.availableB <= over.mem!.totalB);
+  // Nothing of ours running: the machine is untouched.
+  const same = withoutOurUsage(machine, 0, 0);
+  assertEquals(same.gpus[0]!.vramUsedB, machine.gpus[0]!.vramUsedB);
+});
+
+Deno.test("plan: the current state of an idle machine has no llama.cpp in it", () => {
+  // The "nothing running" half of Current Memory State goes through the same
+  // `plan` as everything else, via NO_MODEL — one code path, not a second
+  // subtly-different one.
+  const GB = 1024 ** 3;
+  const machine = hw({ gpus: [{ ...gpu(24), vramUsedB: 2 * GB }] });
+  const p = plan(NO_MODEL, machine, { ...defaults(), ngl: 0 });
+  assertEquals(p.vram.usedB, 0, "we are using no VRAM");
+  assertEquals(p.kvTotalB, 0);
+  assertEquals(p.layersOnGpu, 0);
+  // But the machine's real occupancy still shows.
+  assertEquals(Math.round(p.vram.otherB / GB), 2);
+  assert(p.vram.freeB > 0);
+});
+
+Deno.test("plan: an idle machine is not given advice about a model it has no", () => {
+  // The "current state" view goes through `plan` as NO_MODEL, and it used to
+  // come back carrying "GPU layers is 0, so the GPU is idle. Raise it to use the
+  // card." — guidance attached to a machine with nothing loaded to raise.
+  const idle = plan(NO_MODEL, hw({ gpus: [gpu(24, 0)] }), {
+    ...defaults(),
+    ngl: 0,
+  });
+  assert(
+    !idle.notes.some((n) => n.includes("GPU layers is 0")),
+    `no advice without a model; got ${JSON.stringify(idle.notes)}`,
+  );
+  // With a real model the advice is still there — it is useful then.
+  const loaded = plan(meta(), hw({ gpus: [gpu(24, 0)] }), {
+    ...defaults(),
+    ngl: 0,
+  });
+  assert(loaded.notes.some((n) => n.includes("GPU layers is 0")));
 });

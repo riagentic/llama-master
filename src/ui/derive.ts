@@ -24,6 +24,8 @@ import { models } from "../cell/models.ts";
 import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
+import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
+import type { Plan } from "../lib/plan.ts";
 import { str } from "../lib/params.ts";
 import { updateFor } from "../lib/update.ts";
 import type { UpdateCheck } from "../lib/update.ts";
@@ -173,6 +175,49 @@ export function ctxOverride(): number {
 /** Is the memory view describing a live process rather than a plan? */
 export function memoryIsLive(): boolean {
   return srv.runSettings !== null && serverRunning();
+}
+
+/**
+ * The machine as it is RIGHT NOW.
+ *
+ * When a server is up this is the plan of the command it was actually started
+ * with, so llama.cpp's own share is itemised rather than lumped in with everyone
+ * else's; when nothing is running every llama.cpp bucket is zero and the pools
+ * show only what other processes hold and what is free. Same `plan` either way.
+ */
+export function currentStatePlan(): Plan {
+  const m = shownModel()?.meta;
+  if (memoryIsLive() && m && srv.runSettings) {
+    return computePlan(m, hwSnapshot(), srv.runSettings);
+  }
+  return computePlan(NO_MODEL, hwSnapshot(), { ...cfg.settings, ngl: 0 });
+}
+
+/** What llama.master itself is holding right now, so a projection can take it
+ *  back out instead of counting it as somebody else's memory. */
+export function ourUsageB(): { vramB: number; ramB: number } {
+  if (!memoryIsLive()) return { vramB: 0, ramB: 0 };
+  const p = currentStatePlan();
+  // RSS is measured; the VRAM figure is this app's own exact accounting for the
+  // command that is running, which is the best available — the telemetry does
+  // not attribute VRAM per process.
+  return { vramB: p.vram.usedB, ramB: srv.rssB || p.ram.usedB };
+}
+
+/**
+ * The machine as it WILL look once the selected model runs.
+ *
+ * Current state, minus whatever llama.master is holding now, plus the selected
+ * model under the selected settings — which is the definition that stops a
+ * running model being counted twice. Null when no model with a readable header
+ * is selected.
+ */
+export function projectedStatePlan(): Plan | null {
+  const m = currentModel()?.meta;
+  if (!m) return null;
+  const ours = ourUsageB();
+  const base = withoutOurUsage(hwSnapshot(), ours.vramB, ours.ramB);
+  return computePlan(m, base, cfg.settings);
 }
 
 export function serverRunning(): boolean {

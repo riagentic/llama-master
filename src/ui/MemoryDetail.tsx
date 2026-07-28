@@ -77,9 +77,13 @@ export function MemoryDetail(props: {
   plan: Plan;
   /** True when this describes a live process rather than a projection. */
   live?: boolean;
+  /** Which question this table answers. "current" describes the machine as it
+   *  is; "projected" describes what the settings would do. Passed rather than
+   *  inferred from `live`, because an idle machine's CURRENT state is not a
+   *  projection — labelling it one was simply wrong. */
+  mode?: "current" | "projected";
   /** Measured RSS of the running server, when there is one. */
   rssB?: number;
-  ctxLabel?: string;
 }) {
   const p = props.plan;
   const measured: Row[] = props.live && (props.rssB ?? 0) > 0
@@ -96,11 +100,17 @@ export function MemoryDetail(props: {
     <div class="memdetail-wrap" t="memory-detail">
       <div class="memdetail-head">
         <span class={props.live ? "pill tone-ok" : "pill tone-idle"}>
-          {props.live ? "running now" : "projected"}
+          {props.live
+            ? "running now"
+            : props.mode === "current"
+            ? "as it is now"
+            : "projected"}
         </span>
         <span class="dim">
           {props.live
             ? "What the running server is using."
+            : props.mode === "current"
+            ? "What the machine is using, with nothing of ours loaded."
             : "What these settings would use."}
         </span>
       </div>

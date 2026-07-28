@@ -17,7 +17,6 @@ import { builds } from "../cell/builds.ts";
 import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
-import { plan as computePlan } from "../lib/plan.ts";
 import { CPU_TJMAX, GPU_TJMAX, tempTone } from "../lib/thermal.ts";
 import { bytes, tps } from "../lib/format.ts";
 import { num } from "../lib/params.ts";
@@ -59,8 +58,9 @@ import {
   canSend,
   ctxOverride,
   currentModel,
-  hwSnapshot,
+  currentStatePlan,
   memoryIsLive,
+  projectedStatePlan,
   serverRunning,
   shownModel,
   shownSettings,
@@ -602,11 +602,11 @@ function MiniChat() {
 export function OnePage() {
   const running = serverRunning();
   const live = memoryIsLive();
-  // While a server is up this is the model and settings it was STARTED with.
-  const shownMeta = shownModel()?.meta ?? null;
-  const shownPlan = shownMeta
-    ? computePlan(shownMeta, hwSnapshot(), shownSettings())
-    : null;
+  // Now, and next. `currentPlan` describes the running command (or an idle
+  // machine); `projected` describes the selected model with our own current
+  // usage removed, so a running model is not counted twice.
+  const currentPlan = currentStatePlan();
+  const projected = projectedStatePlan();
   return (
     <div class="tab-body one-page" t="one-page">
       <OrphanBanner />
@@ -635,6 +635,33 @@ export function OnePage() {
         <Vitals />
       </Panel>
 
+      {
+        /* The page reads top to bottom as the decision itself: what the machine
+           is doing NOW, then the settings that change it, then what those
+           settings would give. Both states are on screen at once because they
+           answer different questions and the user needs both while choosing —
+           one visualisation with a mode switch made whichever question you were
+           not currently asking unavailable. */
+      }
+      <Panel
+        title="Current Memory State"
+        icon="▤"
+        wide
+        right={
+          <Pill tone={live ? "ok" : "idle"}>
+            {live ? "a model is running" : "nothing running"}
+          </Pill>
+        }
+      >
+        <MemoryMap plan={currentPlan} />
+        <MemoryDetail
+          plan={currentPlan}
+          live={live}
+          mode="current"
+          rssB={srv.rssB}
+        />
+      </Panel>
+
       <Panel
         title={running ? "Running" : "Run a model"}
         icon="▶"
@@ -654,30 +681,41 @@ export function OnePage() {
            been typed into the form. */
       }
       <Panel
-        title="Memory"
-        icon="▤"
+        title="Projected Memory State"
+        icon="▦"
         wide
         right={
-          <Pill tone={live ? "ok" : "idle"}>
-            {live ? "running now" : "projected"}
+          <Pill tone="idle">
+            {live ? "after replacing what runs" : "after starting"}
           </Pill>
         }
       >
-        {shownMeta
+        {projected
           ? (
             <>
-              <MemoryMap plan={shownPlan!} />
-              <MemoryDetail plan={shownPlan!} live={live} rssB={srv.rssB} />
+              {live
+                ? (
+                  <p class="dim projected-note">
+                    Current state with the running model taken back out, plus
+                    {" "}
+                    <b>{currentModel()?.file}</b>{" "}
+                    under these settings — one model runs at a time, so this is
+                    what a swap would look like.
+                  </p>
+                )
+                : null}
+              <MemoryMap plan={projected} />
+              <MemoryDetail plan={projected} mode="projected" />
             </>
           )
           : (
             <Empty
               icon="▢"
-              title={shownModel()
+              title={currentModel()
                 ? "This model's header could not be read"
-                : "Select a model to see how it fits"}
-              hint={shownModel()
-                ? "Nothing can be measured without it — the Models tab shows why."
+                : "Select a model to see how it would fit"}
+              hint={currentModel()
+                ? "Nothing can be projected without it — the Models tab shows why."
                 : "Press Detect if the list is empty."}
             />
           )}

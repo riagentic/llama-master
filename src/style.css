@@ -2054,6 +2054,11 @@ input[type="checkbox"] {
   flex: 1;
 }
 
+.projected-note {
+  font-size: var(--fs-sm);
+  margin-bottom: 8px;
+}
+
 /* The context row: a number, then one click each for the usual sizes. */
 .ctx-controls {
   display: grid;
