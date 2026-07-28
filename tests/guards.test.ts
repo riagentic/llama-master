@@ -305,3 +305,42 @@ Deno.test("guard: the icon PNG is present and current with the SVG", async () =>
     assert(src.includes(shape), `${f} must use the same diamond geometry`);
   }
 });
+
+Deno.test("guard: every per-method perf budget names a method that exists", async () => {
+  // aio validates these at `aio.run` now and throws under `strictCells`
+  // (verified: a typo'd key aborts boot naming the cell's real methods). This
+  // stays because the suite never calls `aio.run` — without it a typo would only
+  // surface when someone launches the app, not in CI.
+  //
+  // It found `builds:installRelease` the day it was written: releases install
+  // inside `builds:start`, so that budget had never applied to anything.
+  const app = await read(join(ROOT, "src", "app.ts"));
+  const declared = [
+    ...app.matchAll(/"([a-z0-9]+:[A-Za-z][A-Za-z0-9]*)":\s*\{\s*effect/g),
+  ]
+    .map((m) => m[1] as string);
+  assert(declared.length > 0, "expected per-method budgets in aio.run");
+
+  const real = new Set<string>();
+  for (const f of await filesUnder(join(ROOT, "src", "cell"), [".ts"])) {
+    if (f.endsWith(".server.ts")) continue;
+    const src = await read(f);
+    const cell = /\bcell\(\s*"([a-z0-9]+)"/.exec(src)?.[1];
+    const block = /\n {2}methods:\s*\{([\s\S]*?)\n {2}\},\n/.exec(src)?.[1];
+    if (!cell || !block) continue;
+    for (
+      const m of block.matchAll(
+        /^ {4}(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm,
+      )
+    ) {
+      real.add(`${cell}:${m[1]}`);
+    }
+  }
+  assert(
+    real.size > 20,
+    `expected to find the cells' methods, got ${real.size}`,
+  );
+
+  const dead = declared.filter((k) => !real.has(k));
+  assertEquals(dead, [], "these budgets name a method that does not exist");
+});

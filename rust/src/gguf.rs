@@ -290,6 +290,13 @@ pub struct Gguf {
     /// compressed latent of this rank plus the RoPE part, not one entry per
     /// head, which is a ~70x difference on V3. 0 = not an MLA model.
     pub kv_lora_rank: u64,
+    /// Multi-token-prediction blocks (`<arch>.nextn_predict_layers`). A model
+    /// that declares these ships an extra block that can DRAFT the next tokens,
+    /// which llama.cpp verifies against the full model — speculative decoding
+    /// that needs no second model and changes no output. `block_count` INCLUDES
+    /// them, and llama.cpp's own `n_layer()` subtracts them again, so the count
+    /// is only meaningful alongside this. 0 = not an MTP model.
+    pub nextn_layers: u64,
     pub n_expert: u64,
     pub n_expert_used: u64,
     pub rope_freq_base: f64,
@@ -455,6 +462,7 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         swa_window,
         swa_pattern,
         kv_lora_rank,
+        nextn_layers: a("nextn_predict_layers").unwrap_or(0.0) as u64,
         n_expert: a("expert_count").unwrap_or(0.0) as u64,
         n_expert_used: a("expert_used_count").unwrap_or(0.0) as u64,
         rope_freq_base: a("rope.freq_base").unwrap_or(0.0),
@@ -481,7 +489,7 @@ pub fn to_json(g: &Gguf) -> String {
             "{{\"ok\":true,\"version\":{},\"arch\":{},\"name\":{},\"quant\":{},",
             "\"nLayer\":{},\"nCtxTrain\":{},\"nEmbd\":{},\"nHead\":{},\"nHeadKv\":{},",
             "\"keyLength\":{},\"valueLength\":{},",
-            "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},",
+            "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"nextnLayers\":{},",
             "\"nExpert\":{},\"nExpertUsed\":{},",
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"embdBytes\":{},\"outputBytes\":{},",
             "\"unknownTypes\":{},\"layers\":[{}]}}"
@@ -500,6 +508,7 @@ pub fn to_json(g: &Gguf) -> String {
         g.swa_window,
         g.swa_pattern,
         g.kv_lora_rank,
+        g.nextn_layers,
         g.n_expert,
         g.n_expert_used,
         num(g.rope_freq_base),

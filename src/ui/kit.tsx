@@ -6,7 +6,18 @@
 // callbacks, which is what makes each piece renderable in a test in isolation.
 
 import type { JSX } from "aio/jsx-runtime";
-import { bytes as fmtBytes, pct as pctOf } from "../lib/format.ts";
+import {
+  bytes as fmtBytes,
+  pct as pctOf,
+  tps as fmtTps,
+} from "../lib/format.ts";
+import {
+  TPS_GREAT_AT,
+  TPS_POOR_BELOW,
+  tpsBand,
+  tpsLabel,
+  tpsWhy,
+} from "../lib/speed.ts";
 import { useStickyBottom } from "./sticky.ts";
 
 export type Tone = "ok" | "warn" | "bad" | "idle" | "busy" | "accent";
@@ -332,6 +343,67 @@ export function LogView(props: { lines: string[]; t?: string; rows?: number }) {
     >
       {props.lines.length === 0 ? "—" : props.lines.join("\n")}
     </pre>
+  );
+}
+
+/**
+ * Generation speed, as a number you can act on.
+ *
+ * A rate on its own means nothing to most people — is 7 tokens/second good? So
+ * the bar is banded against READING SPEED rather than against hardware, which is
+ * the question actually being asked ("will this be pleasant to use"): under ~5
+ * tok/s you are waiting for the model, and from ~20 it arrives faster than you
+ * can read. Colour carries the same three answers as everywhere else in this app,
+ * and the text says which it is, so the meaning does not live in hue alone.
+ */
+export function TpsMeter(
+  props: { tps: number; measured?: boolean; label?: string; t?: string },
+) {
+  const band = tpsBand(props.tps);
+  const tone = band === "poor" ? "bad" : band === "great" ? "ok" : "warn";
+  // The bar saturates at the point where more speed stops being noticeable.
+  const pct = Math.max(
+    0,
+    Math.min(100, (props.tps / (TPS_GREAT_AT * 1.5)) * 100),
+  );
+  return (
+    <div class="tps-meter" t={props.t ?? "tps-meter"} title={tpsWhy(band)}>
+      <div class="tps-head">
+        <span class="tps-label">{props.label ?? "Speed"}</span>
+        <b class={`tps-value tone-${tone}`}>
+          {props.tps > 0 ? fmtTps(props.tps) : "—"}
+        </b>
+        <span class="tps-unit">tok/s</span>
+        <span class={`pill tone-${tone}`}>{tpsLabel(band)}</span>
+        {props.measured === false
+          ? (
+            <span
+              class="dim tps-est"
+              title="No reply timed on this machine yet — this uses a default bandwidth. It becomes measured after one chat."
+            >
+              ≈ estimated
+            </span>
+          )
+          : null}
+      </div>
+      <div class="tps-track">
+        {/* The band boundaries, drawn on the track so the number has a scale. */}
+        <div
+          class="tps-zone tps-poor"
+          style={{ width: `${(TPS_POOR_BELOW / (TPS_GREAT_AT * 1.5)) * 100}%` }}
+        />
+        <div
+          class="tps-zone tps-ok"
+          style={{
+            width: `${
+              ((TPS_GREAT_AT - TPS_POOR_BELOW) / (TPS_GREAT_AT * 1.5)) * 100
+            }%`,
+          }}
+        />
+        <div class="tps-zone tps-great" />
+        <div class={`tps-needle tone-${tone}`} style={{ left: `${pct}%` }} />
+      </div>
+    </div>
   );
 }
 

@@ -3095,3 +3095,73 @@ Deno.test("tune: a refusal names the constraint that actually binds", () => {
   assert(big.nLayer === plan(big, free, ok.settings).layersOnGpu, "all on GPU");
   assert(GB > 0);
 });
+
+Deno.test("mtp: speculative decoding is taken when the model ships the block", () => {
+  // The rare optimisation with nothing to weigh: the full model verifies every
+  // drafted token, so a rejected draft is discarded and the output is exactly
+  // what it would have been. The weights are in the file and loaded either way,
+  // so leaving it off pays for them and gets nothing.
+  const mtp = meta({ name: "MTP model", nextnLayers: 1 });
+  const plain = meta({ name: "plain model", nextnLayers: 0 });
+  const machine = hw({ gpus: [gpu(24, 0.5)], backend: "cuda" });
+
+  const t = tune(mtp, machine, defaults(), "vram");
+  assertEquals(str(t.settings, "specType"), "draft-mtp");
+  assertStringIncludes(
+    t.reasons.join(" "),
+    "multi-token-prediction",
+    "and it says why",
+  );
+  assertStringIncludes(
+    argv("server", { bin: "x", model: "m.gguf", settings: t.settings }).join(
+      " ",
+    ),
+    "--spec-type draft-mtp",
+  );
+
+  // NEVER for a model without the block: llama.cpp asserts on
+  // `n_layer_nextn > 0` and refuses to load, so this would be "optimal
+  // settings" that do not start.
+  const off = tune(plain, machine, defaults(), "vram");
+  assertEquals(str(off.settings, "specType"), "");
+  assert(
+    !argv("server", { bin: "x", model: "m.gguf", settings: off.settings })
+      .includes("--spec-type"),
+    "the flag must not reach argv for a model that cannot honour it",
+  );
+
+  // A cache type left over from an MTP model is not inherited by the next.
+  const back = tune(plain, machine, t.settings, "vram");
+  assertEquals(str(back.settings, "specType"), "", "reset for the next model");
+});
+
+Deno.test("mtp: the draft context is planned for, not discovered at load", () => {
+  // llama.cpp reserves "context+compute" for the MTP draft before fitting the
+  // target model — the drafting block lives on the target so its weights are
+  // already counted, but the second context is real. A plan that ignored it could
+  // hand back settings that stop fitting the moment the flag is emitted.
+  const m = meta({ name: "MTP", nextnLayers: 1, nCtxTrain: 32768 });
+  const machine = hw({ gpus: [gpu(24, 0.5)], backend: "cuda" });
+  const base = { ...defaults(), ctxSize: 32768, ngl: 999 };
+
+  const without = plan(m, machine, { ...base, specType: "" });
+  const with_ = plan(m, machine, { ...base, specType: "draft-mtp" });
+  assert(
+    with_.vram.usedB > without.vram.usedB,
+    `enabling MTP must cost something: ${with_.vram.usedB} vs ${without.vram.usedB}`,
+  );
+  // One block's KV over the window, not a second model — so it is small.
+  const extra = with_.vram.usedB - without.vram.usedB;
+  assert(
+    extra < without.vram.usedB * 0.25,
+    `the draft context is one block, not a second model: ${extra}`,
+  );
+
+  // And a model with no MTP block is unaffected by the flag, because nothing
+  // will run: the plan must not invent a cost for a flag that cannot apply.
+  const plainM = meta({ name: "plain", nextnLayers: 0, nCtxTrain: 32768 });
+  assertEquals(
+    plan(plainM, machine, { ...base, specType: "draft-mtp" }).vram.usedB,
+    plan(plainM, machine, { ...base, specType: "" }).vram.usedB,
+  );
+});

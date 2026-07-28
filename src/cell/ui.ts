@@ -9,9 +9,11 @@ import { cell } from "aio";
 export type Tab =
   | "one"
   | "dashboard"
+  | "prereq"
   | "cpu"
   | "gpu"
   | "memory"
+  | "storage"
   | "build"
   | "models"
   | "settings"
@@ -23,12 +25,16 @@ export const TABS: readonly { id: Tab; label: string; icon: string }[] = [
   // First and default: most sessions never need to leave it.
   { id: "one", label: "All-in-one", icon: "◎" },
   { id: "dashboard", label: "Machine", icon: "▦" },
-  // The three "tell me about one pool" pages. Machine summarises all of them;
-  // these answer each on its own terms, including storage, which is the third
-  // thing this app fills.
+  // Prerequisites is a task, not a reading: a list with an action on most rows.
+  // The Machine page summarises it in one line and links here.
+  { id: "prereq", label: "Prerequisites", icon: "✓" },
+  // The "tell me about one pool" pages. Machine summarises all of them; these
+  // answer each on its own terms — including storage, which is the third thing
+  // this app fills and the one that fails a build minutes in.
   { id: "cpu", label: "CPU", icon: "⚙" },
   { id: "gpu", label: "GPU", icon: "◈" },
   { id: "memory", label: "Memory", icon: "▤" },
+  { id: "storage", label: "Storage", icon: "▣" },
   { id: "build", label: "Build", icon: "⚒" },
   { id: "models", label: "Models", icon: "◈" },
   { id: "settings", label: "Tune", icon: "⚙" },

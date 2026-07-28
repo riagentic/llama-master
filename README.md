@@ -13,37 +13,39 @@ anything is started.
 <sub>Screenshot taken in demo mode (`LLAMA_MASTER_DEMO=1`): the machine, the
 models and the build shown in it are fictional.</sub>
 
-> **0.1.1.** Developed and tested on Linux/x86_64 with NVIDIA and AMD hardware.
+> **0.1.2.** Developed and tested on Linux/x86_64 with NVIDIA and AMD hardware.
 > The macOS and Windows paths are implemented but have not been run by the
 > author; see [Status](#status).
 >
-> _Since 0.1.0:_
+> _Since 0.1.1:_
 >
-> - **A running model is no longer counted as somebody else's memory.** The
->   driver reports device-wide VRAM, so while llama-server held 39 GB every
->   "would this fit?" question was asked against a machine that looked full —
->   and the app said _"VRAM only: does not fit"_ about a model that was at that
->   moment running entirely in VRAM. Placements, the tuner, the stability check
->   and both memory plans now attribute our own bytes to us.
-> - **A refusal names the constraint that actually binds** — "needs 37.3 GB,
->   there is 4.8 GB available of 47.8 GB (other processes hold 43.0 GB)", not
->   "does not fit in 47.8 GB of VRAM", which blamed the model for someone else's
->   occupancy.
-> - **It adapts to memory that moves.** A game taking VRAM, a compile taking
->   RAM, or either finishing, re-runs the tuning — coarsely, so settings are not
->   rewritten on every 1 s sample. A model already loaded cannot be re-placed,
->   so it says instead whether it is being squeezed or has room to spare, with a
->   restart button.
-> - Context now has named **Min / Opt / Big / Max** sizes and a picture of the
->   usable range, on both the all-in-one and Tune pages. Only Max is read from
->   the model; the rest are marked `≈` because a GGUF header carries no quality
->   signal.
-> - The default build backend follows the hardware instead of defaulting to CPU;
->   the tuner refuses to plan against a machine it has not measured yet (which
->   could leave a GPU idle for a whole session); a quantised KV cache is also
->   chosen to keep layers on the GPU, not only to buy context; server status is
->   shown at a size you cannot miss; and the chat says when it is waiting for
->   the first token.
+> - **Speculative decoding, on by default where the model supports it.** A model
+>   that ships a multi-token-prediction block (`nextn_predict_layers`) now gets
+>   `--spec-type draft-mtp` as part of optimal settings. It is lossless by
+>   construction — the full model verifies every drafted token, so the output is
+>   exactly what it would have been and only the speed changes — and the block
+>   is loaded either way, so leaving it off paid for it and got nothing. Never
+>   set for a model without one: llama.cpp refuses to load, and the control says
+>   so rather than offering a flag that cannot work.
+> - **Every dropdown showed the wrong value.** Flash attention displayed `auto`
+>   while `-fa on` ran; the KV cache type showed `f32` while `q8_0` ran. The
+>   settings were right and the page was misreporting them, which is the exact
+>   opposite of what this app promises. Found only by reading a live client —
+>   the in-process test harness did not reproduce it.
+> - **Prerequisites and Storage are their own pages.** Storage says which of the
+>   disk is _ours_ — `df` tells you a disk is full, not that 40 GB of it is
+>   three builds you stopped using.
+> - **The all-in-one page fits one window**, with chat as a full-height column
+>   beside the numbers rather than a panel below them.
+> - **Estimated tokens/second**, with a meter banded on reading speed: under 5
+>   tok/s you wait for the model, over 20 it outruns your eyes. Bytes-per-token
+>   are exact; the bandwidth starts from a labelled default and calibrates from
+>   your first real reply.
+> - **Context has named Min / Opt / Big / Max sizes** and a drawn usable range,
+>   on both the all-in-one and Tune pages. Only Max is read from the model; the
+>   rest are marked `≈`.
+> - Per-method performance budgets replace one global ceiling, and the memory
+>   plan accounts for the MTP draft context before it is enabled.
 
 ## What it does
 

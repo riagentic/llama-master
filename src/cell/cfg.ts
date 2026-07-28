@@ -35,6 +35,11 @@ export type CfgState = {
    *  usually wrong for the next. Switchable off, because someone who has hand-
    *  tuned a command does not want it rewritten under them. */
   autoOptimal: boolean;
+  /** This machine's measured effective memory bandwidth, bytes/second, learned
+   *  from real generation (`src/lib/speed.ts:calibrate`). 0 = never measured, in
+   *  which case a labelled default is used instead. */
+  gpuBps: number;
+  ramBps: number;
   /** Show the rarely-needed flags. */
   advanced: boolean;
   /** Settings the user has changed away from the llama.cpp default. */
@@ -51,12 +56,29 @@ export const cfg = cell("cfg", {
     ctxOverride: 0,
     ctxOverrideFor: "",
     autoOptimal: true,
+    gpuBps: 0,
+    ramBps: 0,
     advanced: false,
     touched: [] as string[],
   } as CfgState,
   methods: {
     toggleAutoOptimal(s) {
       s.autoOptimal = !s.autoOptimal;
+    },
+    /**
+     * Record what this machine actually achieved.
+     *
+     * Speed is estimated from bandwidth ÷ bytes-per-token, and bandwidth is the
+     * one term that cannot be read off the machine — `nvidia-smi` does not report
+     * bus width, and the achieved fraction depends on the kernel anyway. So the
+     * app starts from a labelled default and replaces it the first time a real
+     * reply gives it a rate to work back from. Only a run living almost entirely
+     * in one pool says anything about that pool; `calibrate` returns nothing for
+     * a hybrid run rather than blaming one side.
+     */
+    setSpeedCal(s, cal: { gpuBps?: number; ramBps?: number }) {
+      if (cal.gpuBps && cal.gpuBps > 0) s.gpuBps = cal.gpuBps;
+      if (cal.ramBps && cal.ramBps > 0) s.ramBps = cal.ramBps;
     },
     /** Set one parameter from a UI control. The raw value is coerced and
      *  clamped by the catalog, so state can never hold NaN or an out-of-range

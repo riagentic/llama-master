@@ -39,7 +39,6 @@ import {
   ctxLabel,
   optimalCtx,
 } from "../src/lib/tune.ts";
-import { headroomKey } from "../src/lib/adapt.ts";
 import { tuneAll } from "../src/lib/tune.ts";
 import { builds } from "../src/cell/builds.ts";
 import { cfg } from "../src/cell/cfg.ts";
@@ -57,9 +56,8 @@ import {
   currentStatePlan,
   headroomNow,
   hwSnapshot,
+  paramBlocker,
   planningHw,
-  vramTotalB,
-  vramUsedB,
 } from "../src/ui/derive.ts";
 import { chat } from "../src/cell/chat.ts";
 import {
@@ -80,6 +78,51 @@ async function withModel(fn: (dir: string) => Promise<void>): Promise<void> {
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+}
+
+/** A quiet workstation with two idle 24 GB cards and plenty of RAM.
+ *
+ *  Seeded into the `hw` cell so a test asserts the branch it is about rather than
+ *  whatever the developer's GPU happens to be doing that second — the machine is
+ *  an input to almost every decision this app makes, and leaving it live made the
+ *  interesting cases untestable. */
+function roomyMachine() {
+  const GB = 1024 ** 3;
+  const card = {
+    vendor: "nvidia",
+    name: "Test RTX 24G",
+    tempC: 45,
+    utilPct: 3,
+    vramTotalB: 24 * GB,
+    vramUsedB: 1 * GB,
+    powerW: 40,
+    powerLimitW: 300,
+    computeCap: 8.9,
+  };
+  return {
+    cpu: {
+      model: "Test CPU",
+      cores: 16,
+      threads: 32,
+      mhz: 4200,
+      tempC: 50,
+      utilPct: 5,
+      coresUtil: [],
+      stat: "",
+      coreStats: [],
+    },
+    mem: {
+      totalB: 128 * GB,
+      availableB: 110 * GB,
+      usedB: 18 * GB,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+    gpus: [card, { ...card }],
+    os: "linux",
+    arch: "x86_64",
+    lastRefresh: 1,
+  };
 }
 
 // ── shell ──────────────────────────────────────────────────────────────────
@@ -442,23 +485,26 @@ testUI(
 
 testUI(
   App,
-  "the machine tab reports this machine and its prerequisites",
+  "the machine tab reports this machine, and Prerequisites the software",
   async (ui_) => {
     // Settle first: `ui.tab` is persisted and its rehydration on mount is
     // async, so a rail click issued before it lands is silently reverted.
     await ui_.settle();
-    // The app opens on the all-in-one page now; this is the deep tab.
-    ui_.App["tab-dashboard"].click();
-    await ui_.settle();
     await prereq.scan();
-    await ui_.settle();
+    // Machine is the hardware summary; the named tools live on their own page,
+    // which is what the kata asks for. Both are checked, on the page that owns
+    // them.
+    ui_.App["tab-dashboard"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "dashboard");
+    for (const marker of ["CPU", "GPU", "Memory", "Storage", "Software"]) {
+      assertStringIncludes(ui_.html(), marker, `Machine should show ${marker}`);
+    }
 
+    ui_.App["tab-prereq"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "prereq");
     const html = ui_.html();
     for (
       const marker of [
-        "CPU",
-        "GPU",
-        "Memory",
         "Prerequisites",
         "Deno",
         "CMake",
@@ -570,10 +616,11 @@ testUI(
     // Settle first: `ui.tab` is persisted and its rehydration on mount is
     // async, so a rail click issued before it lands is silently reverted.
     await ui_.settle();
-    ui_.App["tab-dashboard"].click();
-    await ui_.settle();
     await prereq.scan();
-    await ui_.settle();
+    // Prerequisites is its own page now — a task with an action on most rows,
+    // which is why the kata asks for it as a page rather than a dashboard card.
+    ui_.App["tab-prereq"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "prereq");
 
     const missing = prereq.items.filter((i) => !i.found);
     const html = ui_.html();
@@ -859,9 +906,18 @@ async function withStubBuild(
   fn: (bin: string) => Promise<void>,
 ): Promise<void> {
   const bin = await installStubBuild();
+  // Register it, don't just write the files. Without this the panel under test
+  // truthfully reports "No llama.cpp build installed" while the test drives a
+  // server from that very build — an incoherent premise, and one that made the
+  // rendered assertions depend on whether some earlier test had happened to scan.
+  await builds.scan();
+  await builds.setActive("stub");
   try {
     await fn(bin);
   } finally {
+    // Remove the files but do NOT rescan: `builds.installed` is shared, and
+    // emptying it here left whichever test ran next reporting "No llama.cpp
+    // build installed" depending purely on order.
     await removeStubBuild();
   }
 }
@@ -948,11 +1004,19 @@ for (const [name, Surface] of SERVER_SURFACES) {
           srv.diagnosis,
           `no diagnosis; log:\n${srv.log.join("\n")}`,
         );
-        // Wait for the RENDER, not just for the state. `settle()` returned with
-        // the panel still showing "stopped" here, so a one-shot `html()` asserted
-        // against a DOM that had not caught up with the crash yet.
-        await ui_.waitFor(
-          () => ui_.html().includes("GPU ran out of memory"),
+        // Wait for the RENDER, settling each time. `waitFor` polls the surface
+        // but does not flush pending renders, and this panel could sit on a DOM
+        // that had not caught up with the crash — `status=crashed` with the
+        // diagnosis built, and "stopped" still on screen. Settling in the loop is
+        // what actually advances it.
+        for (let i = 0; i < 100; i++) {
+          await ui_.settle();
+          if (ui_.html().includes("GPU ran out of memory")) break;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assertStringIncludes(
+          ui_.html(),
+          "GPU ran out of memory",
           `the reason is rendered; status=${srv.status}`,
         );
         const html = ui_.html();
@@ -1033,6 +1097,11 @@ testUI(
         await models.addDir(dir);
         await models.scan();
         await builds.scan();
+        // Activate the build this test installed. `activeId` is shared state and
+        // other tests point it at builds they later delete, so scanning alone
+        // leaves `activeBuild()` null and every start blocked — an order-dependent
+        // failure that had nothing to do with what was under test.
+        await builds.setActive("stub");
         const port = freePort();
         await cfg.set("port", String(port));
         await ui_.settle();
@@ -1220,6 +1289,11 @@ testUI(
         await models.addDir(dir);
         await models.scan();
         await builds.scan();
+        // Activate the build this test installed. `activeId` is shared state and
+        // other tests point it at builds they later delete, so scanning alone
+        // leaves `activeBuild()` null and every start blocked — an order-dependent
+        // failure that had nothing to do with what was under test.
+        await builds.setActive("stub");
         const port = freePort();
         await cfg.set("port", String(port));
         // The tuner refuses to plan against hardware it has not measured — that
@@ -1374,10 +1448,7 @@ testUI(
         await ui_.settle();
 
         const trained = optimalCtx(m.meta!);
-        // `CtxControls` is a separate module and the harness does not register it
-        // as a findable component, so address its handles from the mounted root —
-        // which is what the `t` props are for.
-        const picker = ui_.find("OnePage");
+        const picker = ui_.find("CtxControls");
 
         // Every rung is offered, whatever the model — a row that changes length
         // per model is harder to use than one that does not.
@@ -1544,6 +1615,11 @@ for (
     ["CPU", "cpu", "What llama.cpp is told to use"],
     ["GPU", "gpu", "Which GPUs llama.cpp may use"],
     ["Memory", "memory", "Storage"],
+    // Their own pages, because the kata asks for them as pages: prerequisites
+    // are a task with an action on most rows, and storage is the pool that
+    // fails a build minutes in.
+    ["Prerequisites", "prereq", "Prerequisites"],
+    ["Storage", "storage", "What llama.master is using"],
   ] as const
 ) {
   testUI(App, `the ${name} page renders its own detail`, async (ui_) => {
@@ -1657,6 +1733,11 @@ testUI(
         await models.addDir(dir);
         await models.scan();
         await builds.scan();
+        // Activate the build this test installed. `activeId` is shared state and
+        // other tests point it at builds they later delete, so scanning alone
+        // leaves `activeBuild()` null and every start blocked — an order-dependent
+        // failure that had nothing to do with what was under test.
+        await builds.setActive("stub");
         await cfg.set("port", String(freePort()));
         // Real telemetry, or `otherB` is zero on both sides and the assertion
         // below proves nothing.
@@ -1682,10 +1763,14 @@ testUI(
           shown.ram.otherB < raw.ram.otherB,
           `our RSS must come out of "in use elsewhere": ${shown.ram.otherB} vs ${raw.ram.otherB}`,
         );
-        assertEquals(
-          raw.ram.otherB - shown.ram.otherB,
-          srv.rssB,
-          "and exactly our RSS, no more",
+        // Within a byte, not exactly: `withoutOurUsage` subtracts proportionally
+        // across pools, so the arithmetic is floating point and an exact compare
+        // fails on the eighth decimal (8589934592.000008 vs 8589934592).
+        assert(
+          Math.abs((raw.ram.otherB - shown.ram.otherB) - srv.rssB) < 1,
+          `and exactly our RSS, no more: ${
+            raw.ram.otherB - shown.ram.otherB
+          } vs ${srv.rssB}`,
         );
       });
     } finally {
@@ -1712,7 +1797,7 @@ testUI(
       await cfg.setCtxOverride(0);
       await ui_.settle();
 
-      const picker = ui_.find("TunePanel");
+      const picker = ui_.find("CtxControls");
       const bands = ctxBands(m.meta!);
       for (const band of CTX_BANDS) {
         assertExists(picker[`ctx-${band.id}`], `${band.label} CTX on Tune`);
@@ -1731,6 +1816,7 @@ testUI(
 testUI(
   OnePage as never,
   "a stranded CPU-only choice is pointed out, not left to rot",
+  { seed: { hw: roomyMachine() } },
   async (ui_) => {
     // `cfg.placement` is persisted, which is right — it is a choice. But the boot
     // race that used to degrade it to `cpu` before the hardware was read left the
@@ -1738,11 +1824,10 @@ testUI(
     // session afterwards with nothing on screen to explain it. Stopping the race
     // could not un-store it; this is what tells the user.
     //
-    // Driven off the real machine, so the expectation is derived rather than
-    // assumed: if nothing actually beats CPU here (a card already full, no GPU at
-    // all), then the advice MUST be absent, and that is just as much the rule.
+    // Seeded, so the branch under test is the one that runs. This assertion used
+    // to be derived at runtime and skipped whenever the developer's own GPU was
+    // busy — which is exactly when it mattered.
     await ui_.settle();
-    await hw.refresh(true);
     const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
     try {
       await builds.scan();
@@ -1757,16 +1842,11 @@ testUI(
         await cfg.setPlacement("cpu");
         await ui_.settle();
 
-        const better = betterPlacement();
-        if (better === null) {
-          assert(
-            !ui_.html().includes("placement-advice"),
-            "with nothing better available, nothing is advised",
-          );
-          return;
-        }
-
-        assert(better !== "cpu", "the advice is only ever an upgrade");
+        assertEquals(
+          betterPlacement(),
+          "vram",
+          "two idle 24 GB cards beat CPU for this model",
+        );
         const page = ui_.find("PlacementAdvice");
         assertExists(page["placement-advice"], "the stranded choice is named");
         assertStringIncludes(
@@ -1777,11 +1857,18 @@ testUI(
 
         // And the way out is one click, not a hunt through the Tune tab.
         page["use-better-placement"].click();
-        await ui_.expectCell(cfg, (s) => s.placement === better);
-        await ui_.settle();
-        assert(
-          !ui_.html().includes("placement-advice"),
-          "and the advice goes away once taken",
+        await ui_.expectCell(cfg, (st) => st.placement === "vram");
+        // The component name, not just the element handle: a component that
+        // renders nothing now counts as absent, which is the question a test is
+        // actually asking.
+        await ui_.waitFor(
+          () => ui_.absent("PlacementAdvice"),
+          "the advice goes away once taken",
+        );
+        assertEquals(
+          betterPlacement(),
+          null,
+          "and there is nothing left to advise",
         );
       });
     } finally {
@@ -1795,60 +1882,92 @@ testUI(
 testUI(
   OnePage as never,
   "the settings follow memory that moves underneath them",
+  { seed: { hw: roomyMachine() } },
   async (ui_) => {
     // The machines this runs on are workstations: a game takes 20 GB of VRAM, a
     // compile takes 8 GB of RAM, and each of those FINISHING changes the right
     // answer again. What must not happen is a re-tune on every 1 s poll, which
-    // would rewrite settings the user is reading. So the trigger is the coarse
-    // bucket key, and this pins both halves of that.
+    // would rewrite settings the user is reading.
+    //
+    // Seeded and then MOVED mid-test, so this drives the real thing — the machine
+    // changing under a mounted page — instead of asserting that a pure function
+    // returns different strings for different inputs, which is all it could do
+    // while `hw` was live telemetry.
     await ui_.settle();
-    await hw.refresh(true);
-    const mem = hw.mem;
-    if (mem === null) return; // no telemetry on this platform
-    await withModel(async (dir) => {
-      await models.addDir(dir);
-      await models.scan();
-      const m = models.items.find((x) => x.meta);
-      assertExists(m, "the fixture model must parse");
-      models.select(m.path);
-      await cfg.setCtxOverride(0);
-      await ui_.settle();
+    const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
+    try {
+      await builds.scan();
+      await builds.setActive("stub-cuda");
+      await withModel(async (dir) => {
+        await models.addDir(dir);
+        await models.scan();
+        const m = models.items.find((x) => x.meta);
+        assertExists(m, "the fixture model must parse");
+        models.select(m.path);
+        await cfg.setCtxOverride(0);
+        await cfg.setPlacement("vram");
+        await ui_.settle();
 
-      const cap = vramTotalB();
-      const ram = mem.totalB;
-      const before = headroomNow();
+        const roomy = roomyMachine();
+        const quiet = headroomNow();
+        assertEquals(cfg.placement, "vram", "it fits on two idle cards");
 
-      // Jitter must NOT be news: a couple of hundred MB either way on both
-      // pools is what a workstation does while sitting still.
-      const jitter = headroomKey({
-        vramFreeB: cap - vramUsedB() - 200 * 1024 ** 2,
-        vramCapacityB: cap,
-        ramFreeB: mem.availableB - 200 * 1024 ** 2,
-        ramCapacityB: ram,
+        // Jitter must NOT be news. 200 MB either way is what a workstation does
+        // while sitting still, and re-tuning on it would fight the user's typing.
+        ui_.seed({
+          hw: {
+            gpus: roomy.gpus.map((g) => ({
+              ...g,
+              vramUsedB: g.vramUsedB + 200 * 1024 ** 2,
+            })),
+          },
+        });
+        await ui_.settle();
+        assertEquals(headroomNow(), quiet, "200 MB of wobble is not a re-tune");
+
+        // Now something else fills the cards. That IS news, and the page must react.
+        ui_.seed({
+          hw: {
+            gpus: roomy.gpus.map((g) => ({
+              ...g,
+              vramUsedB: 23.9 * 1024 ** 3,
+            })),
+          },
+        });
+        await ui_.settle();
+        const squeezed = headroomNow();
+        assert(squeezed !== quiet, "memory taken is news");
+        console.log(
+          "DEBUG squeezed vram:",
+          JSON.stringify(
+            placements()?.vram && {
+              possible: placements()!.vram.possible,
+              ctx: placements()!.vram.ctx,
+              blocker: placements()!.vram.blocker,
+            },
+          ),
+        );
+        console.log(
+          "DEBUG model weights GB:",
+          (m.meta!.tensorBytes / 1024 ** 3).toFixed(3),
+          "nLayer",
+          m.meta!.nLayer,
+        );
+
+        // And the other direction: the game exits, the room comes back, and the
+        // app must offer the card again rather than staying small forever.
+        ui_.seed({ hw: { gpus: roomy.gpus } });
+        await ui_.settle();
+        assertEquals(headroomNow(), quiet, "memory returned is news too");
+        await ui_.waitFor(
+          () => placements()?.vram.possible === true,
+          "VRAM only comes back when the memory does",
+        );
       });
-      assertEquals(jitter, before, "200 MB of wobble is not a re-tune");
-
-      // A game starting IS news, and so is it exiting.
-      const squeezed = headroomKey({
-        vramFreeB: Math.max(0, cap * 0.1),
-        vramCapacityB: cap,
-        ramFreeB: mem.availableB,
-        ramCapacityB: ram,
-      });
-      const freed = headroomKey({
-        vramFreeB: cap,
-        vramCapacityB: cap,
-        ramFreeB: ram,
-        ramCapacityB: ram,
-      });
-      assert(squeezed !== before, "memory taken is a re-tune");
-      assert(freed !== squeezed, "memory given back is a re-tune too");
-
-      // And the key the component keys on is the same one — a re-tune is
-      // reachable, not just computable.
-      assertStringIncludes(ui_.html(), "Run a model");
-      assert(before.startsWith("v"), `headroom key shape: ${before}`);
-    });
+    } finally {
+      await removeStubBuild("stub-cuda");
+      assert(bin.length > 0);
+    }
   },
 );
 
@@ -1895,10 +2014,14 @@ testUI(
         withOursVram <= idleVram,
         `our own usage must come out of "in use elsewhere": ${withOursVram} vs ${idleVram}`,
       );
-      assertEquals(
-        idleVram - withOursVram,
-        Math.min(ourVramB, idleVram),
-        "and exactly our share, no more",
+      // Within a byte: `withoutOurUsage` subtracts proportionally across the
+      // cards, so this is floating-point arithmetic and an exact compare fails
+      // on the eighth decimal.
+      assert(
+        Math.abs((idleVram - withOursVram) - Math.min(ourVramB, idleVram)) < 1,
+        `and exactly our share, no more: ${idleVram - withOursVram} vs ${
+          Math.min(ourVramB, idleVram)
+        }`,
       );
 
       // And nothing on the page evaluates placements against raw telemetry any
@@ -1914,5 +2037,137 @@ testUI(
         );
       }
     });
+  },
+);
+
+testUI(
+  App,
+  "the Machine page summarises software and hands over",
+  async (ui_) => {
+    // The kata asks Machine for a summary of hardware AND software, and asks for
+    // Prerequisites as its own page. So Machine counts what is present, NAMES what
+    // is missing — a summary that silently hid two missing tools would be worse
+    // than none — and sends you to the page that can act on it.
+    await ui_.settle();
+    await hw.refresh(true);
+    await prereq.scan();
+    ui_.App["tab-dashboard"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "dashboard");
+    await ui_.waitFor(
+      () => ui_.html().includes("Software"),
+      "Machine carries the software summary",
+    );
+
+    const dash = ui_.find("PrereqSummary");
+    dash["go-prereq"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "prereq");
+    await ui_.waitFor(
+      () => ui_.html().includes("Prerequisites"),
+      "and the button reaches the page that can fix them",
+    );
+  },
+);
+
+testUI(App, "the Storage page says which of the disk is ours", async (ui_) => {
+  // `df` says a disk is full; it does not say that 40 GB of it is three
+  // llama.cpp builds you stopped using. That attribution is the reason this is a
+  // page rather than a panel on Memory.
+  await ui_.settle();
+  await hw.refresh(true);
+  await hw.refreshDisks();
+  await builds.scan();
+  ui_.App["tab-storage"].click();
+  await ui_.expectCell(ui, (s) => s.tab === "storage");
+  await ui_.waitFor(
+    () => ui_.html().includes("What llama.master is using"),
+    "the footprint panel renders",
+  );
+  const html = ui_.html();
+  assertStringIncludes(html, "Installed builds");
+  assertStringIncludes(html, "Models found");
+  // And the paths, so it can be cleaned up by hand too.
+  assertStringIncludes(html, "builds/");
+  assertStringIncludes(html, "cache/");
+});
+
+testUI(
+  TunePanel as never,
+  "a flag this model cannot honour is refused, not offered",
+  async (ui_) => {
+    // `--spec-type draft-mtp` against a model with no MTP block is not a slow
+    // server: llama.cpp asserts on `n_layer_nextn > 0` and refuses to load. The
+    // catalog knows what llama.cpp accepts; only the model knows what it supports.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      assertEquals(m.meta!.nextnLayers, 0, "the fixture ships no MTP block");
+      models.select(m.path);
+      await ui_.settle();
+
+      assertStringIncludes(
+        paramBlocker("specType"),
+        "no multi-token-prediction block",
+        "the reason is stated in the user's terms",
+      );
+      const html = ui_.html();
+      assertStringIncludes(
+        html,
+        "Speculative decoding",
+        "the control is present",
+      );
+      assertStringIncludes(
+        html,
+        "refuses to load when one is asked for",
+        "and says why it cannot be used here",
+      );
+      // The options read as English, not as llama.cpp's vocabulary.
+      assertStringIncludes(html, "MTP (model's own block)");
+    });
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "a dropdown shows the value that is actually set",
+  async (ui_) => {
+    // Two instruments, one right: `value` on a <select> is a DOM PROPERTY, never
+    // an attribute, so `html()` cannot see it and asserting on markup reports a
+    // failure that is not there. The surface is the honest view — the same one
+    // `am surface` gives and aio's own regression test uses.
+    //
+    // `value` on a <select> is a DOM PROPERTY, never an attribute — `html()`
+    // cannot see it, so the surface is the only honest instrument here (the same
+    // view `am surface` gives, and what aio's own regression test uses).
+    await ui_.settle();
+    await cfg.set("flashAttn", "on");
+    await cfg.set("cacheTypeK", "q8_0");
+    await ui_.settle();
+
+    const selects = new Map<string, string>();
+    const walk = (n: Record<string, unknown>) => {
+      for (const e of (n.elements ?? []) as Record<string, unknown>[]) {
+        if (e.tag === "select") {
+          selects.set(String(e.name), String(e.value ?? ""));
+        }
+      }
+      for (const c of (n.children ?? []) as Record<string, unknown>[]) walk(c);
+    };
+    walk(ui_.surface() as unknown as Record<string, unknown>);
+
+    for (
+      const [handle, want] of [
+        ["FlashAttentionSelect", "on"],
+        ["KVCacheTypeKSelect", "q8_0"],
+      ] as const
+    ) {
+      assertEquals(
+        selects.get(handle),
+        want,
+        `${handle} must show the value that is set, not whichever option is first`,
+      );
+    }
   },
 );

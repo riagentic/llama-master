@@ -12,6 +12,8 @@ import { commandLine } from "./lib/command.ts";
 import { Pill } from "./ui/kit.tsx";
 import { MemoryMini } from "./ui/Memory.tsx";
 import { Dashboard } from "./ui/Dashboard.tsx";
+import { PrereqPage } from "./ui/PrereqPage.tsx";
+import { StoragePage } from "./ui/StoragePage.tsx";
 import { CpuPanel } from "./ui/CpuPanel.tsx";
 import { GpuPanel } from "./ui/GpuPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
@@ -268,6 +270,10 @@ function Panel() {
       return <CpuPanel />;
     case "gpu":
       return <GpuPanel />;
+    case "prereq":
+      return <PrereqPage />;
+    case "storage":
+      return <StoragePage />;
     case "memory":
       return <MemoryPanel />;
     default:

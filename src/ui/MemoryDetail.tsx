@@ -13,6 +13,7 @@
 
 import type { Plan } from "../lib/plan.ts";
 import { bytes, pctLabel } from "../lib/format.ts";
+import { TpsMeter } from "./kit.tsx";
 
 type Row = { label: string; value: string; hint?: string; strong?: boolean };
 
@@ -84,6 +85,14 @@ export function MemoryDetail(props: {
   mode?: "current" | "projected";
   /** Measured RSS of the running server, when there is one. */
   rssB?: number;
+  /** Generation speed for this plan. `measured: false` means it came from a
+   *  default bandwidth rather than from a reply this machine actually produced,
+   *  and the meter says so. */
+  speed?: { tps: number; measured: boolean } | null;
+  /** Fold the three byte tables behind a disclosure, leaving the headline and
+   *  the speed meter. The all-in-one page has to fit one window; the Memory tab
+   *  shows everything open. The numbers are one click away either way. */
+  compact?: boolean;
 }) {
   const p = props.plan;
   const measured: Row[] = props.live && (props.rssB ?? 0) > 0
@@ -115,52 +124,141 @@ export function MemoryDetail(props: {
         </span>
       </div>
 
-      <div class="memdetail-cols">
-        <section>
-          <h4>
-            Context <span class="mono">{p.ctx.toLocaleString()} tokens</span>
-          </h4>
-          <Rows
-            t="ctx-rows"
-            rows={[
-              {
-                label: "KV cache total",
-                value: bytes(p.kvTotalB),
-                hint:
-                  "Every token in the context is stored twice, once per layer — this is that.",
-                strong: true,
-              },
-              {
-                label: "per 1k tokens",
-                value: bytes(p.kvPerTokenB * 1024),
-                hint: "So you can price a longer context before choosing it.",
-              },
-              {
-                label: "Layers on GPU",
-                value: `${p.layersOnGpu} of ${p.nLayer}`,
-              },
-              ...(p.moeOnCpu > 0
-                ? [{
-                  label: "Expert layers in RAM",
-                  value: `${p.moeOnCpu} of ${p.nLayer}`,
-                }]
-                : []),
-            ]}
+      {props.speed
+        ? (
+          <TpsMeter
+            tps={props.speed.tps}
+            measured={props.speed.measured}
+            label={props.live ? "Speed now" : "Estimated speed"}
+            t={props.live ? "tps-now" : "tps-projected"}
           />
-        </section>
+        )
+        : null}
 
-        <section>
-          <h4>VRAM</h4>
-          {p.vram.capacityB > 0
-            ? <Rows t="vram-rows" rows={poolRows(p.vram)} />
-            : <p class="dim">No GPU in use.</p>}
-        </section>
+      {props.compact
+        ? (
+          <div class="memdetail-summary">
+            <span>
+              llama.cpp <b>{bytes(p.vram.usedB + p.ram.usedB)}</b>
+            </span>
+            <span class="dim">
+              VRAM {bytes(p.vram.usedB)} · RAM {bytes(p.ram.usedB)}
+            </span>
+            <span class="dim">
+              {p.layersOnGpu} of {p.nLayer} layers on GPU
+            </span>
+          </div>
+        )
+        : null}
 
-        <section>
-          <h4>System RAM</h4>
-          <Rows t="ram-rows" rows={poolRows(p.ram, measured)} />
-        </section>
-      </div>
+      {props.compact
+        ? (
+          <details class="memdetail-fold">
+            <summary>Every byte</summary>
+            <div
+              class={props.compact ? "memdetail-cols folded" : "memdetail-cols"}
+            >
+              <section>
+                <h4>
+                  Context{" "}
+                  <span class="mono">{p.ctx.toLocaleString()} tokens</span>
+                </h4>
+                <Rows
+                  t="ctx-rows"
+                  rows={[
+                    {
+                      label: "KV cache total",
+                      value: bytes(p.kvTotalB),
+                      hint:
+                        "Every token in the context is stored twice, once per layer — this is that.",
+                      strong: true,
+                    },
+                    {
+                      label: "per 1k tokens",
+                      value: bytes(p.kvPerTokenB * 1024),
+                      hint:
+                        "So you can price a longer context before choosing it.",
+                    },
+                    {
+                      label: "Layers on GPU",
+                      value: `${p.layersOnGpu} of ${p.nLayer}`,
+                    },
+                    ...(p.moeOnCpu > 0
+                      ? [{
+                        label: "Expert layers in RAM",
+                        value: `${p.moeOnCpu} of ${p.nLayer}`,
+                      }]
+                      : []),
+                  ]}
+                />
+              </section>
+
+              <section>
+                <h4>VRAM</h4>
+                {p.vram.capacityB > 0
+                  ? <Rows t="vram-rows" rows={poolRows(p.vram)} />
+                  : <p class="dim">No GPU in use.</p>}
+              </section>
+
+              <section>
+                <h4>System RAM</h4>
+                <Rows t="ram-rows" rows={poolRows(p.ram, measured)} />
+              </section>
+            </div>
+          </details>
+        )
+        : (
+          <div
+            class={props.compact ? "memdetail-cols folded" : "memdetail-cols"}
+          >
+            <section>
+              <h4>
+                Context{" "}
+                <span class="mono">{p.ctx.toLocaleString()} tokens</span>
+              </h4>
+              <Rows
+                t="ctx-rows"
+                rows={[
+                  {
+                    label: "KV cache total",
+                    value: bytes(p.kvTotalB),
+                    hint:
+                      "Every token in the context is stored twice, once per layer — this is that.",
+                    strong: true,
+                  },
+                  {
+                    label: "per 1k tokens",
+                    value: bytes(p.kvPerTokenB * 1024),
+                    hint:
+                      "So you can price a longer context before choosing it.",
+                  },
+                  {
+                    label: "Layers on GPU",
+                    value: `${p.layersOnGpu} of ${p.nLayer}`,
+                  },
+                  ...(p.moeOnCpu > 0
+                    ? [{
+                      label: "Expert layers in RAM",
+                      value: `${p.moeOnCpu} of ${p.nLayer}`,
+                    }]
+                    : []),
+                ]}
+              />
+            </section>
+
+            <section>
+              <h4>VRAM</h4>
+              {p.vram.capacityB > 0
+                ? <Rows t="vram-rows" rows={poolRows(p.vram)} />
+                : <p class="dim">No GPU in use.</p>}
+            </section>
+
+            <section>
+              <h4>System RAM</h4>
+              <Rows t="ram-rows" rows={poolRows(p.ram, measured)} />
+            </section>
+          </div>
+        )}
 
       {p.notes.length > 0
         ? (

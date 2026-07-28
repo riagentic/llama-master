@@ -53,6 +53,12 @@ export type ModelMeta = {
   swaPattern: number;
   /** Multi-head latent attention rank (DeepSeek-V2/V3). 0 = not MLA. */
   kvLoraRank: number;
+  /** Multi-token-prediction blocks (`nextn_predict_layers`). A model declaring
+   *  these ships a block that drafts the next tokens for llama.cpp to verify
+   *  against the full model — speculative decoding with no second model and no
+   *  change to the output. `nLayer` INCLUDES them; llama.cpp's own `n_layer()`
+   *  subtracts them again. 0 = not an MTP model. */
+  nextnLayers: number;
   nExpert: number;
   nExpertUsed: number;
   ropeFreqBase: number;
@@ -167,6 +173,9 @@ export type Param = {
   max?: number;
   step?: number;
   options?: string[];
+  /** Human labels for `options`, positionally. Without these a select shows the
+   *  raw flag values, which are llama.cpp's vocabulary and not the user's. */
+  optionLabels?: string[];
   /** Plain-language explanation shown as a tooltip. Every param has one. */
   tip: string;
   /** Hidden behind the "advanced" toggle — rarely needed, never removed. */

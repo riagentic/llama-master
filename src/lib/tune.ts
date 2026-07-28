@@ -466,6 +466,25 @@ export function tune(
     );
   }
 
+  // Speculative decoding off the model's own MTP block. Taken whenever the model
+  // ships one, because it is the rare optimisation with no trade to weigh: the
+  // full model verifies every drafted token, so a rejected draft is discarded and
+  // the output is exactly what it would have been. Only the speed changes. The
+  // weights are in the file and loaded either way — leaving it off pays for them
+  // and gets nothing.
+  //
+  // Never set for a model without the block: llama.cpp asserts on
+  // `n_layer_nextn > 0` and refuses to load, which would be "optimal settings"
+  // that do not start.
+  s.specType = meta.nextnLayers > 0 ? "draft-mtp" : "";
+  if (meta.nextnLayers > 0) {
+    reasons.push(
+      `Speculative decoding on — this model ships ${meta.nextnLayers} multi-token-prediction block${
+        meta.nextnLayers === 1 ? "" : "s"
+      }, so it drafts ahead and verifies against itself. Output is identical; only the speed changes.`,
+    );
+  }
+
   const quantKvOk = hw.backend !== undefined &&
     QUANT_KV_BACKENDS.includes(hw.backend);
   s.flashAttn = quantKvOk ? "on" : "auto";

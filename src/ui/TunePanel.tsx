@@ -24,6 +24,7 @@ import {
   ctxOverride,
   currentModel,
   isTouched,
+  paramBlocker,
   planningHw,
 } from "./derive.ts";
 
@@ -36,6 +37,9 @@ export function ParamControl(props: { p: Param }) {
   const p = props.p;
   const value = cfg.settings[p.key] ?? p.def;
   const touched = isTouched(p.key);
+  // Some flags are only meaningful for some models — offering one this model
+  // cannot honour is a load failure with the app's name on it.
+  const blocker = paramBlocker(p.key);
 
   const control = p.kind === "bool"
     ? (
@@ -51,12 +55,27 @@ export function ParamControl(props: { p: Param }) {
       <select
         aria-label={p.label}
         value={String(value)}
+        disabled={blocker !== ""}
+        title={blocker || undefined}
         onChange={(e) =>
           cfg.set(p.key, (e.currentTarget as HTMLSelectElement).value)}
       >
-        {(p.options ?? []).map((o) => (
-          <option key={o || "(default)"} value={o}>
-            {o === "" ? "(default)" : o}
+        {
+          /* `selected` on the option, not only `value` on the select. In a real
+            client the select showed options[0] whatever the state said — Flash
+            attention rendered "auto" while `-fa on` was in the command below it.
+            The in-process test harness does NOT reproduce it, so this is pinned
+            by a surface assertion and reported upstream. The model and build
+            pickers on the all-in-one page have always used this form, which is
+            why they were never wrong. */
+        }
+        {(p.options ?? []).map((o, i) => (
+          <option
+            key={o || "(default)"}
+            value={o}
+            selected={String(value) === o}
+          >
+            {p.optionLabels?.[i] ?? (o === "" ? "(default)" : o)}
           </option>
         ))}
       </select>
@@ -111,7 +130,7 @@ export function ParamControl(props: { p: Param }) {
           ? <span class="unit">{p.unit}</span>
           : null}
       </div>
-      <p class="param-tip">{p.tip}</p>
+      <p class="param-tip">{blocker || p.tip}</p>
     </div>
   );
 }

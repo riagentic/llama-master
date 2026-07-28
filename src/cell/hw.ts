@@ -90,7 +90,11 @@ export const hw = cell("hw", {
       }
     },
     async refresh(s, force?: boolean) {
-      if (s.refreshing) return; // re-entrancy guard: polls can overlap on load
+      // Re-entrancy guard, still needed even though the 1 s schedule now carries
+      // `skipIfRunning`: that de-duplicates the SCHEDULE, and this method is also
+      // called directly — at boot, by Resume, by the Refresh button, and by
+      // tests. Those can still land on top of an in-flight tick.
+      if (s.refreshing) return;
       if (s.paused && !force) return;
       s.refreshing = true;
       try {

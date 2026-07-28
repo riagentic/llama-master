@@ -36,6 +36,7 @@ export function meta(over: Partial<ModelMeta> = {}): ModelMeta {
     swaWindow: 0,
     swaPattern: 1,
     kvLoraRank: 0,
+    nextnLayers: 0,
     valueLength: 128,
     nExpert: 0,
     nExpertUsed: 0,

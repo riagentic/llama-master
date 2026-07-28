@@ -29,6 +29,18 @@ const CACHE_BYTES: Record<string, number> = {
  *  around 250-450 MB for CUDA; the mid-point is the honest planning number. */
 const BACKEND_CONTEXT_B = 350 * 1024 * 1024;
 
+/**
+ * Is speculative decoding actually going to run?
+ *
+ * Both halves matter: the flag has to be set AND the model has to ship the block
+ * it names. `--spec-type draft-mtp` against a model with no MTP block is not a
+ * slow server, it is `GGML_ASSERT(hparams.n_layer_nextn > 0)` and a refusal to
+ * load — so nothing in this app may emit it on a guess.
+ */
+export function specMtpActive(meta: ModelMeta, s: Settings): boolean {
+  return meta.nextnLayers > 0 && str(s, "specType") === "draft-mtp";
+}
+
 export type BucketKey = "weights" | "experts" | "kv" | "compute" | "other";
 
 export type Bucket = {
@@ -206,6 +218,7 @@ export const NO_MODEL: ModelMeta = {
   swaWindow: 0,
   swaPattern: 1,
   kvLoraRank: 0,
+  nextnLayers: 0,
   nExpert: 0,
   nExpertUsed: 0,
   ropeFreqBase: 0,
@@ -319,8 +332,20 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   const ubatch = Math.max(1, num(s, "ubatchSize"));
   const activation = ubatch * whole(meta.nEmbd) * 4;
   const usingGpu = layersOnGpu > 0 || fullOffload;
+
+  // Speculative decoding with the model's own MTP block costs a SECOND context —
+  // llama.cpp measures "only context+compute are new", because the drafting
+  // block lives on the target model and its weights are already counted above.
+  // That second context is one block's KV over the same window, so it is small,
+  // but it is real and a plan that ignored it could hand back settings that no
+  // longer fit the moment the flag is emitted (server-context.cpp:1085).
+  const mtpDraftB = specMtpActive(meta, s)
+    ? whole(kvPerTokenB / Math.max(1, nLayer) * ctx) + BACKEND_CONTEXT_B / 2
+    : 0;
+
   const gpuCompute = usingGpu
-    ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length)
+    ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length) +
+      mtpDraftB
     : 0;
   const cpuCompute = layersOnGpu < nLayer || !usingGpu
     ? activation * 2

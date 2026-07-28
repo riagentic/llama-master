@@ -24,6 +24,7 @@ import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
 import { drift, headroomKey } from "../lib/adapt.ts";
+import { bytesPerToken, calibrate, estimateTps } from "../lib/speed.ts";
 import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
@@ -293,6 +294,77 @@ export function projectedStatePlan(): Plan | null {
   const m = currentModel()?.meta;
   if (!m) return null;
   return computePlan(m, planningHw(), cfg.settings);
+}
+
+/**
+ * Bytes read per generated token, for what the settings would run.
+ *
+ * The context term uses the CONFIGURED size, i.e. the cache full — the honest
+ * pessimistic end, because a conversation gets slower as it fills and the number
+ * that matters to someone choosing settings is what it degrades to.
+ */
+export function perTokenBytes(): { gpuB: number; ramB: number } | null {
+  const m = currentModel()?.meta;
+  if (!m) return null;
+  const p = projectedStatePlan();
+  if (!p) return null;
+  return bytesPerToken(m, p, cfg.settings, p.ctx);
+}
+
+/** Tokens per second these settings should reach, and whether it is measured. */
+export function projectedSpeed(): { tps: number; measured: boolean } | null {
+  const b = perTokenBytes();
+  if (!b) return null;
+  const measured = cfg.gpuBps > 0 || cfg.ramBps > 0;
+  return {
+    tps: estimateTps({
+      gpuB: b.gpuB,
+      ramB: b.ramB,
+      gpuBps: cfg.gpuBps,
+      ramBps: cfg.ramBps,
+    }),
+    measured,
+  };
+}
+
+/**
+ * What this machine actually achieved on the last reply, if that reply can teach
+ * us anything about bandwidth.
+ *
+ * Only meaningful while the server that produced it is still up — the bytes have
+ * to be the ones that were running, not whatever the form now holds.
+ */
+export function speedCalFromLastReply(): { gpuBps?: number; ramBps?: number } {
+  if (!memoryIsLive() || chat.lastTps <= 0) return {};
+  const m = shownModel()?.meta;
+  const run = srv.runSettings;
+  if (!m || !run) return {};
+  const p = currentStatePlan();
+  const b = bytesPerToken(m, p, run, p.ctx);
+  return calibrate(chat.lastTps, b);
+}
+
+/**
+ * Why this parameter cannot be used for the model that is selected, or "".
+ *
+ * The catalog describes what llama.cpp accepts; it cannot know what THIS model
+ * supports. `--spec-type draft-mtp` against a model with no multi-token
+ * prediction block is not a slow server — llama.cpp asserts on
+ * `n_layer_nextn > 0` and refuses to load. A control that offers it anyway is a
+ * raw error waiting to happen, which is the one thing this app promises not to
+ * do. Lives here rather than in the catalog because it depends on cell state.
+ */
+export function paramBlocker(key: string): string {
+  if (key === "specType") {
+    const m = currentModel()?.meta;
+    if (!m) return "Select a model first.";
+    if (m.nextnLayers === 0) {
+      return `${
+        m.name || "This model"
+      } ships no multi-token-prediction block, and llama.cpp refuses to load when one is asked for. Speculative decoding needs a model built with it.`;
+    }
+  }
+  return "";
 }
 
 export function serverRunning(): boolean {

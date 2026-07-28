@@ -6,10 +6,10 @@
 
 import { hw } from "../cell/hw.ts";
 import { prereq } from "../cell/prereq.ts";
+import { ui } from "../cell/ui.ts";
 import { CPU_TJMAX, GPU_TJMAX, tempTone } from "../lib/thermal.ts";
-import { describe, scriptPreview } from "../lib/fixplan.ts";
 import { tooFullToBuild } from "../lib/disk.ts";
-import { fixablePrereqs, fixPlanFor } from "./derive.ts";
+import { fixablePrereqs } from "./derive.ts";
 import { bytes, duration, pctLabel, stamp } from "../lib/format.ts";
 import {
   Bar,
@@ -17,7 +17,6 @@ import {
   ErrorNote,
   Grid,
   KV,
-  LogView,
   Panel,
   Pill,
   Ring,
@@ -277,169 +276,58 @@ function DiskPanel() {
 
 /** One "Fix" per unmet prerequisite. The tooltip is the exact command that
  *  will run — nothing privileged happens without the user seeing it first. */
-function FixButton(props: { id: string; found: boolean }) {
-  if (props.found) return null;
-  const plan = fixPlanFor(props.id);
-  if (!plan) return null;
-  const busy = prereq.fixing !== "" || prereq.install !== null;
-  if (plan.kind === "manual") {
-    // "We will not do this for you" always comes with where to read how.
-    return (
-      <span class="manual-fix">
-        <span class="dim" title={plan.reason}>manual</span>
-        {plan.docsUrl
-          ? (
-            <a
-              href={plan.docsUrl}
-              target="_blank"
-              rel="noreferrer"
-              title={plan.reason}
-            >
-              docs ↗
-            </a>
-          )
-          : null}
-      </span>
-    );
-  }
-  return (
-    <span class="script-fix">
-      <button
-        type="button"
-        class="btn tiny"
-        t={`fix-${props.id}`}
-        title={describe(plan)}
-        disabled={busy}
-        onClick={() => prereq.fix(props.id)}
-      >
-        {prereq.fixing === props.id
-          ? "Fixing…"
-          : plan.kind === "script"
-          ? `Install (${plan.steps.length} steps)`
-          : "Fix"}
-      </button>
-      {plan.kind === "script"
-        ? (
-          <a
-            href={plan.docsUrl}
-            target="_blank"
-            rel="noreferrer"
-            title={plan.docsUrl}
-          >
-            docs ↗
-          </a>
-        )
-        : null}
-    </span>
-  );
-}
 
-function PrereqPanel() {
+/**
+ * Software, in one line, with the way to act on it.
+ *
+ * The kata asks Machine for a summary of the hardware AND software; the doing
+ * lives on its own page. So this counts what is present, names what is missing,
+ * and hands over — a summary that silently hid two missing tools would be worse
+ * than no summary.
+ */
+function PrereqSummary() {
   const items = prereq.items;
-  const inst = prereq.install;
-  const fixable = fixablePrereqs();
-  // A scripted install (ROCm) changes the machine in ways a package install
-  // does not — add a repository, install a driver — so every command is on
-  // screen before the button is pressed, not only in the log afterwards.
-  const script = fixable.map((f) => fixPlanFor(f.id)).find((p) =>
-    p?.kind === "script"
-  );
-  const scriptSteps = script ? scriptPreview(script) : [];
-  const scriptTitle = script?.kind === "script" ? script.title : "";
+  const found = items.filter((i) => i.found).length;
+  const missing = items.filter((i) => !i.found);
+  const fixable = fixablePrereqs().length;
   return (
     <Panel
-      title="Prerequisites"
+      title="Software"
       icon="✓"
       right={
-        <>
-          {fixable.length > 0
-            ? (
-              <button
-                type="button"
-                class="btn small primary"
-                t="fix-all"
-                title={`Install ${fixable.map((f) => f.label).join(", ")}`}
-                disabled={prereq.fixing !== "" || prereq.install !== null}
-                onClick={() => prereq.fixAll()}
-              >
-                {prereq.fixQueue.length > 0
-                  ? `Fixing ${
-                    fixable.length - prereq.fixQueue.length
-                  }/${fixable.length}…`
-                  : `Fix all (${fixable.length})`}
-              </button>
-            )
-            : null}
-          <button
-            type="button"
-            class="btn small"
-            onClick={() => prereq.scan()}
-            disabled={prereq.scanning}
-          >
-            {prereq.scanning ? "Scanning…" : "Re-check"}
-          </button>
-        </>
+        <Pill tone={missing.length === 0 ? "ok" : "warn"}>
+          {items.length > 0 ? `${found} of ${items.length}` : "not scanned"}
+        </Pill>
       }
     >
-      <ErrorNote message={prereq.lastError} />
-      {inst
-        ? (
-          <div class="install-progress">
-            <div class="sub-label">{inst.label}</div>
-            <Bar
-              value={inst.received}
-              max={inst.total ?? Math.max(1, inst.received)}
-              tone="busy"
-              height={8}
-            />
-          </div>
-        )
-        : null}
-      <table class="table" t="prereq-table">
-        <tbody>
-          {items.map((p) => (
-            <tr
-              key={p.id}
-              class={p.found ? "" : p.systemOnly ? "row-warn" : "row-bad"}
-            >
-              <td class="c-icon">{p.found ? "●" : "○"}</td>
-              <td class="c-name" title={p.why}>{p.label}</td>
-              <td class="c-ver mono" title={p.path}>
-                {p.found ? p.version || "found" : "not found"}
-                {p.managed ? <Pill tone="accent">app</Pill> : null}
-              </td>
-              <td class="c-act">
-                <FixButton id={p.id} found={p.found} />
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {scriptSteps.length > 0
-        ? (
-          <details class="steps-preview" t="script-steps">
-            <summary>
-              {scriptTitle} — {scriptSteps.length}{" "}
-              steps, shown before anything runs
-            </summary>
-            <pre class="cmd">{scriptSteps.join("\n\n")}</pre>
-          </details>
-        )
-        : null}
-      {prereq.fixLog.length > 0
-        ? (
+      {items.length === 0
+        ? <Empty title="Prerequisites have not been scanned yet" />
+        : (
           <>
-            <div class="sub-label">Installer output</div>
-            <LogView lines={prereq.fixLog} t="fix-log" rows={10} />
+            <div class="kv-grid">
+              <KV k="Present" v={String(found)} mono />
+              <KV
+                k="Missing"
+                v={missing.length > 0
+                  ? missing.map((i) => i.label || i.id).join(", ")
+                  : "none"}
+                tip={missing.length > 0
+                  ? "A prebuilt release needs none of these; only a source build does."
+                  : undefined}
+              />
+            </div>
+            <button
+              type="button"
+              class={fixable > 0 ? "btn small primary" : "btn small"}
+              t="go-prereq"
+              onClick={() => ui.go("prereq")}
+            >
+              {fixable > 0
+                ? `Prerequisites — ${fixable} can be installed for you`
+                : "Prerequisites"}
+            </button>
           </>
-        )
-        : null}
-      <div class="hint">
-        “Fix” installs through your package manager and will ask for your
-        password. Items marked “manual” need a decision the app should not make
-        for you. Nothing here is required for a prebuilt release — that path
-        needs no toolchain at all.
-      </div>
+        )}
     </Panel>
   );
 }
@@ -482,7 +370,7 @@ export function Dashboard() {
         <GpuPanel />
         <MemoryPanel />
         <DiskPanel />
-        <PrereqPanel />
+        <PrereqSummary />
       </div>
     </div>
   );

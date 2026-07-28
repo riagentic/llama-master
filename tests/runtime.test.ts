@@ -11,11 +11,14 @@
 // here, on `testServer`, which boots the same runtime `deno task dev` does.
 
 import { assert, assertEquals } from "@std/assert";
-import { testServer } from "aio/testing";
+import { testMultiClient, testServer } from "aio/testing";
 import type { StateOf } from "aio";
 import { builds } from "../src/cell/builds.ts";
 import { cfg } from "../src/cell/cfg.ts";
 import { models } from "../src/cell/models.ts";
+import { ui } from "../src/cell/ui.ts";
+import { num } from "../src/lib/params.ts";
+import type { Settings } from "../src/lib/types.ts";
 import { moeGguf } from "./gguf-fixture.ts";
 import { join } from "@std/path";
 
@@ -180,4 +183,60 @@ Deno.test({
     await srvCell.stop();
     await Deno.remove(dir, { recursive: true }).catch(() => {});
   },
+});
+
+Deno.test("two surfaces, one state — the claim this app is built on", async () => {
+  // llama.master ships an Electron window AND a browser client, and the reason it
+  // could be written without a line of transport code is aio's promise that both
+  // read one state. This app leaned on that promise harder than on anything else
+  // and had never once tested it, because until `testMultiClient` there was
+  // nothing to test it with (reported as llama-master #16).
+  //
+  // Real server, real sockets, real broadcast — a harness that faked the
+  // transport would report success for the exact thing it exists to check.
+  await using m = await testMultiClient({ cells: [cfg, ui] }, 2);
+
+  // A setting changed on one surface reaches the other. This is the everyday
+  // case: the user edits context in the window while a browser tab is open.
+  await m.clients[0]!.dispatch(cfg.set.action("ctxSize", "16384"));
+  await m.converged();
+  assertEquals(
+    num(m.clients[1]!.state<{ settings: Settings }>("cfg").settings, "ctxSize"),
+    16384,
+    "the second surface sees a setting changed on the first",
+  );
+
+  // Navigation is shared too, and deliberately so: `ui` is a shared cell because
+  // a second window showing the same panel is the expected behaviour here.
+  await m.clients[1]!.dispatch(ui.go.action("storage"));
+  await m.converged();
+  assertEquals(
+    m.clients[0]!.state<{ tab: string }>("ui").tab,
+    "storage",
+    "navigation on one surface moves the other",
+  );
+
+  // The case that cannot be reasoned about from the outside: both surfaces
+  // dispatch the same action in the same tick. `cfg.touched` records which
+  // parameters the user has changed, and a lost update would leave it wrong.
+  await m.dispatchAll(cfg.set.action("temp", "0.5"));
+  await m.converged();
+  const server = m.serverState<{ settings: Settings; touched: string[] }>(
+    "cfg",
+  );
+  assertEquals(num(server.settings, "temp"), 0.5);
+  assertEquals(
+    server.touched.filter((k) => k === "temp").length,
+    1,
+    "a parameter changed by both surfaces at once is recorded once, not twice",
+  );
+
+  // And every surface agrees with the server, which is the whole promise.
+  for (const c of m.clients) {
+    assertEquals(
+      c.state<{ touched: string[] }>("cfg").touched.slice().sort(),
+      server.touched.slice().sort(),
+      `client ${c.index} agrees with the server`,
+    );
+  }
 });

@@ -2706,3 +2706,180 @@ input[type="checkbox"] {
 .drift-note .spacer {
   flex: 1;
 }
+
+/* Generation speed, banded against reading pace rather than against hardware:
+   under ~5 tok/s you wait for the model, from ~20 it outruns your eyes. Colour
+   and word say the same thing, so the meaning never lives in hue alone. */
+.tps-meter {
+  display: grid;
+  gap: 4px;
+}
+
+.tps-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-sm);
+}
+
+.tps-label {
+  color: var(--text-dim);
+}
+
+.tps-value {
+  font-family: var(--mono);
+  font-size: var(--fs-lg);
+  font-weight: 700;
+}
+
+.tps-value.tone-ok {
+  color: var(--ok);
+}
+
+.tps-value.tone-warn {
+  color: var(--warn);
+}
+
+.tps-value.tone-bad {
+  color: var(--bad);
+}
+
+.tps-unit {
+  color: var(--text-faint);
+  margin-right: 2px;
+}
+
+.tps-est {
+  font-size: var(--fs-xs);
+}
+
+.tps-track {
+  position: relative;
+  display: flex;
+  height: 8px;
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+}
+
+.tps-zone {
+  height: 100%;
+}
+
+.tps-poor {
+  background: color-mix(in srgb, var(--bad) 55%, transparent);
+}
+
+.tps-ok {
+  background: color-mix(in srgb, var(--warn) 55%, transparent);
+}
+
+.tps-great {
+  flex: 1;
+  background: color-mix(in srgb, var(--ok) 55%, transparent);
+}
+
+.tps-needle {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 3px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: var(--text);
+  box-shadow: 0 0 0 1px var(--panel);
+}
+
+/* ── all-in-one: one window, two columns ──────────────────────────────────
+   The page fills the content area instead of scrolling it: the left column is
+   the decision (machine → what is → settings → what would be), the right is the
+   conversation. Chat as a full-height column rather than a panel at the bottom
+   of a scroll is the whole point — the reply is what you are waiting for, so it
+   sits beside the numbers that produced it. */
+.one-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 30%);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.one-main,
+.one-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  /* Only if the window is genuinely too short for the compact layout — the
+     content is sized to fit a default window without it. */
+  overflow-y: auto;
+}
+
+/* The chat panel takes the height that is left, and its log grows into it. */
+.one-side > .panel:first-child {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.one-side > .panel:first-child > .panel-body {
+  min-height: 0;
+  flex: 1;
+}
+
+.one-side .one-chatlog {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
+/* Compact memory detail: headline and speed always visible, every byte one
+   click away. The Memory tab still shows the tables open. */
+.memdetail-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+}
+
+.memdetail-summary b {
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+}
+
+.memdetail-fold > summary {
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  list-style: none;
+}
+
+.memdetail-fold > summary::before {
+  content: "▸ ";
+}
+
+.memdetail-fold[open] > summary::before {
+  content: "▾ ";
+}
+
+.memdetail-fold > summary:hover {
+  color: var(--text);
+}
+
+/* On a narrow window the columns stack rather than crushing the chat. */
+@media (max-width: 1100px) {
+  .one-page {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+  }
+
+  .one-side > .panel:first-child {
+    flex: none;
+  }
+
+  .one-side .one-chatlog {
+    max-height: 300px;
+  }
+}

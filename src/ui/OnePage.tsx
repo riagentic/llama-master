@@ -61,10 +61,12 @@ import {
   driftNow,
   headroomNow,
   memoryIsLive,
+  projectedSpeed,
   projectedStatePlan,
   serverRunning,
   shownModel,
   shownSettings,
+  speedCalFromLastReply,
   vramTotalB,
   vramUsedB,
 } from "./derive.ts";
@@ -218,6 +220,19 @@ function RunStrip() {
     tunedFor.current = key;
     applyOptimal();
   });
+  // Learn this machine's real bandwidth from the reply it just produced. The
+  // speed estimate is bandwidth ÷ bytes-per-token, and bandwidth is the one term
+  // that cannot be read off the machine — so the app ships a labelled default and
+  // replaces it the first time a real generation gives it a rate to work back
+  // from. Keyed on the rate so it runs once per reply, not once per frame.
+  const calFor = useRef(0);
+  afterRender(() => {
+    if (calFor.current === chat.lastTps) return;
+    calFor.current = chat.lastTps;
+    const cal = speedCalFromLastReply();
+    if (cal.gpuBps || cal.ramBps) cfg.setSpeedCal(cal);
+  });
+
   const blocker = startBlocker();
   const running = serverRunning();
   const locked = runLocked();
@@ -621,28 +636,25 @@ function AllSettings() {
           )
           : null}
       </div>
-      {!open
-        ? null
-        : locked
-        ? <p class="param-tip">{LOCK_REASON}</p>
-        : (
-          <div class="one-settings">
-            {GROUPS.map((g) => {
-              const list = PARAMS.filter(
-                (p) => p.group === g.id && (cfg.advanced || !p.advanced),
-              );
-              if (list.length === 0) return null;
-              return (
-                <div class="one-settings-group" key={g.id}>
-                  <div class="sub-label">{g.label}</div>
-                  <div class="params">
-                    {list.map((p) => <ParamControl key={p.key} p={p} />)}
-                  </div>
+      {!open ? null : (
+        <fieldset class="one-settings" disabled={locked}>
+          {locked ? <p class="param-tip">{LOCK_REASON}</p> : null}
+          {GROUPS.map((g) => {
+            const list = PARAMS.filter(
+              (p) => p.group === g.id && (cfg.advanced || !p.advanced),
+            );
+            if (list.length === 0) return null;
+            return (
+              <div class="one-settings-group" key={g.id}>
+                <div class="sub-label">{g.label}</div>
+                <div class="params">
+                  {list.map((p) => <ParamControl key={p.key} p={p} />)}
                 </div>
-              );
-            })}
-          </div>
-        )}
+              </div>
+            );
+          })}
+        </fieldset>
+      )}
     </div>
   );
 }
@@ -738,129 +750,154 @@ export function OnePage() {
   const currentPlan = currentStatePlan();
   const projected = projectedStatePlan();
   return (
-    <div class="tab-body one-page" t="one-page">
-      <OrphanBanner />
-      {srv.diagnosis && srv.status === "crashed"
-        ? <Guidance diagnosis={srv.diagnosis} tone="error" t="one-srv-failed" />
-        : <ErrorNote message={srv.lastError || chat.lastError} />}
-      <Panel
-        title="Machine"
-        icon="▦"
-        wide
-        right={
-          <>
-            <Pill tone={hw.paused ? "warn" : "ok"}>
-              {hw.paused ? "paused" : "live"}
-            </Pill>
-            <button
-              type="button"
-              class="btn tiny"
-              onClick={() => ui.go("dashboard")}
-            >
-              Details
-            </button>
-          </>
-        }
-      >
-        <Vitals />
-      </Panel>
+    <div class="one-page" t="one-page">
+      <div class="one-main">
+        <OrphanBanner />
+        {srv.diagnosis && srv.status === "crashed"
+          ? (
+            <Guidance
+              diagnosis={srv.diagnosis}
+              tone="error"
+              t="one-srv-failed"
+            />
+          )
+          : <ErrorNote message={srv.lastError || chat.lastError} />}
+        <Panel
+          title="Machine"
+          icon="▦"
+          wide
+          right={
+            <>
+              <Pill tone={hw.paused ? "warn" : "ok"}>
+                {hw.paused ? "paused" : "live"}
+              </Pill>
+              <button
+                type="button"
+                class="btn tiny"
+                onClick={() => ui.go("dashboard")}
+              >
+                Details
+              </button>
+            </>
+          }
+        >
+          <Vitals />
+        </Panel>
 
-      {
-        /* The page reads top to bottom as the decision itself: what the machine
+        {
+          /* The page reads top to bottom as the decision itself: what the machine
            is doing NOW, then the settings that change it, then what those
            settings would give. Both states are on screen at once because they
            answer different questions and the user needs both while choosing —
            one visualisation with a mode switch made whichever question you were
            not currently asking unavailable. */
-      }
-      <Panel
-        title="Current Memory State"
-        icon="▤"
-        wide
-        right={
-          <Pill tone={live ? "ok" : "idle"}>
-            {live ? "a model is running" : "nothing running"}
-          </Pill>
         }
-      >
-        <MemoryMap plan={currentPlan} />
-        <MemoryDetail
-          plan={currentPlan}
-          live={live}
-          mode="current"
-          rssB={srv.rssB}
-        />
-      </Panel>
+        <Panel
+          title="Current Memory State"
+          icon="▤"
+          wide
+          right={
+            <Pill tone={live ? "ok" : "idle"}>
+              {live ? "a model is running" : "nothing running"}
+            </Pill>
+          }
+        >
+          <MemoryMap plan={currentPlan} />
+          <MemoryDetail
+            plan={currentPlan}
+            live={live}
+            mode="current"
+            compact
+            rssB={srv.rssB}
+            speed={live && chat.lastTps > 0
+              ? { tps: chat.lastTps, measured: true }
+              : null}
+          />
+        </Panel>
 
-      <Panel
-        title={running ? "Running" : "Run a model"}
-        icon="▶"
-        wide
-        right={chat.lastTps > 0
-          ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
-          : null}
-      >
-        <RunStrip />
-        <AllSettings />
-      </Panel>
+        <Panel
+          title={running ? "Running" : "Run a model"}
+          icon="▶"
+          wide
+          right={chat.lastTps > 0
+            ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
+            : null}
+        >
+          <RunStrip />
+          <AllSettings />
+        </Panel>
 
-      {
-        /* Memory gets its own panel because it is the question this app exists
+        {
+          /* Memory gets its own panel because it is the question this app exists
            to answer, and it needs the room: the picture, then every byte of it
            in words. While a server is up both describe THAT process, computed
            from the command it was started with — not from whatever has since
            been typed into the form. */
-      }
-      <Panel
-        title="Projected Memory State"
-        icon="▦"
-        wide
-        right={
-          <Pill tone="idle">
-            {live ? "after replacing what runs" : "after starting"}
-          </Pill>
         }
-      >
-        {projected
-          ? (
-            <>
-              {live
-                ? (
-                  <p class="dim projected-note">
-                    Current state with the running model taken back out, plus
-                    {" "}
-                    <b>{currentModel()?.file}</b>{" "}
-                    under these settings — one model runs at a time, so this is
-                    what a swap would look like.
-                  </p>
-                )
-                : null}
-              <MemoryMap plan={projected} />
-              <MemoryDetail plan={projected} mode="projected" />
-            </>
-          )
-          : (
-            <Empty
-              icon="▢"
-              title={currentModel()
-                ? "This model's header could not be read"
-                : "Select a model to see how it would fit"}
-              hint={currentModel()
-                ? "Nothing can be projected without it — the Models tab shows why."
-                : "Press Detect if the list is empty."}
-            />
-          )}
-      </Panel>
-
-      <Panel title="Chat" icon="✉" wide>
-        <MiniChat />
-      </Panel>
+        <Panel
+          title="Projected Memory State"
+          icon="▦"
+          wide
+          right={
+            <Pill tone="idle">
+              {live ? "after replacing what runs" : "after starting"}
+            </Pill>
+          }
+        >
+          {projected
+            ? (
+              <>
+                {live
+                  ? (
+                    <p class="dim projected-note">
+                      Current state with the running model taken back out, plus
+                      {" "}
+                      <b>{currentModel()?.file}</b>{" "}
+                      under these settings — one model runs at a time, so this
+                      is what a swap would look like.
+                    </p>
+                  )
+                  : null}
+                <MemoryMap plan={projected} />
+                <MemoryDetail
+                  plan={projected}
+                  mode="projected"
+                  compact
+                  speed={projectedSpeed()}
+                />
+              </>
+            )
+            : (
+              <Empty
+                icon="▢"
+                title={currentModel()
+                  ? "This model's header could not be read"
+                  : "Select a model to see how it would fit"}
+                hint={currentModel()
+                  ? "Nothing can be projected without it — the Models tab shows why."
+                  : "Press Detect if the list is empty."}
+              />
+            )}
+        </Panel>
+      </div>
 
       {
-        /* The diagnosis above says "the log below" — so it has to be here, not
-          one tab away. Absent until the server has actually said something. */
+        /* Chat is a column, not a panel at the bottom of a scroll. A reply is the
+          thing you are waiting for, so it should be beside the numbers that
+          produced it rather than below them — and given the full height, it
+          holds a real conversation instead of six lines. */
       }
-      {srv.log.length > 0 ? <ServerLog rows={12} /> : null}
+      <aside class="one-side">
+        <Panel title="Chat" icon="✉">
+          <MiniChat />
+        </Panel>
+        {
+          /* The diagnosis says "the log below" — so it has to be on this page,
+            not one tab away. Absent until the server has actually said
+            something. */
+        }
+        {srv.log.length > 0 ? <ServerLog rows={10} /> : null}
+      </aside>
     </div>
   );
 }
