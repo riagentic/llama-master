@@ -38,6 +38,8 @@ import {
 } from "../src/lib/plan.ts";
 import {
   bestPlacement,
+  CTX_PRESETS,
+  ctxLabel,
   MIN_CTX,
   optimalCtx,
   tune,
@@ -2618,4 +2620,28 @@ Deno.test("ollama: a broken manifest is distinguished from a cloud-only one", ()
     }],
   });
   assertEquals(manifestSkipReason(path, odd), "unreadable");
+});
+
+Deno.test("context: the preset ladder is the one people recognise", () => {
+  // Powers of two, because that is how models and benchmarks describe context —
+  // and because the KV cache doubles with each rung, so the ladder is also the
+  // cost ladder.
+  assertEquals(CTX_PRESETS.map(ctxLabel), [
+    "16k",
+    "32k",
+    "64k",
+    "128k",
+    "256k",
+    "512k",
+    "1M",
+  ]);
+  // Ascending, and every rung a real power of two.
+  for (let i = 1; i < CTX_PRESETS.length; i++) {
+    assertEquals(CTX_PRESETS[i], CTX_PRESETS[i - 1]! * 2);
+  }
+  assert(CTX_PRESETS[0]! > MIN_CTX, "every preset is a usable context");
+  // The label is what a user reads, not a byte count.
+  assertEquals(ctxLabel(2048), "2k");
+  assertEquals(ctxLabel(1_048_576), "1M");
+  assertEquals(ctxLabel(512), "512");
 });

@@ -2054,6 +2054,30 @@ input[type="checkbox"] {
   flex: 1;
 }
 
+/* The context row: a number, then one click each for the usual sizes. */
+.ctx-controls {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ctx-presets {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ctx-presets .btn.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.ctx-presets .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* Each placement carries its own answer, so the choice is informed. */
 .placements {
   display: flex;

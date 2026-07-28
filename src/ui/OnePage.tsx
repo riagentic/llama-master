@@ -32,7 +32,13 @@ import {
   startServer,
   stopServer,
 } from "./actions.ts";
-import { optimalCtx, PLACEMENTS } from "../lib/tune.ts";
+import {
+  CTX_PRESETS,
+  ctxLabel,
+  MIN_CTX,
+  optimalCtx,
+  PLACEMENTS,
+} from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { MemoryDetail } from "./MemoryDetail.tsx";
 import {
@@ -307,49 +313,36 @@ function RunStrip() {
 
         <label class="run-row">
           <span class="run-label">Context</span>
-          <div class="field-inline">
-            <input
-              type="number"
-              class="one-ctx"
-              aria-label="Context size"
-              t="one-ctx"
-              min="256"
-              max={target || undefined}
-              step="256"
-              disabled={locked}
-              title={locked
-                ? LOCK_REASON
-                : "Tokens the model can attend to. Blank the override to go back to the model's own maximum."}
-              value={String(ctxNow)}
-              onChange={(e) =>
-                cfg.setCtxOverride(
-                  Number((e.currentTarget as HTMLInputElement).value),
-                  models.selected,
-                )}
-            />
-            {target > 0
-              ? (
-                <span class="unit">
-                  of {target.toLocaleString()} trained
-                  {ctxOverride() > 0
-                    ? (
-                      <>
-                        {" · "}
-                        <button
-                          type="button"
-                          class="btn tiny"
-                          t="one-ctx-auto"
-                          disabled={locked}
-                          onClick={() => cfg.setCtxOverride(0)}
-                        >
-                          auto
-                        </button>
-                      </>
-                    )
-                    : null}
-                </span>
-              )
-              : null}
+          <div class="ctx-controls">
+            <div class="field-inline">
+              <input
+                type="number"
+                class="one-ctx"
+                aria-label="Context size"
+                t="one-ctx"
+                min={MIN_CTX}
+                max={target || undefined}
+                step="256"
+                disabled={locked}
+                title={locked
+                  ? LOCK_REASON
+                  : `Any value from ${MIN_CTX.toLocaleString()} up to the ${
+                    (target || 0).toLocaleString()
+                  } this model was trained for.`}
+                value={String(ctxNow)}
+                onChange={(e) =>
+                  cfg.setCtxOverride(
+                    Number((e.currentTarget as HTMLInputElement).value),
+                    models.selected,
+                  )}
+              />
+              <span class="unit">
+                tokens{target > 0
+                  ? ` · ${target.toLocaleString()} trained`
+                  : ""}
+              </span>
+            </div>
+            <CtxPresets ctxNow={ctxNow} target={target} locked={locked} />
           </div>
         </label>
       </div>
@@ -424,6 +417,61 @@ function RunStrip() {
         )
         : null}
     </>
+  );
+}
+
+/**
+ * One click each for the context sizes people actually use, plus the model's own
+ * optimum.
+ *
+ * The optimum is a first-class button rather than something that appears only
+ * once you have overridden the context: "put it back the way the app would have
+ * chosen" is the most likely thing anyone wants from this row, and a control
+ * that is missing until you have already made a mess is no help.
+ *
+ * A preset larger than the model's trained context is shown disabled. Hiding it
+ * would leave the row a different length per model; offering it live would be a
+ * button that silently does nothing, since the tuner caps at the trained value.
+ */
+function CtxPresets(
+  props: { ctxNow: number; target: number; locked: boolean },
+) {
+  const pinned = ctxOverride() > 0;
+  return (
+    <div class="ctx-presets" t="ctx-presets">
+      {CTX_PRESETS.map((n) => {
+        const tooBig = props.target > 0 && n > props.target;
+        return (
+          <button
+            key={String(n)}
+            type="button"
+            class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
+            t={`ctx-${ctxLabel(n)}`}
+            disabled={props.locked || tooBig}
+            title={props.locked
+              ? LOCK_REASON
+              : tooBig
+              ? `This model was trained for ${props.target.toLocaleString()} tokens — past that, answers degrade rather than improve.`
+              : `Set the context to ${n.toLocaleString()} tokens`}
+            onClick={() => cfg.setCtxOverride(n, models.selected)}
+          >
+            {ctxLabel(n)}
+          </button>
+        );
+      })}
+      <button
+        type="button"
+        class={`btn tiny${pinned ? "" : " on"}`}
+        t="ctx-optimal"
+        disabled={props.locked || props.target === 0}
+        title={props.target > 0
+          ? `The most this model can take without degrading: ${props.target.toLocaleString()} tokens, the length it was trained for. Each placement then fits as much of that as its memory allows.`
+          : "Select a model with a readable header first"}
+        onClick={() => cfg.setCtxOverride(0)}
+      >
+        optimal
+      </button>
+    </div>
   );
 }
 

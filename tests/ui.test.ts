@@ -32,6 +32,7 @@ import { OnePage } from "../src/ui/OnePage.tsx";
 import { TunePanel } from "../src/ui/TunePanel.tsx";
 import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
+import { CTX_PRESETS, ctxLabel, optimalCtx } from "../src/lib/tune.ts";
 import { builds } from "../src/cell/builds.ts";
 import { cfg } from "../src/cell/cfg.ts";
 import { models } from "../src/cell/models.ts";
@@ -891,11 +892,20 @@ for (const [name, Surface] of SERVER_SURFACES) {
       // VRAM. The app must say so, and show the output it points at.
       await withStubBuild(async (bin) => {
         await srv.start([bin, "--oom"], "http://127.0.0.1:1");
-        for (let i = 0; i < 200 && srv.status !== "crashed"; i++) {
-          await new Promise((r) => setTimeout(r, 25));
+        // Wait for what is actually asserted, not a proxy for it: the status
+        // turns "crashed" the moment the process is gone, while the diagnosis
+        // is built from its captured output — so gating on the status alone
+        // left the rendering assertions racing the log.
+        for (let i = 0; i < 200; i++) {
           await srv.poll();
+          if (srv.status === "crashed" && srv.diagnosis) break;
+          await new Promise((r) => setTimeout(r, 25));
         }
         assertEquals(srv.status, "crashed");
+        assertExists(
+          srv.diagnosis,
+          `no diagnosis; log:\n${srv.log.join("\n")}`,
+        );
         await ui_.settle();
 
         const html = ui_.html();
@@ -1279,6 +1289,69 @@ testUI(
       );
     } finally {
       await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: one click each for the standard context sizes, and for the optimum",
+  async (ui_) => {
+    await ui_.settle();
+    const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
+    try {
+      await builds.scan();
+      await builds.setActive("stub-cuda");
+      await withModel(async (dir) => {
+        await models.addDir(dir);
+        await models.scan();
+        await ui_.settle();
+
+        const m = models.items.find((x) => x.meta);
+        assertExists(m, "the fixture model must parse");
+        models.select(m.path);
+        await cfg.setCtxOverride(0);
+        await ui_.settle();
+
+        const trained = optimalCtx(m.meta!);
+        const picker = ui_.find("CtxPresets");
+
+        // Every rung is offered, whatever the model — a row that changes length
+        // per model is harder to use than one that does not.
+        for (const n of CTX_PRESETS) {
+          assertExists(
+            picker[`ctx-${ctxLabel(n)}`],
+            `${ctxLabel(n)} must be offered`,
+          );
+        }
+
+        // A preset the model cannot use is disabled rather than a button that
+        // silently does nothing (the tuner caps at the trained length).
+        const tooBig = CTX_PRESETS.filter((n) => n > trained);
+        for (const n of tooBig) {
+          assertEquals(
+            picker[`ctx-${ctxLabel(n)}`].disabled,
+            true,
+            `${ctxLabel(n)} is past the ${trained} this model was trained for`,
+          );
+        }
+
+        // A usable one sets the context, for this model.
+        const usable = CTX_PRESETS.find((n) => n <= trained);
+        if (usable) {
+          picker[`ctx-${ctxLabel(usable)}`].click();
+          await ui_.expectCell(cfg, (s) => s.ctxOverride === usable);
+          assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
+        }
+
+        // And "optimal" is always there — not only once you have overridden
+        // something — and hands the choice back to the tuner.
+        picker["ctx-optimal"].click();
+        await ui_.expectCell(cfg, (s) => s.ctxOverride === 0);
+      });
+    } finally {
+      await removeStubBuild("stub-cuda");
+      assert(bin.length > 0);
     }
   },
 );

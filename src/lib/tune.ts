@@ -84,6 +84,33 @@ export function optimalCtx(meta: ModelMeta): number {
  *  that cannot reach it is reported impossible rather than proposed. */
 export const MIN_CTX = 2048;
 
+/**
+ * The context sizes worth one click.
+ *
+ * Powers of two because that is how every model and every published benchmark
+ * describes its context, and because the KV cache doubles with each step — so
+ * the ladder is also the cost ladder. A preset above what the model was trained
+ * for is offered but disabled rather than hidden: "1M is possible, not for THIS
+ * model" is information, and a row that changes length per model is harder to
+ * use than one that does not.
+ */
+export const CTX_PRESETS: readonly number[] = [
+  16_384,
+  32_768,
+  65_536,
+  131_072,
+  262_144,
+  524_288,
+  1_048_576,
+];
+
+/** `131072` → `128k`, `1048576` → `1M`. The label users recognise. */
+export function ctxLabel(tokens: number): string {
+  if (tokens >= 1_048_576) return `${Math.round(tokens / 1_048_576)}M`;
+  if (tokens >= 1024) return `${Math.round(tokens / 1024)}k`;
+  return String(tokens);
+}
+
 /** Contexts are searched on this grid: llama.cpp allocates the cache in blocks,
  *  and 8,192 is a nicer thing to read than 8,137. */
 const CTX_STEP = 256;
