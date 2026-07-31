@@ -54,7 +54,11 @@ export function GpuPanel() {
             >
               <div class="gpu-cards">
                 {hw.gpus.map((g, i) => {
-                  const dev = named[i];
+                  // By identity, not by index: `devices` filters to the cards
+                  // this backend can use and numbers THOSE (a CUDA build's
+                  // CUDA0 can be the machine's third GPU). Pairing by index
+                  // captioned an AMD iGPU as CUDA0 on mixed machines.
+                  const dev = named.find((d) => d.gpu === g);
                   return (
                     <div class="gpu-card" key={`${g.name}-${i}`}>
                       <div class="gpu-card-head">

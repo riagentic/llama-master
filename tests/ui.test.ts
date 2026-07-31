@@ -1454,7 +1454,7 @@ testUI(
         // per model is harder to use than one that does not.
         for (const n of CTX_PRESETS) {
           assertExists(
-            picker[`ctx-${ctxLabel(n)}`],
+            picker[`one-ctx-${ctxLabel(n)}`],
             `${ctxLabel(n)} must be offered`,
           );
         }
@@ -1464,7 +1464,7 @@ testUI(
         const tooBig = CTX_PRESETS.filter((n) => n > trained);
         for (const n of tooBig) {
           assertEquals(
-            picker[`ctx-${ctxLabel(n)}`].disabled,
+            picker[`one-ctx-${ctxLabel(n)}`].disabled,
             true,
             `${ctxLabel(n)} is past the ${trained} this model was trained for`,
           );
@@ -1473,7 +1473,7 @@ testUI(
         // A usable one sets the context, for this model.
         const usable = CTX_PRESETS.find((n) => n <= trained);
         if (usable) {
-          picker[`ctx-${ctxLabel(usable)}`].click();
+          picker[`one-ctx-${ctxLabel(usable)}`].click();
           await ui_.expectCell(cfg, (s) => s.ctxOverride === usable);
           assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
         }
@@ -1483,7 +1483,7 @@ testUI(
         // marker, which is checked below.
         const bands = ctxBands(m.meta!);
         for (const band of CTX_BANDS) {
-          const b = picker[`ctx-${band.id}`];
+          const b = picker[`one-ctx-${band.id}`];
           assertExists(b, `${band.label} CTX must be offered`);
           assertEquals(b.disabled, false, `${band.label} is usable here`);
           b.click();
@@ -1516,7 +1516,7 @@ testUI(
 
         // And "Auto" is always there — not only once you have overridden
         // something — and hands the choice back to the tuner.
-        picker["ctx-optimal"].click();
+        picker["one-ctx-optimal"].click();
         await ui_.expectCell(cfg, (s) => s.ctxOverride === 0);
       });
     } finally {
@@ -1800,13 +1800,16 @@ testUI(
       const picker = ui_.find("CtxControls");
       const bands = ctxBands(m.meta!);
       for (const band of CTX_BANDS) {
-        assertExists(picker[`ctx-${band.id}`], `${band.label} CTX on Tune`);
+        assertExists(
+          picker[`tune-ctx-${band.id}`],
+          `${band.label} CTX on Tune`,
+        );
       }
-      assertExists(picker["ctx-optimal"], "and Auto");
+      assertExists(picker["tune-ctx-optimal"], "and Auto");
       assertExists(picker["ctx-range"], "and the usable range");
 
       // It is wired, not decoration.
-      picker["ctx-big"].click();
+      picker["tune-ctx-big"].click();
       await ui_.expectCell(cfg, (s) => s.ctxOverride === bands.big);
       assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
     });
@@ -2085,9 +2088,12 @@ testUI(App, "the Storage page says which of the disk is ours", async (ui_) => {
   const html = ui_.html();
   assertStringIncludes(html, "Installed builds");
   assertStringIncludes(html, "Models found");
-  // And the paths, so it can be cleaned up by hand too.
-  assertStringIncludes(html, "builds/");
-  assertStringIncludes(html, "cache/");
+  // And the REAL paths, so it can be cleaned up by hand too — `paths()`
+  // honours LLAMA_MASTER_HOME, and printing a hardcoded `~/.llama-master`
+  // would name a directory that does not exist on this install.
+  const { paths } = await import("../src/cell/host.server.ts");
+  assertStringIncludes(html, paths().builds);
+  assertStringIncludes(html, paths().cache);
 });
 
 testUI(

@@ -19,6 +19,9 @@ export type HwState = {
   /** Filesystems this app writes to. Refreshed on its own slow schedule: it
    *  shells out to `df`, and free space does not move second to second. */
   disks: Disk[];
+  /** Where this install actually lives — `paths()` honours LLAMA_MASTER_HOME,
+   *  so a page must print these rather than a hardcoded `~/.llama-master`. */
+  appPaths: { home: string; builds: string; cache: string } | null;
   os: string;
   arch: string;
   /** Previous `/proc/stat` samples — the other half of the utilization delta. */
@@ -34,6 +37,10 @@ export type HwState = {
   /** Pauses the scheduled poll; a manual refresh still works. */
   paused: boolean;
   lastError: string;
+  /** `df` failures live here, not in `lastError` — the 1 s `refresh` clears
+   *  `lastError` on every good tick, which would erase a disk error within a
+   *  second of it appearing. Rendered on the Storage page. */
+  diskError: string;
 };
 
 export const hw = cell("hw", {
@@ -45,6 +52,7 @@ export const hw = cell("hw", {
     mem: null as Mem | null,
     gpus: [] as Gpu[],
     disks: [] as Disk[],
+    appPaths: null as HwState["appPaths"],
     os: "",
     arch: "",
     prevStat: "",
@@ -59,22 +67,29 @@ export const hw = cell("hw", {
     refreshing: false,
     paused: false,
     lastError: "",
+    diskError: "",
   } as HwState,
   methods: {
     /** Free space on the filesystems this app writes to. Its own method, on a
      *  30 s schedule (src/app.ts) — `df` is a subprocess, and the 1 s poll has
      *  no business spawning one. */
     async refreshDisks(s) {
-      const io = await import("./hw.server.ts");
-      const paths = await import("./host.server.ts").then((h) => {
-        const p = h.paths();
-        return [p.home, p.builds, p.cache];
-      });
-      const models = await import("./models.server.ts").then((m) =>
-        m.defaultDirs()
-      );
       try {
-        const found = await io.disks([...paths, ...models]);
+        const io = await import("./hw.server.ts");
+        const app = await import("./host.server.ts").then((h) => {
+          const p = h.paths();
+          return { home: p.home, builds: p.builds, cache: p.cache };
+        });
+        s.appPaths = app;
+        const models = await import("./models.server.ts").then((m) =>
+          m.defaultDirs()
+        );
+        const found = await io.disks([
+          app.home,
+          app.builds,
+          app.cache,
+          ...models,
+        ]);
         // Compare before writing: this runs on a schedule and an equal value
         // would re-render the page for nothing. Reading `s.disks` after the
         // await is deliberate — the comparison is against whatever is current
@@ -85,8 +100,9 @@ export const hw = cell("hw", {
             d.mount === s.disks[i]?.mount && d.availB === s.disks[i]?.availB
           );
         if (!same) s.disks = found;
+        s.diskError = "";
       } catch (e) {
-        s.lastError = `disk usage: ${e}`;
+        s.diskError = `disk usage: ${e}`;
       }
     },
     async refresh(s, force?: boolean) {

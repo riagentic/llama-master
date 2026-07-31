@@ -104,6 +104,10 @@ export function drift(args: {
   /** What the running model was given when it started. */
   startedVramB: number;
   startedRamB: number;
+  /** Free JUST BEFORE this run was spawned, device-wide. 0 = not recorded,
+   *  which disables the roomier signal rather than inventing a baseline. */
+  vramFreeAtStartB: number;
+  ramFreeAtStartB: number;
   slackFraction?: number;
 }): Drift {
   const over = Math.max(0, args.vramOverB) + Math.max(0, args.ramOverB);
@@ -114,13 +118,25 @@ export function drift(args: {
       ramOverB: Math.max(0, args.ramOverB),
     };
   }
-  // Roomier only if the slack is a real fraction of what this run is using —
-  // "you could have 3% more" is not worth a restart.
+  // Roomier is measured AGAINST THE MOMENT THIS RUN STARTED: what is free now,
+  // minus what would be free had nobody else moved (free-at-start less what
+  // this run took). Comparing free-now against the run's own size instead made
+  // the note fire permanently on any machine that simply had headroom to begin
+  // with — "memory has come free" while nothing had moved at all. And it still
+  // has to be a real fraction of what this run is using — "you could have 3%
+  // more" is not worth a restart.
   const slack = args.slackFraction ?? 0.5;
+  const gained = (freeNow: number, atStart: number, started: number): number =>
+    atStart > 0 ? freeNow - Math.max(0, atStart - started) : 0;
+  const vGain = gained(
+    args.vramFreeB,
+    args.vramFreeAtStartB,
+    args.startedVramB,
+  );
+  const rGain = gained(args.ramFreeB, args.ramFreeAtStartB, args.startedRamB);
   const vramWorth = args.startedVramB > 0 &&
-    args.vramFreeB >= args.startedVramB * slack;
-  const ramWorth = args.startedRamB > 0 &&
-    args.ramFreeB >= args.startedRamB * slack;
+    vGain >= args.startedVramB * slack;
+  const ramWorth = args.startedRamB > 0 && rGain >= args.startedRamB * slack;
   if (vramWorth || ramWorth) {
     return {
       kind: "roomier",

@@ -28,7 +28,9 @@ import {
   endpoint,
   LOCK_REASON,
   placements,
+  restartTuned,
   runLocked,
+  selectModel,
   startBlocker,
   startServer,
   stopServer,
@@ -304,7 +306,7 @@ function RunStrip() {
             title={locked ? LOCK_REASON : undefined}
             value={models.selected}
             onChange={(e) => {
-              models.select((e.currentTarget as HTMLSelectElement).value);
+              selectModel((e.currentTarget as HTMLSelectElement).value);
               // A context pinned for the previous model means nothing for this
               // one; the re-tune itself is handled by the sync above.
               cfg.setCtxOverride(0);
@@ -347,7 +349,12 @@ function RunStrip() {
           </div>
         </div>
 
-        <label class="run-row">
+        {
+          /* A div, not a <label>: CtxControls holds a dozen buttons and a
+            range, and a label wrapping them all sends every click to focus
+            the number input. The input carries its own aria-label. */
+        }
+        <div class="run-row">
           <span class="run-label">Context</span>
           <CtxControls
             ctxNow={ctxNow}
@@ -356,7 +363,7 @@ function RunStrip() {
             meta={m?.meta ?? null}
             t="one-ctx"
           />
-        </label>
+        </div>
       </div>
 
       <DriftNote />
@@ -493,14 +500,11 @@ function DriftNote() {
         type="button"
         class={squeezed ? "btn tiny danger" : "btn tiny"}
         t="restart-for-drift"
+        disabled={srv.status === "stopping"}
         title="Stop the server, re-tune for the machine as it is now, and start again"
-        onClick={async () => {
-          await stopServer();
-          applyOptimal();
-          await startServer();
-        }}
+        onClick={() => void restartTuned()}
       >
-        Restart for this machine
+        {srv.status === "stopping" ? "Restarting…" : "Restart for this machine"}
       </button>
     </div>
   );
@@ -517,7 +521,7 @@ function DriftNote() {
 function PlacementAdvice(
   props: { all: Record<Placement, Tuning> | null; locked: boolean },
 ) {
-  const better = betterPlacement();
+  const better = betterPlacement(props.all);
   if (!better || props.locked) return null;
   const label = PLACEMENTS.find((p) => p.id === better)?.label ?? better;
   const gain = props.all?.[better];

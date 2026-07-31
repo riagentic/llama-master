@@ -32,6 +32,12 @@ export type SrvState = {
    *  typed into the panel — those are different things the moment they edit. */
   runSettings: Settings | null;
   runModel: string;
+  /** Device-wide free memory the moment this run was spawned — the baseline
+   *  the "roomier" drift note measures against. Without it, "memory has come
+   *  free since this model started" fired on any machine that simply had
+   *  headroom to begin with. */
+  startFreeVramB: number;
+  startFreeRamB: number;
   /** Resident set size of the running process: measured, not predicted. */
   rssB: number;
   url: string;
@@ -65,6 +71,8 @@ export const srv = cell("srv", {
     argv: [] as string[],
     runSettings: null as Settings | null,
     runModel: "",
+    startFreeVramB: 0,
+    startFreeRamB: 0,
     rssB: 0,
     url: "",
     healthy: false,
@@ -88,8 +96,14 @@ export const srv = cell("srv", {
       argv: string[],
       url: string,
       /** What this run is: the model path and the settings it was composed
-       *  from, so the memory view can describe reality rather than the form. */
-      run?: { model: string; settings: Settings },
+       *  from, so the memory view can describe reality rather than the form —
+       *  and how much was free at the moment of the spawn, so drift can tell
+       *  "memory came back" apart from "there was always room". */
+      run?: {
+        model: string;
+        settings: Settings;
+        freeAtStart?: { vramB: number; ramB: number };
+      },
     ): Promise<CellEffect | void> {
       if (s.status === "starting" || s.status === "ready") return;
       s.status = "starting";
@@ -104,6 +118,8 @@ export const srv = cell("srv", {
       s.url = url;
       s.runSettings = run?.settings ?? null;
       s.runModel = run?.model ?? "";
+      s.startFreeVramB = run?.freeAtStart?.vramB ?? 0;
+      s.startFreeRamB = run?.freeAtStart?.ramB ?? 0;
       s.rssB = 0;
       try {
         const io = await import("./srv.server.ts");
@@ -158,6 +174,8 @@ export const srv = cell("srv", {
         s.props = null;
         s.runSettings = null;
         s.runModel = "";
+        s.startFreeVramB = 0;
+        s.startFreeRamB = 0;
         s.rssB = 0;
         return own.dispose("srv:process");
       } catch (e) {

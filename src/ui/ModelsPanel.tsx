@@ -9,7 +9,7 @@ import { models } from "../cell/models.ts";
 import { cfg } from "../cell/cfg.ts";
 import { plan as computePlan } from "../lib/plan.ts";
 import { bytes, shortPath, stamp } from "../lib/format.ts";
-import { runModel } from "./actions.ts";
+import { runModel, selectModel } from "./actions.ts";
 import { Bar, Empty, ErrorNote, KV, Panel, Pill } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
 import {
@@ -210,14 +210,14 @@ export function ModelsPanel() {
                     <tr
                       key={m.path}
                       class={m.path === models.selected ? "row-active" : ""}
-                      onClick={() => models.select(m.path)}
+                      onClick={() => selectModel(m.path)}
                     >
                       <td class="c-icon">
                         <input
                           type="radio"
                           aria-label={`Select ${m.file}`}
                           checked={m.path === models.selected}
-                          onChange={() => models.select(m.path)}
+                          onChange={() => selectModel(m.path)}
                         />
                       </td>
                       <td class="c-file" title={m.path}>{m.file}</td>

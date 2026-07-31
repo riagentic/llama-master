@@ -89,7 +89,7 @@ const MB = 1024 * 1024;
  * are all false. Clamping here keeps "we could not read this model" looking like
  * zero rather than like a plan.
  */
-function whole(n: number): number {
+export function whole(n: number): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
@@ -339,17 +339,21 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   // That second context is one block's KV over the same window, so it is small,
   // but it is real and a plan that ignored it could hand back settings that no
   // longer fit the moment the flag is emitted (server-context.cpp:1085).
-  const mtpDraftB = specMtpActive(meta, s)
-    ? whole(kvPerTokenB / Math.max(1, nLayer) * ctx) + BACKEND_CONTEXT_B / 2
+  const mtpKvB = specMtpActive(meta, s)
+    ? whole(kvPerTokenB / Math.max(1, nLayer) * ctx)
     : 0;
+  const mtpDraftB = mtpKvB > 0 ? mtpKvB + BACKEND_CONTEXT_B / 2 : 0;
 
   const gpuCompute = usingGpu
     ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length) +
       mtpDraftB
     : 0;
-  const cpuCompute = layersOnGpu < nLayer || !usingGpu
-    ? activation * 2
-    : 32 * MB;
+  // On a CPU-only run the draft context is just as real, minus the GPU backend
+  // half — it lands in RAM, where a tight MTP run is exactly the case that
+  // cannot afford an unbilled block of KV.
+  const cpuCompute =
+    (layersOnGpu < nLayer || !usingGpu ? activation * 2 : 32 * MB) +
+    (usingGpu ? 0 : mtpKvB);
 
   const vramCapacity = sum(hw.gpus.map((g) => g.vramTotalB));
   const ramCapacity = hw.mem?.totalB ?? 0;

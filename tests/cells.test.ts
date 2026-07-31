@@ -400,5 +400,14 @@ testCell(
     t.expect.state((s) => s.backendChosen === true);
     t.send.suggestBackend("cuda");
     t.expect.state((s) => s.backend === "cpu");
+
+    // A store from before `backendChosen` existed restores the flag as false —
+    // but the only way such a store holds a non-cpu backend is that the user
+    // picked it. The seed must never move off a non-default value.
+    t.init();
+    t.send.suggestBackend("vulkan");
+    t.expect.state((s) => s.backend === "vulkan" && s.backendChosen === false);
+    t.send.suggestBackend("cuda");
+    t.expect.state((s) => s.backend === "vulkan");
   },
 );

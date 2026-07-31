@@ -13,7 +13,7 @@ anything is started.
 <sub>Screenshot taken in demo mode (`LLAMA_MASTER_DEMO=1`): the machine, the
 models and the build shown in it are fictional.</sub>
 
-> **0.1.2.** Developed and tested on Linux/x86_64 with NVIDIA and AMD hardware.
+> **0.1.3.** Developed and tested on Linux/x86_64 with NVIDIA and AMD hardware.
 > The macOS and Windows paths are implemented but have not been run by the
 > author; see [Status](#status).
 >

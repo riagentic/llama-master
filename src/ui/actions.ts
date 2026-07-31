@@ -16,6 +16,7 @@ import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
 import { argv, serverUrl } from "../lib/command.ts";
+import { str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
@@ -28,6 +29,7 @@ import {
   ctxOverride,
   currentModel,
   foundPrereqs,
+  paramBlocker,
   planningHw,
   serverRunning,
 } from "./derive.ts";
@@ -121,6 +123,24 @@ export function runLocked(): boolean {
 /** Said once, in one place, so every disabled control gives the same reason. */
 export const LOCK_REASON = "Stop the server first — one model runs at a time.";
 
+/**
+ * Select a model, and void what cannot survive the switch.
+ *
+ * `--spec-type draft-mtp` is the tuner's decision FOR a model that ships a
+ * multi-token-prediction block; against any other model llama.cpp asserts on
+ * `n_layer_nextn > 0` and refuses to load. Like a pinned context, the value
+ * belongs to the model it was chosen for — carrying it over would be
+ * "optimal settings" that do not start. Every UI path that changes the
+ * selection goes through here.
+ */
+export function selectModel(path: string): void {
+  models.select(path);
+  const meta = models.items.find((m) => m.path === path)?.meta;
+  if (str(cfg.settings, "specType") !== "" && (meta?.nextnLayers ?? 0) === 0) {
+    cfg.resetOne("specType");
+  }
+}
+
 /** Why the app cannot start a server right now, or "" when it can. */
 export function startBlocker(): string {
   if (runLocked()) return LOCK_REASON;
@@ -129,6 +149,16 @@ export function startBlocker(): string {
   }
   if (!serverBin()) return "The active build has no llama-server binary.";
   if (!currentModel()) return "No model selected — scan for models first.";
+  // Backstop for a restored session or any selection path around
+  // `selectModel`: spawning with a stale `--spec-type` is a server that
+  // refuses to load, and with auto-optimal off nothing else would clear it
+  // (when it is on, Start re-tunes and the tuner resets the flag itself).
+  if (
+    !cfg.autoOptimal && str(cfg.settings, "specType") !== "" &&
+    paramBlocker("specType") !== ""
+  ) {
+    return "Speculative decoding is set, but this model ships no multi-token-prediction block — llama.cpp refuses to load. Press Optimal settings, or reset --spec-type in Tune.";
+  }
   return "";
 }
 
@@ -164,8 +194,12 @@ export function placements(): Record<Placement, Tuning> | null {
  * So this is advice, not a correction — the user is told and offered the switch,
  * and "CPU only" stays a legitimate thing to want.
  */
-export function betterPlacement(): Placement | null {
-  const all = placements();
+export function betterPlacement(
+  // Callers that already ran the tuner pass its result in — `placements()` is
+  // three binary searches over `plan`, and a page polling at 1 Hz should not
+  // run them twice per frame for the same answer.
+  all: Record<Placement, Tuning> | null = placements(),
+): Placement | null {
   if (!all) return null;
   const best = bestPlacement(all);
   if (best === cfg.placement) return null;
@@ -253,11 +287,55 @@ export function startServer(): Promise<void> {
   return srv.start(command, serverUrl(settings), {
     model: model?.path ?? "",
     settings,
+    freeAtStart: freeNowB(),
   }).then(() => {});
+}
+
+/** Device-wide free memory right now — the baseline a run's drift note
+ *  measures against. Nothing of ours runs when this is read (Start is blocked
+ *  while a server is up), so device-wide IS "everyone else". */
+function freeNowB(): { vramB: number; ramB: number } {
+  return {
+    vramB: hw.gpus.reduce((a, g) => a + (g.vramTotalB - g.vramUsedB), 0),
+    ramB: hw.mem?.availableB ?? 0,
+  };
 }
 
 export function stopServer(): Promise<void> {
   return srv.stop().then(() => {});
+}
+
+/**
+ * Stop, re-tune for the machine as it is now, and start again — the drift
+ * note's button.
+ *
+ * Deliberately NOT `stop(); applyOptimal(); startServer()`: `startServer`
+ * consults `startBlocker`, which reads `srv.status` — and on a browser client
+ * a read straight after the awaited stop can still say "ready", turning the
+ * restart into a silent no-op with the server left down. Everything here is
+ * decided from return values and the tuner's output; the only status guard
+ * left is `srv.start`'s own, which runs against the cell's authoritative
+ * state rather than a possibly-stale replica. Explicitly re-tunes regardless
+ * of the auto-optimal toggle — adapting to the machine is what the button
+ * says it does.
+ */
+export async function restartTuned(): Promise<void> {
+  const model = currentModel();
+  const bin = serverBin();
+  if (!model || !bin) return;
+  await srv.stop();
+  let settings = cfg.settings;
+  const r = tunedForStart();
+  if (r) {
+    settings = r.tuning.settings;
+    cfg.apply(r.tuning.settings, r.reasons);
+  }
+  const command = argv("server", { bin, model: model.path, settings });
+  await srv.start(command, serverUrl(settings), {
+    model: model.path,
+    settings,
+    freeAtStart: freeNowB(),
+  });
 }
 
 /**
@@ -272,6 +350,11 @@ export async function updateNow(): Promise<void> {
   const wasRunning = serverRunning();
   const argvBefore = srv.argv.slice();
   const urlBefore = srv.url;
+  // Carry the run's identity across the restart: without it the memory view
+  // stops describing the live process the moment an update brings it back up.
+  const runBefore = srv.runSettings
+    ? { model: srv.runModel, settings: srv.runSettings }
+    : undefined;
 
   if (wasRunning) await srv.stop();
   // The RETURN value, not `builds.job`: a state read straight after an await
@@ -284,7 +367,11 @@ export async function updateNow(): Promise<void> {
     const bin = serverBin();
     if (bin && argvBefore.length > 0) {
       // The binary path changes with the ref; everything after it does not.
-      srv.start([bin, ...argvBefore.slice(1)], urlBefore || endpoint());
+      srv.start(
+        [bin, ...argvBefore.slice(1)],
+        urlBefore || endpoint(),
+        runBefore && { ...runBefore, freeAtStart: freeNowB() },
+      );
     }
   }
 }
@@ -292,7 +379,7 @@ export async function updateNow(): Promise<void> {
 /** Models table "Run": select, tune, start, and show the server. One gesture,
  *  because that is what "run this model" means to a user. */
 export function runModel(path: string): void {
-  models.select(path);
+  selectModel(path);
   applyOptimal();
   ui.go("server");
   void startServer();

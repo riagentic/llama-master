@@ -168,9 +168,13 @@ export const CTX_BANDS: readonly {
  * has to display the same number or it is promising something that will not run.
  * It lived in both places once, and the UI copy had dropped the floor — a pin of
  * 512 rendered as 512 and ran as 2048.
+ *
+ * The target wins over the floor: on a model trained for 512 tokens the floor
+ * must not round a pin up past what the model can actually attend over — the
+ * one rule `bestCtx` exists to keep.
  */
 export function pinnedCtx(override: number, target: number): number {
-  return Math.max(MIN_CTX, Math.min(override, target || Infinity));
+  return Math.min(Math.max(MIN_CTX, override), target || Infinity);
 }
 
 /**
@@ -513,10 +517,15 @@ export function tune(
   // every token, so at equal context the candidate with fewer is the faster one.
   // This is the honest measure because it covers all three ways a full-precision
   // cache pushes work off the card — whole layers, routed experts, and the cache
-  // itself — where a layer count sees only the first.
+  // itself — where a layer count sees only the first. Weights and KV only: the
+  // compute bucket has a ≥32 MB floor on every plan, and counting it made
+  // "spilling" vacuously true for any GPU placement.
   const hostB = (t: Settings, c: number): number => {
     const p = place(meta, hw, t, placement, c);
-    return p ? plan(meta, hw, p.settings).ram.usedB : Infinity;
+    if (!p) return Infinity;
+    return plan(meta, hw, p.settings).ram.buckets
+      .filter((b) => b.key !== "compute")
+      .reduce((a, b) => a + b.bytes, 0);
   };
   const usesGpu = placement !== "cpu" && hw.gpus.length > 0;
 
@@ -535,7 +544,11 @@ export function tune(
     const q8 = bestCtx(meta, hw, q8s, placement, ceiling);
     const q8Host = q8 > 0 ? hostB(q8s, q8) : Infinity;
     const buysContext = q8 > f16;
-    const buysResidency = spilling && q8 === f16 && q8Host < f16Host;
+    // The gain has to be worth the quality cost — and worth a sentence. A
+    // sub-256 MB delta would flip the cache to q8_0 with a reason that reads
+    // "brings 0.0 GB back onto the GPU".
+    const buysResidency = spilling && q8 === f16 &&
+      f16Host - q8Host >= 256 * 1024 * 1024;
     if (buysContext || buysResidency) {
       s.cacheTypeK = "q8_0";
       s.cacheTypeV = "q8_0";
@@ -619,7 +632,15 @@ function blockerFor(
   // about the model, sends the user looking for a smaller quantisation, and is
   // simply not what happened. What they need to know is how much room there is
   // and who has the rest.
-  const at = plan(meta, hw, { ...defaults(), ctxSize: MIN_CTX, ngl: 999 });
+  // Plan the placement being explained: a CPU blocker computed from a
+  // full-offload plan puts every weight in the VRAM pool and then reports
+  // "needs 0.0 GB of RAM" while refusing — a self-contradiction.
+  const at = plan(meta, hw, {
+    ...defaults(),
+    ctxSize: MIN_CTX,
+    ngl: placement === "cpu" ? 0 : 999,
+    nCpuMoe: 0,
+  });
   const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
   const need = (pool: "vram" | "ram") =>
     `${gb(at[pool].usedB)} at a ${floor}-token context`;

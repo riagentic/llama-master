@@ -173,7 +173,7 @@ export function CtxControls(
               key={band.id}
               type="button"
               class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
-              t={`ctx-${band.id}`}
+              t={`${id}-${band.id}`}
               disabled={props.locked || n === 0}
               title={n === 0
                 ? "Select a model with a readable header first"
@@ -188,7 +188,7 @@ export function CtxControls(
         <button
           type="button"
           class={`btn tiny${pinned ? "" : " on"}`}
-          t="ctx-optimal"
+          t={`${id}-optimal`}
           disabled={props.locked || props.target === 0}
           title={props.target > 0
             ? `Let the tuner choose: the largest context this placement can hold, up to the ${props.target.toLocaleString()} tokens this model was trained for.`
@@ -207,7 +207,7 @@ export function CtxControls(
               key={String(n)}
               type="button"
               class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
-              t={`ctx-${ctxLabel(n)}`}
+              t={`${id}-${ctxLabel(n)}`}
               disabled={props.locked || tooBig}
               title={props.locked
                 ? LOCK_REASON

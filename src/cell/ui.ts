@@ -31,8 +31,8 @@ export const TABS: readonly { id: Tab; label: string; icon: string }[] = [
   // The "tell me about one pool" pages. Machine summarises all of them; these
   // answer each on its own terms — including storage, which is the third thing
   // this app fills and the one that fails a build minutes in.
-  { id: "cpu", label: "CPU", icon: "⚙" },
-  { id: "gpu", label: "GPU", icon: "◈" },
+  { id: "cpu", label: "CPU", icon: "▩" },
+  { id: "gpu", label: "GPU", icon: "◇" },
   { id: "memory", label: "Memory", icon: "▤" },
   { id: "storage", label: "Storage", icon: "▣" },
   { id: "build", label: "Build", icon: "⚒" },

@@ -133,6 +133,13 @@ import {
   rocmPlan,
   scriptPreview,
 } from "../src/lib/fixplan.ts";
+import {
+  bytesPerToken,
+  calibrate,
+  estimateTps,
+  speedIsMeasured,
+  tpsBand,
+} from "../src/lib/speed.ts";
 import { gpu, hw, layers, meta, moeMeta, NO_GPU } from "./fixtures.ts";
 
 const GB = 1024 ** 3;
@@ -2803,6 +2810,11 @@ Deno.test("tune: a pinned context is clamped the same way everywhere", () => {
   // No model header yet: the ceiling is unknown, so only the floor applies.
   assertEquals(pinnedCtx(16384, 0), 16384);
   assertEquals(pinnedCtx(100, 0), MIN_CTX);
+  // A model trained under the floor: the model wins. The floor must not round
+  // a pin up past what the model can attend over — that is the one invariant
+  // the whole context search exists to keep.
+  assertEquals(pinnedCtx(512, 512), 512, "the trained ceiling beats the floor");
+  assertEquals(pinnedCtx(4096, 1024), 1024);
 });
 
 Deno.test("tune: with no memory reading yet, nothing is proposed", () => {
@@ -2967,7 +2979,14 @@ Deno.test("adapt: headroom buckets react to real change and ignore jitter", () =
 
 Deno.test("adapt: a running model is told about drift, in both directions", () => {
   const GB = 1024 ** 3;
-  const running = { startedVramB: 10 * GB, startedRamB: 4 * GB };
+  // A 10 GB / 4 GB run spawned onto a machine with 11 GB / 5 GB free — so a
+  // quiet machine shows ~1 GB free in each pool afterwards.
+  const running = {
+    startedVramB: 10 * GB,
+    startedRamB: 4 * GB,
+    vramFreeAtStartB: 11 * GB,
+    ramFreeAtStartB: 5 * GB,
+  };
 
   // Nothing happening.
   assertEquals(
@@ -3038,6 +3057,38 @@ Deno.test("adapt: a running model is told about drift, in both directions", () =
       .kind,
     "squeezed",
   );
+  // The false positive that shipped: a machine that simply HAD headroom when
+  // the run started. 26 GB free at spawn, 16 GB free after loading 10 GB —
+  // nothing moved, nothing "came free", and the note must stay quiet.
+  assertEquals(
+    drift({
+      startedVramB: 10 * GB,
+      startedRamB: 4 * GB,
+      vramFreeAtStartB: 26 * GB,
+      ramFreeAtStartB: 20 * GB,
+      vramOverB: 0,
+      ramOverB: 0,
+      vramFreeB: 16 * GB,
+      ramFreeB: 16 * GB,
+    }).kind,
+    "none",
+    "headroom that was always there is not news",
+  );
+  // No baseline recorded (a restored session): the signal is disabled rather
+  // than fired from an invented baseline.
+  assertEquals(
+    drift({
+      ...running,
+      vramFreeAtStartB: 0,
+      ramFreeAtStartB: 0,
+      vramOverB: 0,
+      ramOverB: 0,
+      vramFreeB: 9 * GB,
+      ramFreeB: 9 * GB,
+    }).kind,
+    "none",
+    "no baseline, no roomier",
+  );
 });
 
 Deno.test("tune: a refusal names the constraint that actually binds", () => {
@@ -3094,6 +3145,27 @@ Deno.test("tune: a refusal names the constraint that actually binds", () => {
   );
   assert(big.nLayer === plan(big, free, ok.settings).layersOnGpu, "all on GPU");
   assert(GB > 0);
+
+  // The CPU refusal must be computed from a CPU plan. It was planned with
+  // `ngl: 999` — every weight billed to the VRAM pool — so the message read
+  // "Needs 0.0 GB … of system RAM" while refusing for lack of RAM.
+  const tinyRam = hw({
+    gpus: [],
+    mem: {
+      totalB: 16 * GB,
+      availableB: 12 * GB,
+      usedB: 4 * GB,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+  });
+  const cpu = tune(big, tinyRam, defaults(), "cpu");
+  assertEquals(cpu.possible, false, "a 35B does not fit in 16 GB of RAM");
+  const needs = Number(cpu.blocker.match(/Needs ([\d.]+) GB/)?.[1] ?? 0);
+  assert(
+    needs > 12,
+    `the need must reflect the weights actually in RAM: ${cpu.blocker}`,
+  );
 });
 
 Deno.test("mtp: speculative decoding is taken when the model ships the block", () => {
@@ -3164,4 +3236,125 @@ Deno.test("mtp: the draft context is planned for, not discovered at load", () =>
     plan(plainM, machine, { ...base, specType: "draft-mtp" }).vram.usedB,
     plan(plainM, machine, { ...base, specType: "" }).vram.usedB,
   );
+
+  // A CPU-only MTP run pays for the draft context too — in RAM, where a tight
+  // fit is exactly the case that cannot afford an unbilled block of KV.
+  const cpuBase = { ...base, ngl: 0 };
+  assert(
+    plan(m, NO_GPU, { ...cpuBase, specType: "draft-mtp" }).ram.usedB >
+      plan(m, NO_GPU, { ...cpuBase, specType: "" }).ram.usedB,
+    "the draft KV lands in RAM on a CPU run",
+  );
+});
+
+// ── speed ────────────────────────────────────────────────────────────────────
+
+Deno.test("speed: a MoE model reads only the experts the router picks", () => {
+  const m = moeMeta(); // 8 experts, 2 used: 40 MB dense + 720 MB experts/layer
+  const machine = hw({ gpus: [gpu(80)] });
+  const s = { ...defaults(), ngl: 999, ctxSize: 4096 };
+  const p = plan(m, machine, s);
+  const b = bytesPerToken(m, p, s, 0);
+  const layerB = 40 * 1024 ** 2 + (720 * 1024 ** 2) * (2 / 8);
+  const want = 32 * layerB + m.outputBytes;
+  assert(
+    Math.abs(b.totalB - want) < 1024,
+    `active experts only: ${b.totalB} vs ${want}`,
+  );
+});
+
+Deno.test("speed: the KV read respects a sliding window", () => {
+  // Gemma-3-shaped: window 1024, one global layer per 6. At 128k the uniform
+  // rate would overstate the read ~5x — the same error class the fit side
+  // fixed, and the tps meter must not resurrect it.
+  const m = meta({ swaWindow: 1024, swaPattern: 6, nCtxTrain: 131072 });
+  const s = { ...defaults(), ngl: 999, ctxSize: 131072 };
+  const machine = hw({ gpus: [gpu(80)] });
+  const p = plan(m, machine, s);
+  const b = bytesPerToken(m, p, s, 131072);
+  const uniform = bytesPerToken(
+    meta({ nCtxTrain: 131072 }),
+    p,
+    s,
+    131072,
+  );
+  const kvWindowed = b.totalB - (32 * 128 * 1024 ** 2 + m.outputBytes);
+  const kvUniform = uniform.totalB - (32 * 128 * 1024 ** 2 + m.outputBytes);
+  assertEquals(kvWindowed, kvTotal(m, s, 131072));
+  assert(
+    kvWindowed < kvUniform / 3,
+    `windowed layers stop growing: ${kvWindowed} vs uniform ${kvUniform}`,
+  );
+});
+
+Deno.test("speed: the embedding table is a lookup, not a per-token read", () => {
+  const m = meta(); // 300 MB embd, 300 MB output
+  const s = { ...defaults(), ngl: 0, ctxSize: 2048 };
+  const p = plan(m, NO_GPU, s);
+  const b = bytesPerToken(m, p, s, 0);
+  // Output head billed, embedding table not.
+  assertEquals(b.totalB, 32 * 128 * 1024 ** 2 + m.outputBytes);
+});
+
+Deno.test("speed: ends placement agrees with the planner at the boundary", () => {
+  const m = meta();
+  const machine = hw({ gpus: [gpu(80)] });
+  // ngl == nLayer: plan.ts bills the ends to the CPU (full offload is >, not
+  // >=). The speed estimate must place them the same way or the two halves of
+  // the page disagree about the same bytes.
+  const at = { ...defaults(), ngl: 32, ctxSize: 2048 };
+  const bAt = bytesPerToken(m, plan(m, machine, at), at, 0);
+  assert(bAt.ramB >= m.outputBytes, `ends stay on CPU at ngl==nLayer`);
+  const past = { ...defaults(), ngl: 999, ctxSize: 2048 };
+  const bPast = bytesPerToken(m, plan(m, machine, past), past, 0);
+  assertEquals(bPast.ramB, 0);
+});
+
+Deno.test("speed: a hostile header cannot poison the estimate", () => {
+  const m = meta({
+    layers: [
+      { i: 0, bytes: Number.NaN, expert: -5 },
+      { i: 1, bytes: -1, expert: Number.NaN },
+    ],
+    nLayer: 2,
+    embdBytes: Number.NaN,
+    outputBytes: -3,
+  });
+  const s = { ...defaults(), ngl: 999, ctxSize: 2048 };
+  const p = plan(m, hw(), s);
+  const b = bytesPerToken(m, p, s, 2048);
+  assert(Number.isFinite(b.totalB) && b.totalB >= 0, `clamped: ${b.totalB}`);
+  assert(Number.isFinite(estimateTps({ gpuB: b.gpuB, ramB: b.ramB })));
+});
+
+Deno.test("speed: calibration only trusts a run that lives in one pool", () => {
+  assertEquals(calibrate(50, { gpuB: 99, ramB: 1 }).gpuBps, 100 * 50);
+  assertEquals(calibrate(5, { gpuB: 1, ramB: 99 }).ramBps, 100 * 5);
+  assertEquals(calibrate(20, { gpuB: 60, ramB: 40 }), {});
+  assertEquals(calibrate(0, { gpuB: 100, ramB: 0 }), {});
+  assertEquals(calibrate(Number.NaN, { gpuB: 100, ramB: 0 }), {});
+});
+
+Deno.test("speed: 'measured' means the dominant pool was calibrated", () => {
+  const GBps = 1024 ** 3;
+  const gpuRun = { gpuB: 5 * GBps, ramB: 0 };
+  const cpuRun = { gpuB: 0, ramB: 5 * GBps };
+  // A GPU calibration covers a GPU run, and says nothing about a CPU one.
+  assert(speedIsMeasured(gpuRun, 400 * GBps, 0));
+  assert(!speedIsMeasured(cpuRun, 400 * GBps, 0));
+  assert(speedIsMeasured(cpuRun, 0, 40 * GBps));
+  // A hybrid run is dominated by its RAM time even when most BYTES are on the
+  // GPU — the honest answer follows the time, not the bytes.
+  const hybrid = { gpuB: 8 * GBps, ramB: 2 * GBps };
+  assert(!speedIsMeasured(hybrid, 400 * GBps, 0), "RAM time dominates");
+  assert(speedIsMeasured(hybrid, 400 * GBps, 40 * GBps));
+  assert(!speedIsMeasured({ gpuB: 0, ramB: 0 }, 400 * GBps, 40 * GBps));
+});
+
+Deno.test("speed: the bands are anchored on reading speed", () => {
+  assertEquals(tpsBand(4.9), "poor");
+  assertEquals(tpsBand(5), "ok");
+  assertEquals(tpsBand(19.9), "ok");
+  assertEquals(tpsBand(20), "great");
+  assertEquals(tpsBand(Number.NaN), "poor");
 });

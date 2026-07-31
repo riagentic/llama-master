@@ -99,15 +99,20 @@ function OurFootprint() {
         <Stat label="Together" value={bytes(bSize + mSize)} />
       </div>
       <div class="kv-grid">
+        {
+          /* The REAL paths, from `paths()` — it honours LLAMA_MASTER_HOME, so a
+            hardcoded `~/.llama-master` here could name a directory that does
+            not exist on this install. */
+        }
         <KV
           k="Builds live in"
-          v="~/.llama-master/data/files/builds/"
+          v={hw.appPaths?.builds ?? "…"}
           mono
           tip="Everything the app installed or compiled. Deleting one frees its whole tree."
         />
         <KV
           k="Downloads and source trees"
-          v="~/.llama-master/cache/"
+          v={hw.appPaths?.cache ?? "…"}
           mono
           tip="Regenerable: archives, checkouts, cmake output. Safe to delete at any time — the app re-fetches what it needs."
         />
@@ -134,6 +139,7 @@ export function StoragePage() {
   return (
     <div class="tab-body">
       <ErrorNote message={hw.lastError} />
+      <ErrorNote message={hw.diskError} />
       <Filesystems />
       <OurFootprint />
     </div>

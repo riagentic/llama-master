@@ -134,7 +134,12 @@ export const builds = cell("builds", {
      * `cpu` on a CUDA box is a legitimate answer, not a stale default.
      */
     suggestBackend(s, backend: Backend) {
-      if (s.backendChosen || s.backend === backend) return;
+      // `backend !== "cpu"` covers stores from before `backendChosen` existed:
+      // the only way a pre-seed store holds a non-default backend is that the
+      // user picked it, so the missing flag must not let the seed overwrite it.
+      if (s.backendChosen || s.backend !== "cpu" || s.backend === backend) {
+        return;
+      }
       s.backend = backend;
       s.assetName = "";
     },

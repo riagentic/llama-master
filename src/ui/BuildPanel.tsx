@@ -89,8 +89,15 @@ function Chooser() {
             onChange={(e) =>
               builds.setRef((e.currentTarget as HTMLSelectElement).value)}
           >
+            {
+              /* `selected`, not just `value` on the select: the tag list loads
+                async, and a value applied before its option exists leaves the
+                browser showing whichever option happens to be first — a pinned
+                tag rendered as "master (latest)". Same bug 0.1.2 fixed on the
+                Tune page dropdowns. */
+            }
             {(builds.refs.length ? builds.refs : [builds.ref]).map((r) => (
-              <option key={r} value={r}>
+              <option key={r} value={r} selected={r === builds.ref}>
                 {r === "master" ? "master (latest)" : r}
               </option>
             ))}
@@ -158,11 +165,19 @@ function Chooser() {
                 onChange={(e) =>
                   builds.setAsset((e.currentTarget as HTMLSelectElement).value)}
               >
-                <option value="">
+                {
+                  /* `selected` for the same async-options reason as the Version
+                    select above. */
+                }
+                <option value="" selected={builds.assetName === ""}>
                   {auto ? `auto — ${auto.name}` : "auto"}
                 </option>
                 {assets.map((a) => (
-                  <option key={a.name} value={a.name}>
+                  <option
+                    key={a.name}
+                    value={a.name}
+                    selected={a.name === builds.assetName}
+                  >
                     {a.name}
                     {a.sizeB > 0 ? ` · ${bytes(a.sizeB)}` : ""}
                   </option>

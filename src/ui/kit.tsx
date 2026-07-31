@@ -401,7 +401,11 @@ export function TpsMeter(
           }}
         />
         <div class="tps-zone tps-great" />
-        <div class={`tps-needle tone-${tone}`} style={{ left: `${pct}%` }} />
+        {
+          /* Neutral by design — the value and pill carry the tone; the needle
+            just marks where on the scale this speed sits. */
+        }
+        <div class="tps-needle" style={{ left: `${pct}%` }} />
       </div>
     </div>
   );

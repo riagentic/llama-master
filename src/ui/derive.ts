@@ -24,7 +24,13 @@ import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
 import { drift, headroomKey } from "../lib/adapt.ts";
-import { bytesPerToken, calibrate, estimateTps } from "../lib/speed.ts";
+import { optimalCtx } from "../lib/tune.ts";
+import {
+  bytesPerToken,
+  calibrate,
+  estimateTps,
+  speedIsMeasured,
+} from "../lib/speed.ts";
 import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
@@ -128,14 +134,27 @@ export function headroomNow(): string {
 export function driftNow(): Drift {
   if (!memoryIsLive()) return { kind: "none" };
   const p = currentStatePlan();
-  return drift({
+  const d = drift({
     vramOverB: p.vram.overB,
     ramOverB: p.ram.overB,
     vramFreeB: p.vram.freeB,
     ramFreeB: p.ram.freeB,
     startedVramB: p.vram.usedB,
     startedRamB: p.ram.usedB,
+    vramFreeAtStartB: srv.startFreeVramB,
+    ramFreeAtStartB: srv.startFreeRamB,
   });
+  // "Roomier" is only news when a restart could actually spend the room: a
+  // run that already has every layer resident and its full trained context
+  // gains nothing from one, however much came free.
+  if (d.kind === "roomier") {
+    const m = shownModel()?.meta;
+    const maxed = m !== undefined && m !== null &&
+      p.layersOnGpu >= p.nLayer && p.moeOnCpu === 0 &&
+      p.ctx >= optimalCtx(m);
+    if (maxed) return { kind: "none" };
+  }
+  return d;
 }
 
 export function vramTotalB(): number {
@@ -315,7 +334,10 @@ export function perTokenBytes(): { gpuB: number; ramB: number } | null {
 export function projectedSpeed(): { tps: number; measured: boolean } | null {
   const b = perTokenBytes();
   if (!b) return null;
-  const measured = cfg.gpuBps > 0 || cfg.ramBps > 0;
+  // "Measured" only when the pools carrying this projection's time are the
+  // calibrated ones — a GPU-only calibration says nothing about a CPU-heavy
+  // run whose time is spent at the default RAM bandwidth.
+  const measured = speedIsMeasured(b, cfg.gpuBps, cfg.ramBps);
   return {
     tps: estimateTps({
       gpuB: b.gpuB,

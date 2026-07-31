@@ -180,9 +180,10 @@ function PrereqPanel() {
   );
 }
 export function PrereqPage() {
+  // No ErrorNote here: PrereqPanel already renders `prereq.lastError`, and one
+  // failure showing as two identical red boxes reads as two failures.
   return (
     <div class="tab-body">
-      <ErrorNote message={prereq.lastError} />
       <PrereqPanel />
     </div>
   );

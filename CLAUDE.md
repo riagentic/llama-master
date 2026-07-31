@@ -138,16 +138,19 @@ Data flow worth knowing:
   `src/lib/adapt.ts` drives three things. (1) `headroomKey` — eighths of each
   pool — is part of the auto-tune key in `OnePage`, so a real change re-tunes
   and 200 MB of jitter does not; keying on `availableB` itself would rewrite the
-  user's settings on every 1 s poll and fight their typing. (2) `volatilityB`
-  feeds `Hw.volatility`, and `tune.ts:marginB`/`ramMarginB` ADD the observed
-  swing to the reserve — a fixed 5% is not a margin on a machine that regularly
-  moves 6 GB, and what dies is weights the kernel cannot page out. Measured: a
-  131k model on a 12 GB card plans 99k of context on a quiet machine and 53k
-  while it churns; capped so a volatile machine can still run something. (3)
-  `drift` — a loaded model cannot be re-placed, so while a server runs the app
-  does not re-tune, it TELLS you: squeezed (someone took memory this run depends
-  on) or roomier (enough came back that a restart would get more), each with the
-  restart button.
+  user's settings on every 1 s poll and fight their typing. (2) The reserve is
+  FIXED (`tune.ts:marginB`/`ramMarginB`) — it was briefly widened by observed
+  memory "churn", and that was removed on purpose: the only churn signal
+  available is the device-wide usage series, our own llama-server is inside it,
+  so loading a 39 GB model registered as 39 GB of volatility and the app refused
+  models that fit. A reserve driven by a signal that cannot separate our
+  allocation from everyone else's produces false refusals. (3) `drift` — a
+  loaded model cannot be re-placed, so while a server runs the app does not
+  re-tune, it TELLS you: squeezed (someone took memory this run depends on) or
+  roomier (enough came back that a restart would get more), each with the
+  restart button. Roomier is measured against the free memory recorded at the
+  moment the run was spawned (`srv.startFreeVramB/RamB`) — without that baseline
+  it fired forever on any machine that simply had headroom.
 - **Of the four context bands, only Max is a fact.** `.katana/context.md` asks
   for Min / Opt / Big / Max buttons and a picture of the usable range
   (`src/lib/tune.ts:ctxBands`, `src/ui/CtxControls.tsx`, on both the all-in-one

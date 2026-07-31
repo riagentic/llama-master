@@ -151,63 +151,11 @@ export function MemoryDetail(props: {
         )
         : null}
 
-      {props.compact
-        ? (
-          <details class="memdetail-fold">
-            <summary>Every byte</summary>
-            <div
-              class={props.compact ? "memdetail-cols folded" : "memdetail-cols"}
-            >
-              <section>
-                <h4>
-                  Context{" "}
-                  <span class="mono">{p.ctx.toLocaleString()} tokens</span>
-                </h4>
-                <Rows
-                  t="ctx-rows"
-                  rows={[
-                    {
-                      label: "KV cache total",
-                      value: bytes(p.kvTotalB),
-                      hint:
-                        "Every token in the context is stored twice, once per layer — this is that.",
-                      strong: true,
-                    },
-                    {
-                      label: "per 1k tokens",
-                      value: bytes(p.kvPerTokenB * 1024),
-                      hint:
-                        "So you can price a longer context before choosing it.",
-                    },
-                    {
-                      label: "Layers on GPU",
-                      value: `${p.layersOnGpu} of ${p.nLayer}`,
-                    },
-                    ...(p.moeOnCpu > 0
-                      ? [{
-                        label: "Expert layers in RAM",
-                        value: `${p.moeOnCpu} of ${p.nLayer}`,
-                      }]
-                      : []),
-                  ]}
-                />
-              </section>
-
-              <section>
-                <h4>VRAM</h4>
-                {p.vram.capacityB > 0
-                  ? <Rows t="vram-rows" rows={poolRows(p.vram)} />
-                  : <p class="dim">No GPU in use.</p>}
-              </section>
-
-              <section>
-                <h4>System RAM</h4>
-                <Rows t="ram-rows" rows={poolRows(p.ram, measured)} />
-              </section>
-            </div>
-          </details>
-        )
-        : (
+      {(() => {
+        // One implementation of the three byte tables — the compact page folds
+        // the SAME columns behind a disclosure rather than keeping a pasted
+        // copy that could drift from the open one.
+        const cols = (
           <div
             class={props.compact ? "memdetail-cols folded" : "memdetail-cols"}
           >
@@ -258,7 +206,16 @@ export function MemoryDetail(props: {
               <Rows t="ram-rows" rows={poolRows(p.ram, measured)} />
             </section>
           </div>
-        )}
+        );
+        return props.compact
+          ? (
+            <details class="memdetail-fold">
+              <summary>Every byte</summary>
+              {cols}
+            </details>
+          )
+          : cols;
+      })()}
 
       {p.notes.length > 0
         ? (

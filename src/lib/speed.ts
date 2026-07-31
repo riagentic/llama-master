@@ -22,6 +22,7 @@
 // Pure: bytes and bandwidths in, tokens per second out.
 
 import type { ModelMeta, Settings } from "./types.ts";
+import { kvTotal, whole } from "./plan.ts";
 import type { Plan } from "./plan.ts";
 import { num, str } from "./params.ts";
 
@@ -30,10 +31,12 @@ import { num, str } from "./params.ts";
  *
  * Not the model's size: a mixture-of-experts model reads only the experts the
  * router picked (`nExpertUsed` of `nExpert`), which is the entire reason a 35B
- * A3B model generates at the speed of something far smaller. Dense layers,
- * embeddings and the output head are read whole, and so is the KV cache — every
- * token attends over everything already in the context, which is why a long
- * conversation gets slower as it goes.
+ * A3B model generates at the speed of something far smaller. Dense layers and
+ * the output head are read whole (the embedding table is a per-row lookup, so
+ * it is not billed), and so is the KV cache — every token attends over
+ * everything already in the context, which is why a long conversation gets
+ * slower as it goes. Windowed layers stop growing at their window, and the
+ * read stops with them.
  *
  * `ctx` is the context ACTUALLY filled, not the configured maximum: the cache is
  * allocated up front but only the occupied part is read. Callers that want the
@@ -45,9 +48,9 @@ export function bytesPerToken(
   s: Settings,
   ctxFilled: number,
 ): { gpuB: number; ramB: number; totalB: number } {
-  const nLayer = Math.max(0, meta.nLayer);
-  const onGpu = Math.max(0, Math.min(hwPlan.layersOnGpu, nLayer));
-  const moeOnCpu = Math.max(0, Math.min(hwPlan.moeOnCpu, nLayer));
+  const nLayer = whole(meta.nLayer);
+  const onGpu = Math.min(whole(hwPlan.layersOnGpu), nLayer);
+  const moeOnCpu = Math.min(whole(hwPlan.moeOnCpu), nLayer);
   // Fraction of each layer's expert bytes actually read. Dense models have no
   // experts and this term is zero.
   const used = meta.nExpert > 0
@@ -59,9 +62,12 @@ export function bytesPerToken(
   for (let i = 0; i < nLayer; i++) {
     const layer = meta.layers[i];
     if (!layer) continue;
-    const expert = Math.max(0, layer.expert);
+    // Same clamp discipline as `plan.ts`: these come out of the file, and one
+    // NaN would ride through every sum below unnoticed.
+    const bytes = whole(layer.bytes);
+    const expert = Math.min(whole(layer.expert), bytes);
     // `bytes` includes the expert bytes; the rest is attention and MLP.
-    const dense = Math.max(0, layer.bytes - expert);
+    const dense = bytes - expert;
     const activeExpert = expert * used;
     // Layers are placed from the END of the model (see plan.ts), so the last
     // `onGpu` indices are the resident ones.
@@ -74,13 +80,20 @@ export function bytesPerToken(
     else ramB += activeExpert;
   }
 
-  // Embeddings and the output head follow the layers onto the GPU.
-  const ends = Math.max(0, meta.embdBytes) + Math.max(0, meta.outputBytes);
-  if (onGpu >= nLayer && nLayer > 0) gpuB += ends;
+  // Only the output head is read whole per token (the vocab matmul). The
+  // embedding table is a LOOKUP — one row per token, a few KB — so billing the
+  // whole table would inflate bytes/token by hundreds of MB on a large-vocab
+  // model and teach `calibrate` a bandwidth off by the same phantom bytes.
+  // Placement matches plan.ts: the ends move only on full offload (ngl > nLayer).
+  const ends = whole(meta.outputBytes);
+  if (num(s, "ngl") > nLayer && nLayer > 0) gpuB += ends;
   else ramB += ends;
 
-  // The KV cache is read in whole every token. `-nkvo` forces it to host RAM.
-  const kv = Math.max(0, hwPlan.kvPerTokenB) * Math.max(0, ctxFilled);
+  // The KV cache is read in whole every token — except a sliding-window
+  // layer's, which is capped at its window; `kvTotal` knows the split, and a
+  // uniform per-token rate would overstate a Gemma-3-class read ~5x at long
+  // context. `-nkvo` forces the whole cache to host RAM.
+  const kv = whole(kvTotal(meta, s, whole(ctxFilled)));
   if (str(s, "noKvOffload") === "true" || num(s, "ngl") === 0 || onGpu === 0) {
     ramB += kv;
   } else {
@@ -150,6 +163,29 @@ export function calibrate(
   if (gpuB / total >= PURE) return { gpuBps: total * observedTps };
   if (ramB / total >= PURE) return { ramBps: total * observedTps };
   return {};
+}
+
+/**
+ * Is a projection built on this machine's own numbers, or on defaults?
+ *
+ * "Measured" used to mean "either bandwidth has ever been calibrated", which
+ * let a GPU-only calibration stamp a CPU-heavy projection as measured while
+ * the term dominating its time was still the default RAM figure. Honest rule:
+ * the pools carrying (nearly) all of the estimated time must be the
+ * calibrated ones. 95% rather than 100%, so a byte-sized remainder in the
+ * other pool does not disqualify an otherwise-measured projection.
+ */
+export function speedIsMeasured(
+  bytes: { gpuB: number; ramB: number },
+  gpuBps: number,
+  ramBps: number,
+): boolean {
+  const gs = whole(bytes.gpuB) / (gpuBps > 0 ? gpuBps : DEFAULT_GPU_BPS);
+  const rs = whole(bytes.ramB) / (ramBps > 0 ? ramBps : DEFAULT_RAM_BPS);
+  const total = gs + rs;
+  if (total <= 0) return false;
+  const calibrated = (gpuBps > 0 ? gs : 0) + (ramBps > 0 ? rs : 0);
+  return calibrated / total >= 0.95;
 }
 
 /** How usable a generation rate actually is. */

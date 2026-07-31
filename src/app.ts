@@ -151,7 +151,11 @@ await aio.run({
     // is always installable — so on a machine with a GPU it has to be corrected
     // once the hardware is known. `seedBackend` does nothing if the user has
     // ever chosen a backend, and nothing once a build is installed.
-    Promise.all([
+    // `allSettled`, not `all`: a cell call rejects when its caller-side
+    // timeout fires (a stalled `loadAssets` socket is enough), and one
+    // rejection must not keep the seed from running — the failed scan
+    // already surfaced its own error in cell state.
+    Promise.allSettled([
       hw.refresh(true),
       prereq.scan(),
       builds.scan(),
