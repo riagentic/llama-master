@@ -186,6 +186,19 @@ export function loadingNow():
   };
 }
 
+/**
+ * RAM the mapped model holds RIGHT NOW — the bytes every "used" meter hides.
+ *
+ * The kernel books a memory-mapped model as reclaimable page cache, so with
+ * 138 GB of DeepSeek-V4 resident, `free` said 22 GB used and the app's own
+ * RAM bars agreed — the model read as simply not there. Measured per process
+ * (`RssFile`), so it is attributable to our server rather than guessed from
+ * the system-wide cache figure.
+ */
+export function mappedModelB(): number {
+  return serverRunning() ? srv.rssFileB : 0;
+}
+
 export function vramTotalB(): number {
   return hw.gpus.reduce((a, g) => a + g.vramTotalB, 0);
 }

@@ -98,6 +98,11 @@ Deno.test({
       true,
       "ready was entered through a real generation, not just /health",
     );
+    assert(srv.rssB > 0, "resident size is measured");
+    assert(
+      srv.rssFileB >= 0 && srv.rssFileB <= srv.rssB,
+      `the file-backed share is sampled and sane: ${srv.rssFileB} of ${srv.rssB}`,
+    );
     assertEquals(srv.loadedModel(), "/models/fixture.gguf");
     assertEquals(srv.props?.n_ctx, 8192);
     assert(

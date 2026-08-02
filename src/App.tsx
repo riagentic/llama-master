@@ -30,6 +30,7 @@ import {
   buildBusy,
   buildsSizeB,
   currentModel,
+  mappedModelB,
   modelsSizeB,
   updateInfo,
   vramTotalB,
@@ -134,6 +135,7 @@ function Header() {
           vramTotalB={vramTotalB()}
           ramUsedB={mem?.usedB ?? 0}
           ramTotalB={mem?.totalB ?? 0}
+          ramMappedB={mappedModelB()}
         />
       </div>
 

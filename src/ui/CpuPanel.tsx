@@ -15,6 +15,7 @@ import { num } from "../lib/params.ts";
 import { bytes, pctLabel } from "../lib/format.ts";
 import { CPU_TJMAX, tempTone } from "../lib/thermal.ts";
 import { Bar, Empty, KV, Panel, Pill, Ring, Spark } from "./kit.tsx";
+import { mappedModelB } from "./derive.ts";
 
 /** One core's load, as a labelled bar. A grid of these is the quickest way to
  *  see whether a run is using the machine evenly or hammering two cores. */
@@ -180,6 +181,16 @@ export function CpuPanel() {
                       }`}
                       mono
                     />
+                    {mappedModelB() > 0
+                      ? (
+                        <KV
+                          k="Mapped model"
+                          v={bytes(mappedModelB())}
+                          mono
+                          tip="Resident weights of the running model, memory-mapped from the file. The kernel books them as reclaimable cache, so 'available' includes them — but evicting them means re-reading from disk and generation slowing to a crawl."
+                        />
+                      )
+                      : null}
                   </div>
                 </Panel>
               )

@@ -41,6 +41,11 @@ export type SrvState = {
   startFreeRamB: number;
   /** Resident set size of the running process: measured, not predicted. */
   rssB: number;
+  /** The FILE-BACKED share of that RSS — the memory-mapped model. The kernel
+   *  books these pages as reclaimable cache, so every "used RAM" meter calls
+   *  them free (measured: 138 of 139 GB invisible). The UI draws this share
+   *  as its own colour so the model does not read as missing. */
+  rssFileB: number;
   url: string;
   /** `/health` result, refreshed by the poll while running. */
   healthy: boolean;
@@ -101,6 +106,7 @@ export const srv = cell("srv", {
     startFreeVramB: 0,
     startFreeRamB: 0,
     rssB: 0,
+    rssFileB: 0,
     url: "",
     healthy: false,
     healthDetail: "",
@@ -165,6 +171,7 @@ export const srv = cell("srv", {
       s.startFreeVramB = run?.freeAtStart?.vramB ?? 0;
       s.startFreeRamB = run?.freeAtStart?.ramB ?? 0;
       s.rssB = 0;
+      s.rssFileB = 0;
       try {
         const io = await import("./srv.server.ts");
         const { pid } = io.start(argv);
@@ -222,6 +229,7 @@ export const srv = cell("srv", {
         s.startFreeVramB = 0;
         s.startFreeRamB = 0;
         s.rssB = 0;
+        s.rssFileB = 0;
         return own.dispose("srv:process");
       } catch (e) {
         s.lastError = String(e);
@@ -286,6 +294,7 @@ export const srv = cell("srv", {
             s.healthy = false;
             s.proven = false;
             s.rssB = 0;
+            s.rssFileB = 0;
             try {
               const { pid } = io.start(next);
               s.pid = pid;
@@ -306,13 +315,15 @@ export const srv = cell("srv", {
         s.healthy = false;
         s.proven = false;
         s.rssB = 0;
+        s.rssFileB = 0;
         return;
       }
 
       // Measured, not predicted — and read off the poll's own await rather
       // than inside the sync status snapshot.
-      const rssB = await io.rss();
-      if (rssB !== s.rssB) s.rssB = rssB; // aiol-ok — see the note above
+      const r = await io.rss();
+      if (r.rssB !== s.rssB) s.rssB = r.rssB; // aiol-ok — see the note above
+      if (r.fileB !== s.rssFileB) s.rssFileB = r.fileB; // aiol-ok — same
 
       // Single writer of liveness means the pid too: anything that leaves the
       // cell's copy stale (a refused duplicate start, a restart) is corrected

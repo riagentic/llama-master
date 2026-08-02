@@ -44,6 +44,7 @@ import {
   Bar,
   Empty,
   ErrorNote,
+  MappedBar,
   Panel,
   Pill,
   Ring,
@@ -65,6 +66,7 @@ import {
   driftNow,
   headroomNow,
   loadingNow,
+  mappedModelB,
   memoryIsLive,
   projectedSpeed,
   projectedStatePlan,
@@ -87,6 +89,10 @@ function Vitals() {
   const m = hw.mem;
   const vramTotal = vramTotalB();
   const vramUsed = vramUsedB();
+  // The mapped model, as its own colour: the kernel books it as reclaimable
+  // cache, so "used" hides 100+ GB of resident weights and the model read as
+  // missing from its own machine.
+  const mapped = mappedModelB();
   return (
     <div class="one-vitals" t="vitals">
       <div class="vital">
@@ -158,7 +164,7 @@ function Vitals() {
 
       <div class="vital">
         <Ring
-          value={m ? (m.usedB / m.totalB) * 100 : 0}
+          value={m ? ((m.usedB + mapped) / m.totalB) * 100 : 0}
           label="RAM"
           tone="ok"
           size={56}
@@ -166,15 +172,34 @@ function Vitals() {
         <div class="vital-body">
           <div class="vital-name">RAM</div>
           <div class="vital-sub">
-            {m ? `${bytes(m.usedB)} / ${bytes(m.totalB)}` : "—"}
+            {m ? `${bytes(m.usedB + mapped)} / ${bytes(m.totalB)}` : "—"}
           </div>
-          <Bar
-            value={m?.usedB ?? 0}
-            max={m?.totalB ?? 0}
-            tone={tone(m ? (m.usedB / m.totalB) * 100 : 0)}
-            height={7}
-          />
-          <div class="vital-sub">{m ? `${bytes(m.availableB)} free` : ""}</div>
+          {mapped > 0
+            ? (
+              <MappedBar
+                usedB={m?.usedB ?? 0}
+                mappedB={mapped}
+                totalB={m?.totalB ?? 0}
+                height={7}
+              />
+            )
+            : (
+              <Bar
+                value={m?.usedB ?? 0}
+                max={m?.totalB ?? 0}
+                tone={tone(m ? (m.usedB / m.totalB) * 100 : 0)}
+                height={7}
+              />
+            )}
+          <div class="vital-sub">
+            {m
+              ? mapped > 0
+                ? `${bytes(mapped)} mapped model · ${
+                  bytes(Math.max(0, m.availableB - mapped))
+                } truly free`
+                : `${bytes(m.availableB)} free`
+              : ""}
+          </div>
         </div>
       </div>
     </div>

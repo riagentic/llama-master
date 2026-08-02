@@ -10,7 +10,7 @@
 import { useLocal } from "aio/air";
 import type { Plan, Pool } from "../lib/plan.ts";
 import type { Segment } from "./kit.tsx";
-import { Bar, KV, Legend, StackBar } from "./kit.tsx";
+import { Bar, KV, Legend, MappedBar, StackBar } from "./kit.tsx";
 import { bytes, pctLabel } from "../lib/format.ts";
 
 function segments(pool: Plan["vram"]): Segment[] {
@@ -331,7 +331,11 @@ export function MemoryMini(props: {
   vramTotalB: number;
   ramUsedB: number;
   ramTotalB: number;
+  /** RAM held by the memory-mapped model — its own colour, because the
+   *  kernel's "used" figure hides it and the model read as missing. */
+  ramMappedB?: number;
 }) {
+  const mapped = props.ramMappedB ?? 0;
   return (
     <div class="memmini">
       <div class="memmini-row">
@@ -348,15 +352,25 @@ export function MemoryMini(props: {
       </div>
       <div class="memmini-row">
         <span>RAM</span>
-        <Bar
-          value={props.ramUsedB}
-          max={props.ramTotalB}
-          tone={props.ramUsedB / Math.max(1, props.ramTotalB) > 0.9
-            ? "bad"
-            : "ok"}
-          height={4}
-        />
-        <b>{bytes(props.ramUsedB)}</b>
+        {mapped > 0
+          ? (
+            <MappedBar
+              usedB={props.ramUsedB}
+              mappedB={mapped}
+              totalB={props.ramTotalB}
+            />
+          )
+          : (
+            <Bar
+              value={props.ramUsedB}
+              max={props.ramTotalB}
+              tone={props.ramUsedB / Math.max(1, props.ramTotalB) > 0.9
+                ? "bad"
+                : "ok"}
+              height={4}
+            />
+          )}
+        <b>{bytes(props.ramUsedB + mapped)}</b>
       </div>
     </div>
   );

@@ -166,17 +166,26 @@ export type Status = {
  * snapshot of in-process state, and a blocking file read inside it would put
  * every client's next action behind a disk touch on the 1 s poll.
  */
-export async function rss(): Promise<number> {
+export async function rss(): Promise<{ rssB: number; fileB: number }> {
   const pid = slot?.pid ?? 0;
-  // Same as findOrphans: /proc/<pid>/statm exists on Linux and nowhere else.
-  if (!pid || PLATFORM !== "linux") return 0;
+  // Same as findOrphans: /proc/<pid>/status exists on Linux and nowhere else.
+  if (!pid || PLATFORM !== "linux") return { rssB: 0, fileB: 0 };
   try {
-    // statm: size resident shared text lib data dt — all in pages.
-    const txt = await Deno.readTextFile(`/proc/${pid}/statm`);
-    const resident = Number(txt.split(/\s+/)[1] ?? 0);
-    return resident > 0 ? resident * 4096 : 0;
+    // /proc/<pid>/status carries the split statm does not: RssAnon vs
+    // RssFile. The distinction is the whole point — a memory-mapped model is
+    // file-backed, the kernel books it as reclaimable page cache, and every
+    // "RAM used" meter shows it as FREE. Measured on the 145 GB DeepSeek-V4:
+    // RSS 139 GB, of which 138 GB RssFile — while `free` said 22 GB used and
+    // a real user concluded the model was not in RAM at all. Sampling the
+    // file-backed share is what lets the UI draw it as its own colour.
+    const txt = await Deno.readTextFile(`/proc/${pid}/status`);
+    const kb = (key: string): number => {
+      const m = new RegExp(`^${key}:\\s+(\\d+) kB`, "m").exec(txt);
+      return Number(m?.[1] ?? 0);
+    };
+    return { rssB: kb("VmRSS") * 1024, fileB: kb("RssFile") * 1024 };
   } catch {
-    return 0; // exited between the check and the read
+    return { rssB: 0, fileB: 0 }; // exited between the check and the read
   }
 }
 

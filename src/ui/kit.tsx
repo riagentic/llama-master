@@ -338,6 +338,37 @@ export function JobProgress(props: {
 
 /** Scrolling log tail. Newest at the bottom, capped upstream. */
 /**
+ * A two-part occupancy bar: what the kernel calls used, plus what it calls
+ * cache while a memory-mapped model sits in it. One component, so the header
+ * and the vitals cannot disagree about what the second colour means. The
+ * kernel books mapped weights as reclaimable cache — every "used" meter calls
+ * them free (measured: 138 of 139 GB invisible), and the model read as
+ * missing from its own machine.
+ */
+export function MappedBar(props: {
+  usedB: number;
+  mappedB: number;
+  totalB: number;
+  height?: number;
+}) {
+  const pct = (n: number) =>
+    `${Math.max(0, Math.min(100, (n / Math.max(1, props.totalB)) * 100))}%`;
+  return (
+    <div
+      class="mappedbar"
+      style={{ height: `${props.height ?? 4}px` }}
+      title={`${fmtBytes(props.usedB)} used by everything else · ${
+        fmtBytes(props.mappedB)
+      } holding the memory-mapped model. The OS books the model as reclaimable cache — meters call it free, but evicting it means re-reading from disk and generation slowing to a crawl.`}
+      t="mapped-bar"
+    >
+      <i class="mappedbar-used" style={{ width: pct(props.usedB) }} />
+      <i class="mappedbar-model" style={{ width: pct(props.mappedB) }} />
+    </div>
+  );
+}
+
+/**
  * A reasoning model's think-first act, folded so it never drowns the answer.
  *
  * llama.cpp streams the `<think>` block as `reasoning_content`, with the

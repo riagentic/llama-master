@@ -2916,6 +2916,31 @@ input[type="checkbox"] {
   font-family: var(--mono);
 }
 
+/* Two-part occupancy: what the kernel calls used, plus the memory-mapped
+   model it calls cache. The model share wears the WEIGHTS colour, so the bar
+   and the memory-map legend tell one story. */
+.mappedbar {
+  flex: 1;
+  display: flex;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--line-soft);
+  min-width: 0;
+}
+
+.mappedbar > i {
+  display: block;
+  height: 100%;
+}
+
+.mappedbar-used {
+  background: var(--ok);
+}
+
+.mappedbar-model {
+  background: var(--seg-weights);
+}
+
 .one-side {
   display: flex;
   flex-direction: column;
