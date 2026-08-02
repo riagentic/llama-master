@@ -46,7 +46,11 @@ function label(action: FixAction): string {
     case "fix-prereq":
       return "Fix it";
     case "open-tab":
-      return action.tab === "dashboard" ? "Open Machine" : "Open Build";
+      return action.tab === "dashboard"
+        ? "Open Machine"
+        : action.tab === "settings"
+        ? "Open Tune"
+        : "Open Build";
     case "open-url":
       return "Open docs ↗";
   }

@@ -1514,6 +1514,21 @@ testUI(
         assertExists(picker["ctx-range"], "the range visual is rendered");
         assertExists(picker["ctx-needle"], "with the current value on it");
 
+        // "Max on VRAM" and "Max on Hybrid": one click for the priority most
+        // sessions have — this placement, at the biggest context it holds.
+        // On a machine where the placement is impossible the button is
+        // disabled with the blocker, never a click that silently does nothing.
+        for (const pl of ["vram", "hybrid"] as const) {
+          const btn = picker[`one-ctx-max-${pl}`];
+          assertExists(btn, `Max·${pl} must be offered`);
+          if (!btn.disabled) {
+            btn.click();
+            await ui_.expectCell(cfg, (s) => s.placement === pl);
+            await ui_.expectCell(cfg, (s) => s.ctxOverride > 0);
+            assertEquals(cfg.ctxOverrideFor, m.path, "pinned to THIS model");
+          }
+        }
+
         // And "Auto" is always there — not only once you have overridden
         // something — and hands the choice back to the tuner.
         picker["one-ctx-optimal"].click();
@@ -1558,13 +1573,21 @@ testUI(
         assertStringIncludes(html, "as it is now");
         assertStringIncludes(html, "What these settings would use.");
 
-        // And the page reads in decision order: state, settings, consequence.
+        // Three columns, one question each. The machine column stacks the two
+        // memory states — same width, same scale, so the difference between
+        // "as it is" and "as it would be" is readable at a glance — and the
+        // decision column follows with the run strip. Current before
+        // projected, and the whole machine column before the decision one.
         const iCur = html.indexOf("Current Memory State");
         const iRun = html.indexOf("Run a model");
         const iProj = html.indexOf("Projected Memory State");
         assert(
-          iCur < iRun && iRun < iProj,
-          `order should be current -> settings -> projected, got ${iCur}/${iRun}/${iProj}`,
+          iCur < iProj,
+          `current state reads before the projection, got ${iCur}/${iProj}`,
+        );
+        assert(
+          iProj < iRun,
+          `the machine column precedes the decision column, got ${iProj}/${iRun}`,
         );
       });
     } finally {

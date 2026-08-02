@@ -35,6 +35,16 @@ export type CfgState = {
    *  usually wrong for the next. Switchable off, because someone who has hand-
    *  tuned a command does not want it rewritten under them. */
   autoOptimal: boolean;
+  /** The largest context that has ACTUALLY started, per model path.
+   *
+   *  For most models the plan is arithmetic and this stays empty. For the ones
+   *  whose buffers cannot be derived from the header — a sparse-attention MoE
+   *  wanted a 68 GiB compute buffer where `plan.ts` predicted 730 MB — it is the
+   *  only honest source: the app tries, steps down when the memory refuses, and
+   *  writes down what worked so the next run of that model opens there instead
+   *  of walking the ladder again (`src/lib/fitladder.ts`). A ceiling, never a
+   *  target: the tuner still has to fit it in the memory that is free now. */
+  fitCtx: Record<string, number>;
   /** This machine's measured effective memory bandwidth, bytes/second, learned
    *  from real generation (`src/lib/speed.ts:calibrate`). 0 = never measured, in
    *  which case a labelled default is used instead. */
@@ -56,6 +66,7 @@ export const cfg = cell("cfg", {
     ctxOverride: 0,
     ctxOverrideFor: "",
     autoOptimal: true,
+    fitCtx: {} as Record<string, number>,
     gpuBps: 0,
     ramBps: 0,
     advanced: false,
@@ -64,6 +75,32 @@ export const cfg = cell("cfg", {
   methods: {
     toggleAutoOptimal(s) {
       s.autoOptimal = !s.autoOptimal;
+    },
+
+    /**
+     * Write down a context this model has actually GENERATED at (`srv.proven`).
+     *
+     * Grows by default: a run that generated at 32,768 proves 32,768 works,
+     * and a later run that settled for 8,192 by choice proves nothing about
+     * the model.
+     *
+     * `exact` replaces instead, and the caller sets it when this run WALKED
+     * THE LADDER (`srv.fitTries > 0`): the ladder only engages after a start
+     * actually died at the opening bid, and the opening bid is capped at the
+     * recorded value — so a ladder run is a measurement that the record
+     * itself is too high. Keeping the maximum then would re-run that crash at
+     * the top of every session: a 17,408 recorded at /health (before `proven`
+     * existed) could never answer a prompt, and grow-only kept it forever.
+     */
+    rememberFit(s, at: { model: string; ctx: number; exact?: boolean }) {
+      if (!at.model || at.ctx <= 0) return;
+      if (!at.exact && (s.fitCtx[at.model] ?? 0) >= at.ctx) return;
+      s.fitCtx[at.model] = at.ctx;
+    },
+
+    /** Forget it, when a start fails for want of memory at that very size. */
+    forgetFit(s, model: string) {
+      if (model in s.fitCtx) delete s.fitCtx[model];
     },
     /**
      * Record what this machine actually achieved.
@@ -126,6 +163,22 @@ export const cfg = cell("cfg", {
     setCtxOverride(s, ctx: number, forModel = "") {
       s.ctxOverride = Number.isFinite(ctx) && ctx > 0 ? Math.floor(ctx) : 0;
       s.ctxOverrideFor = s.ctxOverride > 0 ? forModel : "";
+      // A pin is an instruction, so it goes straight into the settings the
+      // command is composed from. With auto-optimal ON the tuner re-applies
+      // it anyway; with it OFF nothing else would, and the command preview,
+      // the projection and the spawn all disagreed with the number on the
+      // pin. Same coerce-and-track steps as `set`, so the catalog's clamp and
+      // the changed-count stay honest.
+      if (s.ctxOverride > 0) {
+        const p = param("ctxSize");
+        if (p) {
+          const value = coerce(p, String(s.ctxOverride));
+          s.settings.ctxSize = value;
+          const touched = s.touched.filter((k) => k !== "ctxSize");
+          if (value !== p.def) touched.push("ctxSize");
+          s.touched = touched;
+        }
+      }
     },
     toggleAdvanced(s) {
       s.advanced = !s.advanced;

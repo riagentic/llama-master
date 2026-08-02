@@ -284,12 +284,13 @@ export function ServerPanel() {
  * log below" — so the log has to be below, on whichever page the diagnosis was
  * shown. The All-in-one page renders the same component for that reason.
  */
-export function ServerLog(props: { rows?: number }) {
+export function ServerLog(props: { rows?: number; fill?: boolean }) {
   return (
     <Panel
       title="Server log"
       icon="≡"
       wide
+      fill={props.fill}
       right={
         <button
           type="button"
@@ -309,7 +310,13 @@ export function ServerLog(props: { rows?: number }) {
             hint="Start the server to see its log."
           />
         )
-        : <LogView lines={srv.log} t="server-log" rows={props.rows ?? 18} />}
+        : (
+          <LogView
+            lines={srv.log}
+            t="server-log"
+            rows={props.fill ? 0 : props.rows ?? 18}
+          />
+        )}
     </Panel>
   );
 }

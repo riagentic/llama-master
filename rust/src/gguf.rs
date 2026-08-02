@@ -310,6 +310,28 @@ pub struct Gguf {
     pub output_bytes: u64,
     pub unknown_types: u64,
     pub layers: Vec<Layer>,
+    /// This part's index, and how many parts the model has (`split.no`,
+    /// `split.count`). A model over ~40 GB is always shipped split, and each
+    /// part carries ONLY its own slice of the tensor table — so everything
+    /// above (`tensor_bytes`, `layers`, `embd_bytes`, `output_bytes`) describes
+    /// this part alone until the parts are merged. 0 = not a split model.
+    /// Sparse-attention indexer (`<arch>.attention.indexer.top_k`, DeepSeek-V4's
+    /// "lightning indexer"). Non-zero means the graph scores the WHOLE context
+    /// for every micro-batch token, so the compute buffer grows with the context
+    /// instead of being a flat per-process cost — 68.5 GiB measured at a
+    /// 1,048,576 context where the flat estimate said 730 MB. 0 = ordinary
+    /// attention, where the flat estimate holds.
+    /// `<arch>.rope.scaling.original_context_length` — the length the model was
+    /// ACTUALLY trained at, before RoPE scaling stretched the advertised figure.
+    /// DeepSeek-V4-Flash declares 1,048,576 and this says 65,536: the headline is
+    /// a 16x YaRN extrapolation. 0 = no scaling, the headline is the truth.
+    pub n_ctx_orig: u64,
+    pub indexer_top_k: u64,
+    pub split_no: u64,
+    pub split_count: u64,
+    /// Tensors across ALL parts (`split.tensors.count`). The check that a merge
+    /// actually saw everything: reading part 1 of four gives 38 of 1328.
+    pub split_tensors: u64,
 }
 
 fn kv_num(kv: &[(String, Val)], key: &str) -> Option<f64> {
@@ -332,6 +354,11 @@ fn layer_index(name: &str) -> Option<usize> {
     let (n, _) = rest.split_once('.')?;
     n.parse().ok()
 }
+
+/// Ceiling on the layer table, so a hostile `blk.4000000000.weight` cannot ask
+/// for an allocation instead of being ignored. No model is within three orders
+/// of magnitude of it.
+const MAX_LAYERS: usize = 100_000;
 
 /// Routed-expert tensors — the ones `--n-cpu-moe` / `-ot` move off the GPU.
 /// `*_shexp` (shared expert) runs for every token and stays with attention.
@@ -422,14 +449,24 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         }
 
         match layer_index(&name) {
-            Some(i) if i < layers.len() => {
+            // A `blk.N` past `block_count` is not a lie to be filed under
+            // "output". Parts 2..N of a split model carry THREE metadata keys —
+            // `split.no`, `split.count`, `split.tensors.count` — and no
+            // `block_count` at all, so every layer they hold is out of range of
+            // a table sized from the header. Billing those to `output_bytes`
+            // put 107 GB of DeepSeek-V4's experts where `-ngl` cannot move them
+            // and `--n-cpu-moe` cannot see them. The table grows to whatever the
+            // tensors actually say; `n_layer` stays the model's own count, so
+            // the KV geometry is untouched.
+            Some(i) if i < MAX_LAYERS => {
+                if i >= layers.len() {
+                    layers.resize(i + 1, Layer::default());
+                }
                 layers[i].bytes += size;
                 if is_expert(&name) {
                     layers[i].expert_bytes += size;
                 }
             }
-            // A `blk.N` beyond block_count means the metadata lies; count it as
-            // non-layer weight rather than dropping bytes on the floor.
             _ if name.starts_with("token_embd") => embd_bytes += size,
             _ => output_bytes += size,
         }
@@ -447,6 +484,9 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
                 .map(|(t, _)| type_name(*t).to_string())
                 .unwrap_or_else(|| "UNKNOWN".into())
         });
+
+    let indexer_top_k = a("attention.indexer.top_k").unwrap_or(0.0) as u64;
+    let n_ctx_orig = a("rope.scaling.original_context_length").unwrap_or(0.0) as u64;
 
     Ok(Gguf {
         version,
@@ -473,6 +513,12 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         unknown_types,
         layers,
         arch,
+        // NOT arch-prefixed: `split.*` describes the file, not the model.
+        n_ctx_orig,
+        indexer_top_k,
+        split_no: kv_num(&kv, "split.no").unwrap_or(0.0) as u64,
+        split_count: kv_num(&kv, "split.count").unwrap_or(0.0) as u64,
+        split_tensors: kv_num(&kv, "split.tensors.count").unwrap_or(0.0) as u64,
     })
 }
 
@@ -492,7 +538,8 @@ pub fn to_json(g: &Gguf) -> String {
             "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"nextnLayers\":{},",
             "\"nExpert\":{},\"nExpertUsed\":{},",
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"embdBytes\":{},\"outputBytes\":{},",
-            "\"unknownTypes\":{},\"layers\":[{}]}}"
+            "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},",
+            "\"layers\":[{}]}}"
         ),
         g.version,
         quote(&g.arch),
@@ -517,6 +564,11 @@ pub fn to_json(g: &Gguf) -> String {
         g.embd_bytes,
         g.output_bytes,
         g.unknown_types,
+        g.n_ctx_orig,
+        g.indexer_top_k,
+        g.split_no,
+        g.split_count,
+        g.split_tensors,
         layers
     )
 }
@@ -618,6 +670,63 @@ mod tests {
         assert_eq!(g.output_bytes, 4096 * 4, "output_norm is the output group");
         assert_eq!(g.tensor_bytes, q4k * 3 + embd + 4096 * 4);
         assert_eq!(g.unknown_types, 0);
+    }
+
+    /// A part of a split model reports how much of the model it is NOT.
+    ///
+    /// Without this the caller has no way to tell a whole model from 2.9% of
+    /// one: part 1 of DeepSeek-V4-Flash parses cleanly and yields 38 tensors
+    /// and 37 GB, of the 1328 tensors and 145 GB that are actually there.
+    #[test]
+    fn reports_that_it_is_one_part_of_a_split_model() {
+        let mut b = Buf::new();
+        b.u64(1); // tensors in THIS part
+        b.u64(5); // kv
+        b.kv_str("general.architecture", "llama");
+        b.kv_u32("llama.block_count", 2);
+        b.kv_u32("split.no", 0);
+        b.kv_u32("split.count", 4);
+        b.kv_u32("split.tensors.count", 1328);
+        b.tensor("blk.0.attn_q.weight", &[4096, 4096], 12);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.split_no, 0);
+        assert_eq!(g.split_count, 4);
+        assert_eq!(g.split_tensors, 1328, "the whole model's tensor count");
+        assert_eq!(g.n_tensors, 1, "this part's, and only this part's");
+    }
+
+    /// Parts 2..N carry no `block_count`, and their layers must still be layers.
+    ///
+    /// This is the second half of the split bug: with the table sized from a
+    /// header that says nothing, every `blk.N` in parts 2, 3 and 4 fell through
+    /// to `output_bytes` — 107 GB of DeepSeek-V4's routed experts filed as the
+    /// output head, where neither `-ngl` nor `--n-cpu-moe` can place them.
+    #[test]
+    fn layers_are_found_in_a_part_that_declares_no_block_count() {
+        let mut b = Buf::new();
+        b.u64(2);
+        b.u64(3);
+        b.kv_u32("split.no", 1);
+        b.kv_u32("split.count", 4);
+        b.kv_u32("split.tensors.count", 1328);
+        b.tensor("blk.12.ffn_up_exps.weight", &[4096, 4096], 12);
+        b.tensor("blk.13.attn_q.weight", &[4096, 4096], 12);
+        let g = parse(&b.0).unwrap();
+        let q4k = 4096u64 * 4096 / 256 * 144;
+        assert_eq!(g.n_layer, 0, "the part genuinely declares none");
+        assert_eq!(g.layers.len(), 14, "the table grew to what the tensors say");
+        assert_eq!(g.layers[12].bytes, q4k);
+        assert_eq!(g.layers[12].expert_bytes, q4k);
+        assert_eq!(g.layers[13].bytes, q4k);
+        assert_eq!(g.layers[13].expert_bytes, 0);
+        assert_eq!(g.output_bytes, 0, "not one byte of this is the output head");
+    }
+
+    /// The overwhelming majority: one file, no `split.*` keys, no merge.
+    #[test]
+    fn a_single_file_model_declares_no_split() {
+        let g = parse(&fixture()).unwrap();
+        assert_eq!((g.split_no, g.split_count, g.split_tensors), (0, 0, 0));
     }
 
     #[test]

@@ -20,7 +20,7 @@ import { str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
-import { bestPlacement, PLACEMENTS, tuneAll } from "../lib/tune.ts";
+import { bestPlacement, PLACEMENTS, tune, tuneAll } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
 import type { Stability } from "../lib/stability.ts";
@@ -176,8 +176,20 @@ export function placements(): Record<Placement, Tuning> | null {
     // does not fit" for the model that was running in VRAM only at the time.
     planningHw(),
     cfg.settings,
+    // Two different things, and passing them as one number conflated an
+    // instruction with a hint: a context the user typed is EXACT (the tuner
+    // holds it and reports the shortfall when it cannot), while the measured
+    // fit is only a search ceiling for the automatic path — aiming past it
+    // would just walk the retry ladder back down (`src/lib/fitladder.ts`).
     ctxOverride() || undefined,
+    measuredCtx(m.path) || undefined,
   );
+}
+
+/** The largest context this model has been observed to actually start at on
+ *  this machine, or 0 if it has never run. */
+export function measuredCtx(path: string): number {
+  return cfg.fitCtx[path] ?? 0;
 }
 
 /**
@@ -223,7 +235,12 @@ function tunedForStart(): { tuning: Tuning; reasons: string[] } | null {
   if (!all) return null;
   let chosen = cfg.placement;
   const extra: string[] = [];
-  if (!all[chosen].possible) {
+  // NEVER fall back off a pinned context's placement. The refusal at a pin is
+  // the compute-scratch ESTIMATE talking, and the estimate has been measured
+  // pessimistic (512k ran where it said no) — silently switching a pinned
+  // 640k to CPU-only is the app overruling an instruction on a guess. The
+  // allocator has the final say at Start; the warning says so.
+  if (!all[chosen].possible && !ctxOverride()) {
     const fallback = bestPlacement(all);
     if (all[fallback].possible) {
       extra.push(
@@ -244,6 +261,41 @@ export function applyOptimal(): void {
   const r = tunedForStart();
   if (!r) return;
   cfg.apply(r.tuning.settings, r.reasons);
+}
+
+/**
+ * The largest context a placement can hold on this machine, hunted to the
+ * model's ADVERTISED maximum — what the "Max on VRAM / Max on Hybrid"
+ * buttons offer, computed the same way they would run.
+ */
+export function maxFor(placement: Placement): Tuning | null {
+  const m = currentModel();
+  if (!m?.meta) return null;
+  return tune(
+    m.meta,
+    planningHw(),
+    cfg.settings,
+    placement,
+    undefined,
+    undefined,
+    true,
+  );
+}
+
+/**
+ * One click for the priority most sessions actually have: THIS placement, at
+ * the biggest context it can hold. Sets the placement, pins the hunted
+ * context, and re-tunes so the settings, the projection and the command all
+ * describe the same run. The pin means the ladder stays out of it — this is
+ * the user stating their priority, and the measured-boundary warning on the
+ * context control covers the part arithmetic cannot see.
+ */
+export function pinMaxFor(placement: Placement): void {
+  const t = maxFor(placement);
+  if (!t || !t.possible || t.ctx <= 0) return;
+  cfg.setPlacement(placement);
+  cfg.setCtxOverride(t.ctx, models.selected);
+  applyOptimal();
 }
 
 /** Is the current configuration going to hurt? Recomputed on every render, so
@@ -288,6 +340,10 @@ export function startServer(): Promise<void> {
     model: model?.path ?? "",
     settings,
     freeAtStart: freeNowB(),
+    // The ladder is only for settings the APP chose. A context the user typed
+    // is an instruction, and halving it because it did not fit would be the app
+    // overruling them silently (`src/lib/fitladder.ts`).
+    autoFit: cfg.autoOptimal && !ctxOverride(),
   }).then(() => {});
 }
 

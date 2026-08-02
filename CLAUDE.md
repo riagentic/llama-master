@@ -183,6 +183,86 @@ Data flow worth knowing:
 - **Memory numbers are exact, not estimated.** `rust/src/gguf.rs` walks the
   tensor table and reports per-layer bytes with routed experts separated; only
   the compute buffer is an estimate, and it is labelled as one everywhere.
+- **A split model must be read as a model, not as its first part.** Anything
+  past ~40 GB ships as `-00001-of-000NN.gguf`, and the tensor table is DIVIDED
+  across the parts, not repeated: part 1 of DeepSeek-V4-Flash parses perfectly
+  and describes 38 tensors and 37 GB, of the 1,328 tensors and 145 GB on disk.
+  Nothing downstream can tell — the planner sized it at a quarter, VRAM-only
+  looked possible on 48 GB of cards, the tuner proposed it, and llama-server was
+  OOM-killed loading the other 108 GB. `src/lib/shards.ts` merges every part and
+  `readModel` refuses to return a merge that did not see all of them (a partial
+  set is not a smaller model; llama.cpp cannot load it either). Two independent
+  completeness checks, because they catch different failures: the header's own
+  tensor count across all parts, and the summed on-disk size for parts that are
+  present but truncated. Parts 2..N carry THREE metadata keys and no
+  `block_count`, so the Rust layer table grows to fit the tensors it actually
+  sees — sizing it from that header filed 107 GB of routed experts as the output
+  head, where neither `-ngl` nor `--n-cpu-moe` can place them.
+
+- **A second GPU is not a bigger GPU.** llama.cpp offloads a contiguous run of
+  layers and cuts it into per-device ranges **by count** — `--tensor-split`, or
+  by default each card's free VRAM, is normalised into cumulative fractions and
+  layer `i` goes to the first device whose fraction exceeds `i / n_offloaded`
+  (`llama-model.cpp`, `get_layer_buft_list`). By count, not by bytes. On a dense
+  model those agree; with `--n-cpu-moe N` they do not, because that flag holds
+  the FIRST N layers' experts in RAM, so every layer that still owns its experts
+  is at the END of the model — and the end of the model is the LAST card. A
+  DeepSeek-V4 plan of 38 GB against 42 GB of free VRAM asked one 24 GB card for
+  34 GB and died with `cudaMalloc failed`. `src/lib/devsplit.ts` sizes each
+  slot, packs them into the cards in order, and emits the `-ts` that pins the
+  result; `plan.devices.fits` is a separate constraint from `vram.overB === 0`,
+  and `tune` requires both.
+- **`-ngl` counts the output head, and never moves the embeddings.** There are
+  `nLayer + 1` slots, so `-ngl 43` on a 43-layer model offloads layers 1..42 AND
+  the output, leaving layer 0 on the host; only `-ngl > nLayer` takes every
+  layer. The token embedding table is an INPUT tensor and llama.cpp pins those
+  to the CPU at any `-ngl` (`dev_input`, "very little benefit to offloading the
+  input layer"), so billing it to VRAM spent ~1 GB of a card's budget on bytes
+  that were never going there. Both rules live in `devsplit.ts:offloadRange` and
+  `plan.ts` reads them.
+- **`--mlock` and `--no-mmap` are ONE setting.** Both assign `params.load_mode`
+  (`common/arg.cpp`), so emitting both is not "locked and unmapped" — it is
+  whichever came last, silently, while the app prints a reason claiming the
+  other. With routed experts on the host the tuner now emits NEITHER flag —
+  llama.cpp's mmap default — and it was measured: `--no-mmap` copies the whole
+  145 GB file on every start (148 s cold, 160 s even warm, because its own copy
+  evicts the page cache), while mapped the same start is 73 s cold and **6 s
+  warm**, and generation is slightly FASTER mapped (9.6 against 8.9 tok/s, same
+  CUDA build, same cards). Every fit-ladder rung reloads the model, so this is
+  also what makes the retry ladder affordable. `--mlock` is not emitted there
+  either: it would ask to pin more than stock `RLIMIT_MEMLOCK` allows (23 GB on
+  the machine that motivated this, against ~110 GB of experts), and llama.cpp
+  would warn and run unpinned — a flag whose stated effect does not happen. A
+  test in `tests/lib.test.ts` fails if any placement emits both flags.
+
+- **Some models cannot be sized from their header, so the app measures.**
+  `plan.ts` is arithmetic over facts and that is still true for almost every
+  model — but DeepSeek-V4-Flash declares a 1,048,576-token context at which
+  llama.cpp asked for a **68.5 GiB compute buffer** (predicted: 730 MB) and an
+  18 GiB KV cache (predicted: 183 MB). Both scale with the context for a
+  sparse-attention model and nothing in the header says by how much, so no
+  placement search could have found it — 68 GiB of scratch does not fit any
+  division of any cards. llama.cpp's own fitter (`-fit`) exists for exactly this
+  and **segfaults on this model**, so it cannot be delegated to either. What is
+  left is `src/lib/fitladder.ts`: start, and if the run dies for want of memory,
+  halve the context and start again (six rungs — 1M → 32k, because 64k was
+  measured to fail), then write the working length into `cfg.fitCtx` so the next
+  run of that model opens there. The estimate is the opening bid; the allocator
+  has the final say — **at generation, not just at load**: CUDA allocates its
+  compute scratch (activation-quantise buffers, cuBLAS workspace, graphs) lazily
+  at the first real batch, so a too-tight plan can pass `/health` and die on the
+  first prompt (measured: healthy at 17,408, then `CUDA error: out of memory`
+  inside `quantize_row_q8_1_cuda` answering "Hi" — stderr that never says
+  "buffer", which `isFitFailure` must still recognise). So `srv.poll` enters
+  `ready` only through a one-shot generation probe (`srv.server.ts:probe`,
+  `/completion`, a few dozen prompt tokens + 2 predicted); a probe that kills
+  the process is the ladder's next rung, and `cfg.rememberFit` waits for
+  `srv.proven`, never `/health` alone — recording at health once wrote a
+  crashing 17,408 down as a fact, and `rememberFit` only ever grows. The retry
+  rewrites `-c` in the argv that actually ran rather than re-composing one, so
+  "what you see is what runs" survives it, and it is off whenever the user typed
+  the context themselves. `tests/deepseek.e2e.test.ts` proves the whole path on
+  the real 145 GB model (opt-in: `LLAMA_MASTER_E2E=1`).
 
 ## Never a raw error
 

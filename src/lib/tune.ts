@@ -70,14 +70,34 @@ export type Tuning = {
 };
 
 /**
- * The largest context at which the model still performs the best.
+ * The full advertised context — the hard ceiling for a pin and the Max band.
  *
- * Its trained context, and nothing else. Beyond it the positional encoding is
- * extrapolated and answers get worse while the number looks better — so this is
- * the ceiling every placement aims at and none exceeds.
+ * This is what the header declares and what llama.cpp will accept as `-c`
+ * without extrapolating. For a YaRN-stretched model it INCLUDES the stretch:
+ * DeepSeek-V4-Flash advertises 1,048,576 and genuinely runs there (given the
+ * memory). Showing anything smaller as "Max" contradicted the Models page,
+ * which reads `nCtxTrain` directly — the same model must not have two maxima.
+ */
+export function trainedCtx(meta: ModelMeta): number {
+  return meta.nCtxTrain > 0 ? meta.nCtxTrain : 4096;
+}
+
+/**
+ * The largest context at which the model still performs the best — the
+ * TUNER'S aim, not the user's ceiling (`trainedCtx` is that).
+ *
+ * `nCtxTrain` is what the file ADVERTISES, and for a RoPE-scaled model that is
+ * an extrapolation, not a measurement: DeepSeek-V4-Flash declares 1,048,576
+ * over an `original_context_length` of 65,536 — a 16x YaRN stretch. Aiming the
+ * AUTO-tuner at the stretched figure is how it ended up proposing a context
+ * whose compute buffer alone was 68 GiB. The native length is a fact in the
+ * same header, and it is the honest automatic target; the user can still pin
+ * anything up to `trainedCtx` themselves.
  */
 export function optimalCtx(meta: ModelMeta): number {
-  return meta.nCtxTrain > 0 ? meta.nCtxTrain : 4096;
+  const advertised = trainedCtx(meta);
+  const native = meta.nCtxOrig;
+  return native > 0 && native < advertised ? native : advertised;
 }
 
 /** Below this a context is too short to hold a conversation, so a placement
@@ -113,12 +133,21 @@ export type CtxBands = Record<CtxBandId, number>;
  * ordered values rather than a scrambled range.
  */
 export function ctxBands(meta: ModelMeta): CtxBands {
-  const max = optimalCtx(meta);
+  const max = trainedCtx(meta);
+  const native = optimalCtx(meta);
   const step = (n: number) =>
     Math.max(CTX_STEP, Math.floor(n / CTX_STEP) * CTX_STEP);
   const min = Math.min(step(Math.min(4096, max)), max);
-  const big = Math.min(Math.max(step(max / 2), min), max);
-  const opt = Math.min(Math.max(step(max / 4), min), big);
+  // For a YaRN-stretched model the native pre-stretch length is the one
+  // quality fact the header carries, so it anchors the bands: Big IS the
+  // native length and Opt sits at half of it. Everything between Big and Max
+  // is the stretched range — real, but bought with retrieval quality.
+  const stretched = native < max;
+  const big = Math.min(Math.max(step(stretched ? native : max / 2), min), max);
+  const opt = Math.min(
+    Math.max(step(stretched ? native / 2 : max / 4), min),
+    big,
+  );
   return { min, opt, big, max };
 }
 
@@ -150,14 +179,14 @@ export const CTX_BANDS: readonly {
     label: "Big",
     estimated: true,
     tip:
-      "Long, with some quality given up. ESTIMATED at half the trained length, for the same reason as Opt — a defensible place to look, not a measurement.",
+      "Long, with some quality given up. ESTIMATED at half the trained length — or, for a YaRN-stretched model, its native pre-stretch length, the one quality fact the header carries.",
   },
   {
     id: "max",
     label: "Max",
     estimated: false,
     tip:
-      "The full length this model was trained for. Read from the model, not estimated. Past it RoPE extrapolates and answers degrade sharply, so this is the outer edge.",
+      "The full advertised context, read from the model, not estimated. For a YaRN-stretched model this includes the stretch: it genuinely runs there, at a real cost in memory and some retrieval quality past its native length.",
   },
 ];
 
@@ -180,12 +209,15 @@ export function pinnedCtx(override: number, target: number): number {
 /**
  * The context sizes worth one click.
  *
- * Powers of two because that is how every model and every published benchmark
- * describes its context, and because the KV cache doubles with each step — so
- * the ladder is also the cost ladder. A preset above what the model was trained
- * for is offered but disabled rather than hidden: "1M is possible, not for THIS
- * model" is information, and a row that changes length per model is harder to
- * use than one that does not.
+ * Powers of two up to 128k, because that is how every model and every
+ * published benchmark describes its context — then 128k steps to the top,
+ * because on a machine that genuinely holds long contexts the gap from 256k
+ * straight to 512k skips exactly the sizes worth trying (a user watched 256k
+ * work and 512k die, with nothing offered between). The KV cache grows with
+ * every rung, so the ladder is also the cost ladder. A preset above what the
+ * model was trained for is offered but disabled rather than hidden: "1M is
+ * possible, not for THIS model" is information, and a row that changes length
+ * per model is harder to use than one that does not.
  */
 export const CTX_PRESETS: readonly number[] = [
   16_384,
@@ -193,7 +225,11 @@ export const CTX_PRESETS: readonly number[] = [
   65_536,
   131_072,
   262_144,
+  393_216,
   524_288,
+  655_360,
+  786_432,
+  917_504,
   1_048_576,
 ];
 
@@ -256,10 +292,22 @@ function gb(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+/**
+ * Does this placement fit the GPUs — all of them, and each of them?
+ *
+ * Two questions, and only the first used to be asked. The aggregate says the
+ * machine has the VRAM; `p.devices.fits` says there is a way to cut the layers
+ * so that no single card is asked for more than it holds. On one GPU they are
+ * the same question. On two they are not, and the difference is a plan that
+ * passes every check here and dies with `cudaMalloc failed` on device 1 —
+ * because llama.cpp divides the offloaded layers by COUNT while `--n-cpu-moe`
+ * makes the last ones an order of magnitude heavier (`src/lib/devsplit.ts`).
+ */
 function fitsVram(meta: ModelMeta, hw: Hw, s: Settings): boolean {
   const p = plan(meta, hw, s);
   const total = hw.gpus.reduce((a, g) => a + g.vramTotalB, 0);
-  return p.vram.overB === 0 && p.vram.freeB >= marginB(total);
+  return p.vram.overB === 0 && p.vram.freeB >= marginB(total) &&
+    p.devices.fits;
 }
 
 /**
@@ -412,7 +460,45 @@ function bestCtx(
   base: Settings,
   placement: Placement,
   ceiling: number,
+  /** Drop the residency anchor: grow the context even when that pushes
+   *  weights back to the host. The "Max on Hybrid" contract — the user has
+   *  said context outranks speed, which is the one trade the automatic
+   *  search exists to refuse. A pinned 262,144 ran fine on hybrid while the
+   *  button offered 17,920, because the pin skipped the anchor and the
+   *  button did not: same machine, two answers, and the button's was the
+   *  wrong one for the question it claims to answer. */
+  keepResidency = true,
 ): number {
+  // RESIDENCY FIRST. The old search asked "what is the largest context that
+  // fits?" and answered it by moving work to the host — on a model whose
+  // compute scratch grows with the context that is a trade it will always take,
+  // and it settled on one layer on the GPU at a 654,848 context: fits, and runs
+  // at CPU speed. Speed is the reason a GPU is here at all, so the placement is
+  // fixed first, at the shortest useful context, and the context then grows only
+  // as far as it can WITHOUT pushing another byte of weight back to the host.
+  //
+  // Host WEIGHTS, not host bytes: the KV cache grows with the context by
+  // definition and on a CPU placement everything is host-side, so anchoring on
+  // total host bytes would pin every placement to its floor.
+  const anchorAt = Math.min(MIN_CTX, ceiling);
+  const hostWeightsB = (c: number): number => {
+    const p = place(meta, hw, base, placement, c);
+    if (!p) return Infinity;
+    return plan(meta, hw, p.settings).ram.buckets
+      .filter((b) => b.key === "weights")
+      .reduce((a, b) => a + b.bytes, 0);
+  };
+  const anchor = hostWeightsB(anchorAt);
+  const keepsResidency = (c: number): boolean =>
+    place(meta, hw, base, placement, c) !== null &&
+    hostWeightsB(c) <= anchor;
+  const placeable = (c: number): boolean =>
+    place(meta, hw, base, placement, c) !== null;
+  return searchCtx(ceiling, keepResidency ? keepsResidency : placeable);
+}
+
+/** Largest value on the grid, at most `ceiling`, that satisfies `ok`. */
+function searchCtx(ceiling: number, ok: (c: number) => boolean): number {
   // The model's ceiling wins over our usability floor. A model trained for 128
   // tokens cannot be handed 2,048 just because that is the shortest context we
   // would normally propose — that would break the one rule this whole search
@@ -420,15 +506,15 @@ function bestCtx(
   const floor = Math.min(MIN_CTX, ceiling);
   const rounded = Math.floor(ceiling / CTX_STEP) * CTX_STEP;
   const top = Math.max(floor, rounded);
-  if (place(meta, hw, base, placement, top)) return top;
-  if (!place(meta, hw, base, placement, floor)) return 0;
+  if (ok(top)) return top;
+  if (!ok(floor)) return 0;
   // Invariant: lo fits, hi does not.
   let lo = floor;
   let hi = top;
   while (hi - lo > CTX_STEP) {
     const mid = Math.floor((lo + hi) / 2 / CTX_STEP) * CTX_STEP;
     if (mid <= lo || mid >= hi) break;
-    if (place(meta, hw, base, placement, mid)) lo = mid;
+    if (ok(mid)) lo = mid;
     else hi = mid;
   }
   return lo;
@@ -437,9 +523,21 @@ function bestCtx(
 /**
  * Optimal settings for this model, on this machine, in this placement.
  *
- * `base` supplies everything the tuner does not decide (port, sampling). Pass
- * `ctxOverride` to hold the context at a value the user typed — an edited
- * context is an instruction, not a suggestion to be re-optimised.
+ * `base` supplies everything the tuner does not decide (port, sampling).
+ *
+ * `ctxOverride` is a value the user typed, and it is an INSTRUCTION: the
+ * context is held exactly there (clamped only to the advertised maximum) and
+ * everything else is arranged around it. When it does not fit, the answer is
+ * `possible: false` with the shortfall named and a plan that SHOWS the
+ * overflow — never a silently smaller number. It used to be a search ceiling
+ * instead, so pinning 1,048,576 quietly started 17,920, and the projection
+ * never showed what the megabyte question actually cost.
+ *
+ * `measuredCtx` is different in kind: the largest context this model has
+ * actually run at on this machine (`cfg.fitCtx`). It is a SEARCH ceiling for
+ * the automatic path — the machine may hold less today than it did then, so
+ * the tuner may settle lower, it just never aims higher only to walk the
+ * retry ladder back down.
  */
 export function tune(
   meta: ModelMeta,
@@ -447,6 +545,13 @@ export function tune(
   base: Settings,
   placement: Placement = "vram",
   ctxOverride?: number,
+  measuredCtx?: number,
+  /** Hunt the largest context this placement can hold, all the way to the
+   *  ADVERTISED maximum — past the native-first aim and past the measured
+   *  ceiling. The "Max on VRAM / Max on Hybrid" gesture: the user has said
+   *  context is the priority, so the memory search goes to the model's edge
+   *  and the measured-boundary warning covers what arithmetic cannot see. */
+  aimFull = false,
 ): Tuning {
   const d = defaults();
   const s: Settings = { ...d, ...base };
@@ -454,9 +559,13 @@ export function tune(
   const target = optimalCtx(meta);
 
   // The cache type is the tuner's to decide, so start from llama.cpp's default
-  // rather than from whatever the last model happened to need.
+  // rather than from whatever the last model happened to need. Same for the
+  // tensor split: it is derived from THIS model's layer sizes, and one carried
+  // over from another model is a wrong answer that looks deliberate.
   s.cacheTypeK = str(d, "cacheTypeK");
   s.cacheTypeV = str(d, "cacheTypeV");
+  s.tensorSplit = str(d, "tensorSplit");
+  s.noMmap = false;
 
   const cores = hw.cpu?.cores ?? 0;
   if (cores > 0) {
@@ -509,9 +618,26 @@ export function tune(
     );
   }
 
-  const ceiling = ctxOverride !== undefined
-    ? pinnedCtx(ctxOverride, target)
-    : target;
+  const pinned = ctxOverride !== undefined && ctxOverride > 0;
+  // A pin clamps to the ADVERTISED maximum, not the tuner's native-first aim:
+  // the UI offers Max = trainedCtx, and a pin of 1,048,576 silently searched
+  // under a 65,536 ceiling was two lies at once.
+  const ceiling = pinned
+    ? pinnedCtx(ctxOverride, trainedCtx(meta))
+    : aimFull
+    ? trainedCtx(meta)
+    : Math.min(
+      target,
+      measuredCtx !== undefined && measuredCtx > 0 ? measuredCtx : target,
+    );
+  if (!pinned && !aimFull && ceiling < target) {
+    reasons.push(
+      `Context search capped at ${ceiling.toLocaleString()} — the largest this model has actually started at on this machine. Pin a size to try beyond it.`,
+    );
+  }
+  /** A pinned context either places at exactly the pin, or not at all. */
+  const fitAt = (t: Settings, c: number): number =>
+    place(meta, hw, t, placement, c) !== null ? c : 0;
 
   // Host-side bytes for a candidate. Every one of them crosses the PCIe bus on
   // every token, so at equal context the candidate with fewer is the faster one.
@@ -535,13 +661,17 @@ export function tune(
   // count, and it can be the bigger prize: a long-context MoE that reaches its
   // full trained length either way can still be paying for it with several GB of
   // experts and cache in system RAM, which q8_0 brings back onto the card.
-  const f16 = bestCtx(meta, hw, s, placement, ceiling);
+  const f16 = pinned
+    ? fitAt(s, ceiling)
+    : bestCtx(meta, hw, s, placement, ceiling, !aimFull);
   let ctx = f16;
   const f16Host = f16 > 0 ? hostB(s, f16) : 0;
   const spilling = usesGpu && f16 > 0 && f16Host > 0;
   if (quantKvOk && (f16 < ceiling || spilling)) {
     const q8s: Settings = { ...s, cacheTypeK: "q8_0", cacheTypeV: "q8_0" };
-    const q8 = bestCtx(meta, hw, q8s, placement, ceiling);
+    const q8 = pinned
+      ? fitAt(q8s, ceiling)
+      : bestCtx(meta, hw, q8s, placement, ceiling, !aimFull);
     const q8Host = q8 > 0 ? hostB(q8s, q8) : Infinity;
     const buysContext = q8 > f16;
     // The gain has to be worth the quality cost — and worth a sentence. A
@@ -568,13 +698,30 @@ export function tune(
   if (ctx === 0) {
     // Nothing fits. Return an honest attempt so the UI still has numbers to
     // show, and say plainly that this placement is not available here.
-    const floor = Math.min(MIN_CTX, ceiling);
-    const fallback = place(meta, hw, s, placement, floor)?.settings ?? {
+    //
+    // A PINNED context keeps the pin in the returned settings: the projection
+    // is computed from them, and the whole point of pinning 1M on a machine
+    // that cannot hold it is to SEE what is missing — a fallback quietly reset
+    // to 2,048 drew a fitting plan and left "so what memory is missing?"
+    // unanswerable.
+    const floor = pinned ? ceiling : Math.min(MIN_CTX, ceiling);
+    // For a pinned refusal, keep the PLACEMENT's shape: take the arrangement
+    // this placement reaches at a small context and hold the pin in it. The
+    // old fallback (`ngl: 999`, experts on GPU) priced a hybrid refusal as if
+    // the whole model sat in VRAM and told the user "needs 142 GB more VRAM"
+    // for a placement whose weights live mostly in RAM — a shortfall nobody
+    // could act on.
+    const shape = pinned
+      ? place(meta, hw, s, placement, Math.min(MIN_CTX, ceiling))?.settings
+      : place(meta, hw, s, placement, floor)?.settings;
+    const fallback = shape ? { ...shape, ctxSize: floor } : {
       ...s,
       ctxSize: floor,
       ngl: placement === "cpu" ? 0 : 999,
     };
-    const blocker = blockerFor(meta, hw, placement);
+    const blocker = pinned
+      ? pinBlocker(meta, hw, fallback, ceiling)
+      : blockerFor(meta, hw, placement);
     return {
       settings: fallback,
       reasons: [...reasons, `${label} is not possible here: ${blocker}`],
@@ -582,15 +729,24 @@ export function tune(
       optimalCtx: target,
       possible: false,
       blocker,
-      summary: `${label} — not possible for this model here`,
+      summary: pinned
+        ? `${label} — does not fit at the pinned ${ceiling.toLocaleString()}`
+        : `${label} — not possible for this model here`,
     };
   }
 
   const placed = place(meta, hw, s, placement, ctx);
   const settings = placed?.settings ?? { ...s, ctxSize: ctx };
   if (placed?.note) reasons.push(`${label}: ${placed.note}.`);
+  if (aimFull) {
+    reasons.push(
+      "Context first, by request: the search was allowed to move weights into system RAM to buy length, which the automatic path never does. The projected speed shows the price.",
+    );
+  }
   reasons.push(
-    ctx >= target
+    pinned
+      ? `Context ${ctx.toLocaleString()} — pinned by you; the tuner arranges everything else around it.`
+      : ctx >= target
       ? `Context ${ctx.toLocaleString()} — the full length this model was trained for. More would need RoPE scaling and answer worse, not better.`
       : `Context ${ctx.toLocaleString()} of the ${target.toLocaleString()} this model was trained for — the most this placement can hold.`,
   );
@@ -602,13 +758,38 @@ export function tune(
     optimalCtx: target,
     possible: true,
     blocker: "",
-    summary: ctx >= target
+    summary: pinned
+      ? `${label} · pinned ${ctx.toLocaleString()} context`
+      : ctx >= target
       ? `${label} · full ${ctx.toLocaleString()} context`
       : `${label} · ${ctx.toLocaleString()} of ${target.toLocaleString()} context`,
   };
 }
 
 /** Why a placement is unavailable, in the user's terms. */
+/**
+ * Why a PINNED context cannot run, with the missing bytes named.
+ *
+ * The pin is an instruction, so the answer is not "pick a smaller model" — it
+ * is exactly how far short this machine falls at the size the user asked for,
+ * and the two ways out: a smaller pin, or Auto.
+ */
+function pinBlocker(
+  meta: ModelMeta,
+  hw: Hw,
+  settings: Settings,
+  pin: number,
+): string {
+  const p = plan(meta, hw, settings);
+  const missing = [
+    p.vram.overB > 0 ? `${gb(p.vram.overB)} more VRAM` : "",
+    p.ram.overB > 0 ? `${gb(p.ram.overB)} more RAM` : "",
+  ].filter(Boolean).join(" and ");
+  const detail = missing ||
+    "no arrangement of the cards can hold its layers";
+  return `does not fit at the pinned ${pin.toLocaleString()} tokens — needs ${detail}. Lower the pin, or press Auto to let the tuner find the largest that fits.`;
+}
+
 function blockerFor(
   meta: ModelMeta,
   hw: Hw,
@@ -676,10 +857,67 @@ function finish(
   reasons: string[],
 ): string[] {
   const p = plan(meta, hw, s);
+
+  // Pin the layer-to-card division rather than leaving it to llama.cpp's
+  // default. The default divides by each card's free memory but applies the
+  // result to the layer COUNT, which is only the same thing when every layer
+  // weighs the same — and with `--n-cpu-moe` holding the first N layers'
+  // experts in RAM, the last layers are ~20x the first. That put 34 GB of a
+  // 38 GB plan on one 24 GB card. This is the split that was actually planned,
+  // so it is also the one the memory bars are drawing.
+  if (p.devices.tensorSplit) {
+    s.tensorSplit = p.devices.tensorSplit;
+    reasons.push(
+      `Layers split ${
+        p.devices.bytesB.map((b) => gb(b)).join(" / ")
+      } across the cards (-ts ${p.devices.tensorSplit}) — llama.cpp divides them by count, and with the experts held back the last layers are far heavier, so left to itself it would overfill one card.`,
+    );
+  }
+
+  // llama.cpp's own advice for this configuration: "tensor overrides to CPU are
+  // used with mmap enabled - consider using --no-mmap for better performance".
+  // How the weights get into memory. ONE choice, not two flags.
+  //
+  // `--mlock` and `--no-mmap` are the same setting in llama.cpp: both assign
+  // `params.load_mode`, so emitting them together is not "locked and unmapped",
+  // it is whichever came last silently winning (`common/arg.cpp`). The app would
+  // have printed a reason claiming --mlock while shipping an argv that cancelled
+  // it — precisely the "what you see is what runs" promise, broken.
+  //
+  // So they are ranked. `mlock` mode still memory-maps (`use_mmap = MMAP ||
+  // MLOCK`, llama-model-loader.cpp:545), which is what llama.cpp warns about the
+  // moment any tensor is overridden to the CPU: "tensor overrides to CPU are
+  // used with mmap enabled - consider using --no-mmap for better performance".
+  // With the routed experts on the host that warning is about the bytes crossing
+  // the bus on every token, so it wins — and it is only taken when the host side
+  // has real room, because unmapped weights are anonymous pages with no file to
+  // fall back to.
   const availB = hw.mem?.availableB ?? 0;
   const hostNeed = p.ram.usedB;
   const margin = ramMarginB(availB);
-  if (availB > 0 && hostNeed > 0 && hostNeed < availB * 0.7) {
+  const roomToSpare = availB > 0 && hostNeed > 0 && hostNeed < availB * 0.7;
+
+  if (roomToSpare && num(s, "nCpuMoe") > 0 && p.ram.overB === 0) {
+    // MEASURED, not reasoned from folklore, on the 145 GB DeepSeek-V4 with 33
+    // layers of experts on the host: `--no-mmap` copies the whole file on
+    // every start — 148 s cold and 160 s even with a warm page cache, because
+    // its own anonymous copy evicts the cache it would have used. Mapped, the
+    // same start is 73 s cold and 6 s warm, and generation is no slower —
+    // faster, in fact: 9.6 tok/s mapped against 8.9 with `--no-mmap`, same
+    // build, same card — and every fit-ladder rung reloads the model, so
+    // this is the difference between a retry that stings and one that does
+    // not. `--mlock` is not the answer either: it would try to pin the whole
+    // expert set, stock Linux caps RLIMIT_MEMLOCK far below a model this size
+    // (23 GB on the machine that motivated this), and llama.cpp would warn
+    // and continue unpinned — a flag whose stated effect does not happen.
+    // With `roomToSpare` guarding this branch, the page cache keeps the hot
+    // expert pages by itself. So: llama.cpp's default, and no flag at all.
+    s.noMmap = false;
+    s.mlock = false;
+    reasons.push(
+      "Memory-mapped (llama.cpp's default): the routed experts run from the page cache, so a warm restart re-reads nothing — measured 6 s instead of 160 s on a 145 GB model, and every automatic retry reloads the model. --no-mmap would copy the whole file on every start, and --mlock would ask to pin more than stock memlock limits allow, so llama.cpp would warn and run unpinned anyway.",
+    );
+  } else if (roomToSpare) {
     s.mlock = true;
     reasons.push(
       "--mlock on: the host-side weights fit in free RAM with room to spare, so pinning them stops the OS paging the model out mid-generation.",
@@ -718,11 +956,12 @@ export function tuneAll(
   hw: Hw,
   base: Settings,
   ctxOverride?: number,
+  measuredCtx?: number,
 ): Record<Placement, Tuning> {
   return {
-    vram: tune(meta, hw, base, "vram", ctxOverride),
-    hybrid: tune(meta, hw, base, "hybrid", ctxOverride),
-    cpu: tune(meta, hw, base, "cpu", ctxOverride),
+    vram: tune(meta, hw, base, "vram", ctxOverride, measuredCtx),
+    hybrid: tune(meta, hw, base, "hybrid", ctxOverride, measuredCtx),
+    cpu: tune(meta, hw, base, "cpu", ctxOverride, measuredCtx),
   };
 }
 

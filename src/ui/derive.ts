@@ -24,7 +24,9 @@ import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
 import { drift, headroomKey } from "../lib/adapt.ts";
-import { optimalCtx } from "../lib/tune.ts";
+import { optimalCtx, pinnedCtx, trainedCtx } from "../lib/tune.ts";
+import { loadProgress } from "../lib/loadprogress.ts";
+import type { LoadProgress } from "../lib/loadprogress.ts";
 import {
   bytesPerToken,
   calibrate,
@@ -155,6 +157,33 @@ export function driftNow(): Drift {
     if (maxed) return { kind: "none" };
   }
   return d;
+}
+
+/**
+ * The load in progress, measured — or null when nothing is loading.
+ *
+ * A big model takes minutes to come up and "LOADING MODEL" alone reads as a
+ * hang. The poll already measures everything an honest bar needs: the
+ * device-wide VRAM drop since the spawn plus the process RSS, against the
+ * plan's total for the running command (`src/lib/loadprogress.ts`).
+ */
+export function loadingNow():
+  | (LoadProgress & { startedAt: number; note: string })
+  | null {
+  if (srv.status !== "starting" || srv.pid === 0) return null;
+  const p = currentStatePlan();
+  return {
+    ...loadProgress({
+      lines: srv.log,
+      startFreeVramB: srv.startFreeVramB,
+      freeVramB: vramTotalB() - vramUsedB(),
+      rssB: srv.rssB,
+      plannedB: p.vram.usedB + p.ram.usedB,
+    }),
+    startedAt: srv.startedAt,
+    // The ladder's step-down note belongs with the progress it restarted.
+    note: srv.fitNote,
+  };
 }
 
 export function vramTotalB(): number {
@@ -312,7 +341,17 @@ export function planningHw(): Hw {
 export function projectedStatePlan(): Plan | null {
   const m = currentModel()?.meta;
   if (!m) return null;
-  return computePlan(m, planningHw(), cfg.settings);
+  // A pinned context is IN the projection, always. With auto-optimal on the
+  // tuner writes it into the settings anyway; with it off, projecting from
+  // `cfg.settings` alone showed the previous tune's context — a user pinned
+  // 1M, the map did not move, and "so what memory is missing?" had no answer
+  // anywhere on the page. The clamp is the pin's own (`pinnedCtx`), so the
+  // number projected is the number that would run.
+  const pin = ctxOverride();
+  const settings = pin > 0
+    ? { ...cfg.settings, ctxSize: pinnedCtx(pin, trainedCtx(m)) }
+    : cfg.settings;
+  return computePlan(m, planningHw(), settings);
 }
 
 /**

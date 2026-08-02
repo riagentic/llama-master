@@ -218,3 +218,23 @@ export function preferredBackends(
   if (vendors.has("intel")) return ["vulkan", "cpu"];
   return ["cpu"];
 }
+
+/**
+ * The raised graph-split input cap, for builds meant to run extreme contexts.
+ *
+ * `GGML_SCHED_MAX_SPLIT_INPUTS` is 30 by default, behind an `#ifndef` — a
+ * compile-time cap on how many tensors one graph split may pull across a
+ * device boundary. With routed experts in RAM and attention across GPUs, this
+ * model class needs more of them as the context grows: measured on
+ * DeepSeek-V4 on 2×24 GB, a 262,144 context generates and 524,288 dies at
+ * `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` during load — memory
+ * to spare, the constant was the wall. If ~30 inputs carry ~256k, the model's
+ * full 1M needs roughly 4×; 1,024 is that with an 8× margin, and costs only
+ * kilobytes of scheduler bookkeeping per split.
+ */
+export const SCHED_SPLIT_CAP = 1024;
+
+/** The compiler define that raises the cap, or nothing for a stock build. */
+export function schedCapFlags(bypass: boolean): string[] {
+  return bypass ? [`-DGGML_SCHED_MAX_SPLIT_INPUTS=${SCHED_SPLIT_CAP}`] : [];
+}

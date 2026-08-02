@@ -15,6 +15,14 @@ import {
   nameFromManifestPath,
   resolveManifest,
 } from "../lib/ollama.ts";
+import {
+  isSplit,
+  mergeShards,
+  shardGap,
+  shardInfo,
+  shardKey,
+  shardPaths,
+} from "../lib/shards.ts";
 import { exists, PLATFORM } from "./host.server.ts";
 import { gguf } from "./wasm.server.ts";
 import { DEMO_ENV, demoModels } from "../lib/demo.ts";
@@ -69,17 +77,6 @@ function sourceOf(path: string): ModelSource {
  *  Listing them puts unloadable entries in the library. */
 function isProjector(file: string): boolean {
   return /^mmproj[-.]/i.test(file);
-}
-
-const SHARD = /-(\d{5})-of-(\d{5})\.gguf$/i;
-
-/** First shard of a split model, or the file itself. Multi-part GGUFs are
- *  loaded by pointing `-m` at part 1; listing all five parts as five models
- *  would be five wrong answers. */
-function shardInfo(file: string): { isShard: boolean; isFirst: boolean } {
-  const m = SHARD.exec(file);
-  if (!m) return { isShard: false, isFirst: true };
-  return { isShard: true, isFirst: m[1] === "00001" };
 }
 
 async function* walk(
@@ -224,6 +221,64 @@ export async function readMeta(
   };
 }
 
+/**
+ * The WHOLE model behind `path` — every part of it, when it is split.
+ *
+ * `readMeta` reads one file, and one file is what part 1 of a split set is: it
+ * parses cleanly and describes a quarter of the model. Everything downstream
+ * inherits that silently, because there is nothing malformed about the answer —
+ * the planner sized DeepSeek-V4-Flash at 37 GB of its 145 GB, "VRAM only" looked
+ * possible on 48 GB of cards, and llama-server was killed loading the rest.
+ *
+ * So a declared split is read to the end and merged, and a merge that did not
+ * see the whole model is an ERROR, not a smaller model. The parts are missing or
+ * truncated, llama.cpp could not load the set either, and a plan built on what
+ * was readable is a plan for a model that does not exist.
+ *
+ * `sizeB` is the summed size of the parts on disk, used as the second,
+ * header-independent check that everything was accounted for.
+ */
+export async function readModel(
+  path: string,
+  sizeB = 0,
+): Promise<{ meta: ModelMeta | null; error: string | null }> {
+  const one = await readMeta(path);
+  if (!one.meta || !isSplit(one.meta)) return one;
+
+  const parts = shardPaths(path, one.meta.splitCount);
+  if (parts.length === 0) {
+    return {
+      meta: null,
+      error:
+        `this file is part ${
+          one.meta.splitNo + 1
+        } of ${one.meta.splitCount}, ` +
+        `and its name does not say where the other parts are — expected ` +
+        `\`…-00001-of-${String(one.meta.splitCount).padStart(5, "0")}.gguf\``,
+    };
+  }
+
+  const metas: ModelMeta[] = [one.meta];
+  const failures: string[] = [];
+  for (const p of parts.slice(1)) {
+    const r = await readMeta(p);
+    if (r.meta) metas.push(r.meta);
+    else failures.push(`${basename(p)}: ${r.error}`);
+  }
+
+  const merged = mergeShards(metas);
+  const gap = shardGap(merged, sizeB, metas.length, parts.length);
+  if (gap) {
+    return {
+      meta: null,
+      error: `split model incomplete — ${gap}${
+        failures.length > 0 ? ` (${failures.join("; ")})` : ""
+      }. llama.cpp cannot load it either.`,
+    };
+  }
+  return { meta: merged, error: null };
+}
+
 export type ScanProgress = (
   done: number,
   total: number,
@@ -285,12 +340,15 @@ export async function scan(
     }
   }
 
-  // Collapse shard sets onto their first part, summing the size.
+  // Collapse shard sets onto their first part, summing the size. A multi-part
+  // GGUF is loaded by pointing `-m` at part 1, so listing all four parts would
+  // be four wrong answers — and part 1 on its own is a quarter of a model, not
+  // a small model, which is what `readModel` is for.
   const shardTotals = new Map<string, number>();
   for (const f of found) {
     const info = shardInfo(basename(f.path));
     if (!info.isShard) continue;
-    const key = f.path.replace(SHARD, "");
+    const key = shardKey(f.path);
     shardTotals.set(key, (shardTotals.get(key) ?? 0) + f.size);
   }
   const primary = found
@@ -305,17 +363,20 @@ export async function scan(
     // A manifest we could not parse has no blob to read a header from, so do
     // not try — report the manifest problem itself.
     const broken = brokenManifests.get(f.path);
+    const key = shardKey(f.path);
+    const sizeB = shardTotals.get(key) ?? f.size;
+    // The whole set, not part 1 of it — and `sizeB` so the merge can check
+    // itself against what is actually on disk.
     const { meta, error } = broken
       ? { meta: null, error: broken }
-      : await readMeta(f.path);
-    const key = f.path.replace(SHARD, "");
+      : await readModel(f.path, sizeB);
     const ollamaName = named.get(f.path);
     models.push({
       path: f.path,
       file: ollamaName ?? basename(f.path),
       source: ollamaName ? "ollama" : sourceOf(f.path),
       dir: dirname(f.path),
-      sizeB: shardTotals.get(key) ?? f.size,
+      sizeB,
       mtime: f.mtime,
       meta,
       metaError: error,

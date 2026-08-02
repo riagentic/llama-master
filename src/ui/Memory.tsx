@@ -130,6 +130,9 @@ function bands(pool: Pool, kind: "vram" | "ram"): Band[] {
 function Region(props: {
   pool: Pool;
   kind: "vram" | "ram";
+  /** Region caption; defaults to the kind. Per-card regions name the card. */
+  title?: string;
+  tip?: string;
   onHover: (detail: string) => void;
 }) {
   const p = props.pool;
@@ -140,8 +143,8 @@ function Region(props: {
       style={{ flexGrow: String(Math.max(1, p.capacityB)) }}
       onMouseLeave={() => props.onHover("")}
     >
-      <div class="map-region-head">
-        <b>{props.kind.toUpperCase()}</b>
+      <div class="map-region-head" title={props.tip}>
+        <b>{props.title ?? props.kind.toUpperCase()}</b>
         <span>{bytes(p.capacityB)}</span>
       </div>
       <div class="map-region-body">
@@ -187,19 +190,40 @@ function Region(props: {
   );
 }
 
+/** A card of the device plan, shaped as the Pool the map's Region draws —
+ *  one implementation of the band-drawing, whatever it is drawing. */
+function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
+  const usedB = c.weightsB + c.kvB + c.computeB;
+  return {
+    label: `GPU ${i}`,
+    capacityB: c.capacityB,
+    usedB,
+    otherB: c.otherB,
+    freeB: Math.max(0, c.capacityB - usedB - c.otherB),
+    overB: c.overB,
+    buckets: [
+      { key: "weights", label: "Weights", bytes: c.weightsB },
+      { key: "kv", label: "KV cache", bytes: c.kvB },
+      { key: "compute", label: "Compute (est.)", bytes: c.computeB },
+    ],
+  };
+}
+
 /**
  * Every byte of memory on the machine, to scale, with this configuration laid
  * over it.
  *
- * The two pools are drawn side by side and proportional to their real
- * capacities, so a 24 GB card next to 192 GB of RAM looks like a 24 GB card
- * next to 192 GB of RAM. That is the picture that makes "why is it slow" and
- * "why does it not fit" obvious without reading a single number.
+ * The pools are drawn side by side and proportional to their real capacities —
+ * and a machine with two cards shows TWO regions, not one pooled "VRAM": a
+ * second GPU is not a bigger GPU, llama.cpp places layers per card, and the
+ * question a two-card machine actually asks is "which card is full, with
+ * what". One pooled bar could read "fits" while a card overflowed.
  */
 export function MemoryMap(props: { plan: Plan }) {
   const [hovered, setHovered] = useLocal("");
   const p = props.plan;
   const total = p.vram.capacityB + p.ram.capacityB;
+  const perCard = p.devices.cards.length > 1;
   return (
     <div class="memmap" t="memory-map">
       <div class="map-head">
@@ -207,9 +231,29 @@ export function MemoryMap(props: { plan: Plan }) {
         <span class="dim">{bytes(total)} total on this machine</span>
       </div>
       <div class="map-track">
-        <Region pool={p.vram} kind="vram" onHover={setHovered} />
+        {perCard
+          ? p.devices.cards.map((c, i) => (
+            <Region
+              key={c.name + String(i)}
+              pool={cardAsPool(c, i)}
+              kind="vram"
+              title={`GPU ${i}`}
+              tip={c.name}
+              onHover={setHovered}
+            />
+          ))
+          : <Region pool={p.vram} kind="vram" onHover={setHovered} />}
         <Region pool={p.ram} kind="ram" onHover={setHovered} />
       </div>
+      {p.devices.unplacedB > 0
+        ? (
+          <div class="map-unplaced" t="map-unplaced">
+            {bytes(p.devices.unplacedB)}{" "}
+            of layers have nowhere to go — no card has room for them, however
+            the cut is made.
+          </div>
+        )
+        : null}
       <div class="map-legend">
         <span class="legend-item">
           <i class="legend-dot region-swatch-vram" />VRAM

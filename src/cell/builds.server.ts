@@ -394,6 +394,8 @@ export async function buildFromSource(
     backend: Backend;
     jobs: number;
     native: boolean;
+    /** Raise `GGML_SCHED_MAX_SPLIT_INPUTS` to this value; 0/absent = stock. */
+    schedCap?: number;
     signal?: AbortSignal;
   },
   onProgress: OnProgress,
@@ -414,6 +416,11 @@ export async function buildFromSource(
   // not link the imported target — it expects the headers on the default
   // include path — so the include directory has to be added too, or the compile
   // fails later with "'spv' has not been declared".
+  // Everything that lands in CMAKE_CXX_FLAGS collects here and is emitted as
+  // ONE -D: two `-DCMAKE_CXX_FLAGS=` arguments would be last-writer-wins, and
+  // the Vulkan include path silently losing to the sched-cap define (or the
+  // reverse) is exactly the kind of quiet breakage this app exists to refuse.
+  const cxxFlags: string[] = [];
   let vulkanFlags: string[] = [];
   if (opts.backend === "vulkan") {
     const { resolveSpirvHeaders } = await import("./prereq.server.ts");
@@ -424,12 +431,21 @@ export async function buildFromSource(
       );
     }
     if (spirv.managed) {
-      vulkanFlags = [
-        `-DCMAKE_PREFIX_PATH=${spirv.path}`,
-        `-DCMAKE_CXX_FLAGS=-isystem ${join(spirv.path, "include")}`,
-      ];
+      vulkanFlags = [`-DCMAKE_PREFIX_PATH=${spirv.path}`];
+      cxxFlags.push(`-isystem ${join(spirv.path, "include")}`);
       p(0, null, [`Using the app's SPIRV-Headers at ${spirv.path}`]);
     }
+  }
+
+  // Raise llama.cpp's graph-split input cap (`#ifndef`-guarded, stock 30).
+  // With routed experts in RAM the scheduler needs more cross-device inputs
+  // per split as the context grows; measured on DeepSeek-V4: 256k generates,
+  // 512k dies at the assert. The define is the supported way past it.
+  if (opts.schedCap && opts.schedCap > 0) {
+    cxxFlags.push(`-DGGML_SCHED_MAX_SPLIT_INPUTS=${opts.schedCap}`);
+    p(0, null, [
+      `Raising GGML_SCHED_MAX_SPLIT_INPUTS to ${opts.schedCap} (stock: 30) — extreme contexts with experts in RAM need more cross-device inputs per graph split than llama.cpp's default allows.`,
+    ]);
   }
 
   // CUDA: name the architectures explicitly. Left to auto-detection, cmake asks
@@ -485,6 +501,11 @@ export async function buildFromSource(
     ...buildNumberFlags(opts.ref),
     ...cudaFlags,
     ...vulkanFlags,
+    // ALWAYS passed, even empty: the build directory is reused, and CMake
+    // caches CMAKE_CXX_FLAGS — turning the sched-cap option OFF must reset
+    // the cached define, or the rebuild silently keeps it while claiming
+    // stock.
+    `-DCMAKE_CXX_FLAGS=${cxxFlags.join(" ")}`,
   ];
   p(1, null, [`${cmake.path} ${configureArgs.join(" ")}`]);
   const cfgCode = await runStreaming(
@@ -554,6 +575,8 @@ export async function buildFromSource(
     dir: dest,
     // A tag identifies itself; "master" does not, so record what it was.
     sourceSha: opts.ref === "master" ? await masterSha().catch(() => "") : "",
+    // A build that behaves differently must say why.
+    ...(opts.schedCap && opts.schedCap > 0 ? { schedCap: opts.schedCap } : {}),
   });
   p(3, 1, [`${BIN_SERVER} ready at ${build.serverBin}`]);
   return build;

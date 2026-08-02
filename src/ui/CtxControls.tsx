@@ -20,24 +20,41 @@ import {
   ctxLabel,
   MIN_CTX,
 } from "../lib/tune.ts";
-import { LOCK_REASON } from "./actions.ts";
+import { LOCK_REASON, maxFor, pinMaxFor } from "./actions.ts";
 import { ctxOverride } from "./derive.ts";
 
 /**
  * The usable range, drawn.
  *
- * The bands are the point: a bar from zero to the trained length, cut where
- * quality is expected to change, with a needle at what is actually configured.
- * Seeing the needle sitting in the degraded third is the fastest way to
- * understand a setting that a number alone does not explain.
+ * The bands are the point: a bar cut where quality is expected to change, with
+ * a needle at what is actually configured. Seeing the needle sitting in the
+ * degraded third is the fastest way to understand a setting that a number
+ * alone does not explain.
  *
- * Widths are percentages of `max`, so this is to scale — a model whose Opt is a
- * quarter of its trained length looks like a quarter.
+ * The axis is LOG₂, because that is the scale context lives on: the presets
+ * double, the KV cache doubles with each step, and models describe themselves
+ * in powers of two. Drawn linearly, a YaRN-stretched model (Big 65,536, Max
+ * 1,048,576) was 94% "degraded" bar — technically to scale, and read by a real
+ * user as "almost the whole range is bad", which is not what the bands claim.
+ * On a log axis every doubling gets the same width, so Opt→Big and Big→2×Big
+ * read as the equal steps they are.
  */
 function CtxRange(props: { meta: ModelMeta; ctxNow: number }) {
   const b = ctxBands(props.meta);
+  // 1,024 opens the axis: everything below Min is one compact "too short"
+  // segment instead of an invisible sliver.
+  const AXIS_MIN = 1024;
+  const lg = (n: number) => Math.log2(Math.max(AXIS_MIN, n));
+  const span = Math.max(lg(b.max) - lg(AXIS_MIN), 1);
   const pct = (n: number) =>
-    `${Math.max(0, Math.min(100, (n / b.max) * 100))}%`;
+    `${Math.max(0, Math.min(100, ((lg(n) - lg(AXIS_MIN)) / span) * 100))}%`;
+  const width = (from: number, to: number) =>
+    `${
+      Math.max(
+        0,
+        Math.min(100, ((lg(to) - lg(Math.max(from, AXIS_MIN))) / span) * 100),
+      )
+    }%`;
   const segments = [
     {
       key: "short",
@@ -69,7 +86,7 @@ function CtxRange(props: { meta: ModelMeta; ctxNow: number }) {
       from: b.big,
       to: b.max,
       what:
-        `${b.big.toLocaleString()}–${b.max.toLocaleString()} — the far end of what it was trained for`,
+        `${b.big.toLocaleString()}–${b.max.toLocaleString()} — the far end of its advertised range`,
     },
   ].filter((s) => s.to > s.from);
 
@@ -80,7 +97,7 @@ function CtxRange(props: { meta: ModelMeta; ctxNow: number }) {
           <div
             key={s.key}
             class={`ctx-band tone-${s.tone}`}
-            style={{ width: pct(s.to - s.from) }}
+            style={{ width: width(s.from, s.to) }}
             title={s.what}
           />
         ))}
@@ -106,9 +123,8 @@ function CtxRange(props: { meta: ModelMeta; ctxNow: number }) {
         ))}
       </div>
       <p class="param-tip">
-        Only <b>Max</b>{" "}
-        is read from the model — the length it was trained for. Min, Opt and Big
-        are marked <b>≈</b>{" "}
+        Log scale — every doubling is the same width. Only <b>Max</b>{" "}
+        is read from the model. Min, Opt and Big are marked <b>≈</b>{" "}
         because a GGUF header carries no quality signal; they are estimated from
         published long-context measurements, not measured for this model.
       </p>
@@ -197,6 +213,46 @@ export function CtxControls(
         >
           Auto
         </button>
+        {
+          /* The priority most sessions actually have, as one click each:
+            THIS placement, at the biggest context it can hold. The decision
+            walk is "VRAM only? no — hybrid? no — CPU", and these two buttons
+            are its first two questions, answered with the number attached. */
+        }
+        {(["vram", "hybrid"] as const).map((pl) => {
+          const t = props.meta ? maxFor(pl) : null;
+          const ok = t !== null && t.possible && t.ctx > 0;
+          const label = pl === "vram" ? "Max·VRAM" : "Max·Hybrid";
+          return (
+            <button
+              key={pl}
+              type="button"
+              class={`btn tiny${
+                ok && pinned && props.ctxNow === t.ctx &&
+                  cfg.placement === pl
+                  ? " on"
+                  : ""
+              }`}
+              t={`${id}-max-${pl}`}
+              disabled={props.locked || !ok}
+              title={props.locked
+                ? LOCK_REASON
+                : !props.meta
+                ? "Select a model with a readable header first"
+                : ok
+                ? `${
+                  pl === "vram" ? "VRAM only" : "Hybrid"
+                } at the largest context it can hold here: ${t.ctx.toLocaleString()} tokens. Sets the placement and pins the context in one click.`
+                : `${pl === "vram" ? "VRAM only" : "Hybrid"}: ${
+                  t?.blocker || "not possible for this model here"
+                }`}
+              onClick={() => pinMaxFor(pl)}
+            >
+              {label}
+              {ok ? <span class="dim">{` ${ctxLabel(t.ctx)}`}</span> : null}
+            </button>
+          );
+        })}
       </div>
 
       <div class="ctx-presets" t={`${id}-presets`}>
@@ -222,6 +278,27 @@ export function CtxControls(
         })}
       </div>
 
+      {
+        /* Some limits are llama.cpp's own and no plan arithmetic can see them:
+          DeepSeek-V4 on two cards generates at a pinned 262,144 and dies at
+          524,288 on a scheduler assert, with memory to spare. What the app
+          DOES know is what has been measured to work — so a pin beyond it is
+          flagged before Start, not discovered minutes into a load. */
+      }
+      {(() => {
+        const proven = cfg.fitCtx[models.selected] ?? 0;
+        return pinned && proven > 0 && props.ctxNow > proven
+          ? (
+            <p class="warn-note ctx-beyond" t="ctx-beyond-measured">
+              Beyond the largest size measured to work here ({proven
+                .toLocaleString()}{" "}
+              tokens). The plan can price the memory, but llama.cpp also has
+              internal limits it only reveals by refusing — expect the start
+              itself to have the final say.
+            </p>
+          )
+          : null;
+      })()}
       {props.meta ? <CtxRange meta={props.meta} ctxNow={props.ctxNow} /> : null}
     </div>
   );

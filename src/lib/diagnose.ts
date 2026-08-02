@@ -17,7 +17,7 @@ export type FixAction =
   | { kind: "switch-origin"; to: "source" | "release" }
   | { kind: "switch-backend"; to: Backend }
   | { kind: "fix-prereq"; id: string }
-  | { kind: "open-tab"; tab: "dashboard" | "build" }
+  | { kind: "open-tab"; tab: "dashboard" | "build" | "settings" }
   | { kind: "open-url"; url: string };
 
 export type Step = {

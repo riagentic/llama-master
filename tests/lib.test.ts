@@ -39,6 +39,22 @@ import {
   withoutOurUsage,
 } from "../src/lib/plan.ts";
 import {
+  loadPerDevice,
+  offloadRange,
+  packSlots,
+  slotOnGpu,
+  tensorSplitValue,
+} from "../src/lib/devsplit.ts";
+import {
+  ctxOf,
+  fitDecision,
+  isFitFailure,
+  MAX_FIT_RETRIES,
+  openingCtx,
+  withCtx,
+} from "../src/lib/fitladder.ts";
+import type { Hw, ModelMeta } from "../src/lib/types.ts";
+import {
   drift,
   HEADROOM_FRACTION,
   headroomBucket,
@@ -62,7 +78,12 @@ import { buildNumberFlags } from "../src/cell/builds.server.ts";
 import { bytes, duration, pct, shortPath, tps } from "../src/lib/format.ts";
 import { coresUtilPct, pushHistory, utilPct } from "../src/lib/procstat.ts";
 import { appendLog, isError, progressOf } from "../src/lib/buildlog.ts";
-import { deltaText, parseSse, timingsTps } from "../src/lib/sse.ts";
+import {
+  deltaReasoning,
+  deltaText,
+  parseSse,
+  timingsTps,
+} from "../src/lib/sse.ts";
 import {
   availableBackends,
   isBinaryAsset,
@@ -91,6 +112,8 @@ import {
   canCompile,
   compilableBackends,
   preferredBackends,
+  SCHED_SPLIT_CAP,
+  schedCapFlags,
   targetReadiness,
   usableGpus,
 } from "../src/lib/backend.ts";
@@ -140,6 +163,11 @@ import {
   speedIsMeasured,
   tpsBand,
 } from "../src/lib/speed.ts";
+import {
+  elapsedLabel,
+  loadPhase,
+  loadProgress,
+} from "../src/lib/loadprogress.ts";
 import { gpu, hw, layers, meta, moeMeta, NO_GPU } from "./fixtures.ts";
 
 const GB = 1024 ** 3;
@@ -339,29 +367,44 @@ Deno.test("plan: with no offload every byte of weight is in RAM", () => {
   assertEquals(p.vram.usedB, 0, "an unused GPU claims nothing");
 });
 
-Deno.test("plan: full offload puts weights, head and embeddings in VRAM", () => {
+/** The embedding table is the exception, and it is llama.cpp's, not ours: it is
+ *  an INPUT tensor, and those are pinned to the host at any `-ngl` ("there is
+ *  very little benefit to offloading the input layer" — `llama-model.cpp`,
+ *  `dev_input`). Billing it to VRAM spent ~1 GB of a card's budget on bytes that
+ *  were never going to be there. */
+Deno.test("plan: full offload puts every layer and the head in VRAM, but never the embeddings", () => {
   const m = meta();
   const p = plan(m, hw({ gpus: [gpu(48)] }), { ...defaults(), ngl: 999 });
   assertEquals(p.layersOnGpu, m.nLayer);
   const w = p.vram.buckets.find((b) => b.key === "weights")?.bytes ?? 0;
-  assertEquals(w, m.tensorBytes);
+  assertEquals(w, m.tensorBytes - m.embdBytes);
   assertEquals(
     p.ram.buckets.find((b) => b.key === "weights")?.bytes,
-    undefined,
+    m.embdBytes,
+    "the embedding table stays on the host",
   );
 });
 
-Deno.test("plan: partial offload splits weights and KV proportionally", () => {
+/** `-ngl N` offloads the last N SLOTS, and the output head is one of them —
+ *  there are `nLayer + 1`. So `-ngl 16` on a 32-layer model does not put 16
+ *  layers on the card; it puts 15 layers and the head. This is llama.cpp's own
+ *  `i_gpu_start` / `act_gpu_layers` arithmetic (`src/lib/devsplit.ts`). */
+Deno.test("plan: partial offload splits weights and KV by llama.cpp's slot count", () => {
   const m = meta();
   const p = plan(m, hw(), { ...defaults(), ngl: 16 });
   const vw = p.vram.buckets.find((b) => b.key === "weights")?.bytes ?? 0;
   const rw = p.ram.buckets.find((b) => b.key === "weights")?.bytes ?? 0;
   assertEquals(vw + rw, m.tensorBytes, "no byte is lost or double-counted");
+  assertEquals(
+    p.layersOnGpu,
+    15,
+    "15 layers and the output head, not 16 layers",
+  );
   const vkv = p.vram.buckets.find((b) => b.key === "kv")?.bytes ?? 0;
   assertEquals(
     Math.round(vkv),
-    Math.round(p.kvTotalB / 2),
-    "half the layers → half the KV",
+    Math.round(p.kvTotalB * 15 / m.nLayer),
+    "the KV follows the layers that are actually offloaded",
   );
 });
 
@@ -377,7 +420,8 @@ Deno.test("plan: --n-cpu-moe keeps attention on the GPU and experts in RAM", () 
   assertEquals(split.moeOnCpu, 32);
   assertEquals(
     split.vram.buckets.find((b) => b.key === "weights")?.bytes,
-    attentionOnly + m.embdBytes + m.outputBytes,
+    attentionOnly + m.outputBytes,
+    "the head comes too; the embedding table never does",
   );
   assert(
     split.vram.usedB < full.vram.usedB / 3,
@@ -690,6 +734,25 @@ Deno.test("sse: a token split across chunk boundaries is not lost", () => {
   assertEquals(b.events.length, 2);
   assertEquals(deltaText(b.events[0]!.data), "Hello");
   assertEquals(b.events[1]!.data, "[DONE]");
+});
+
+Deno.test("sse: a thinking model's reasoning channel is read, and kept apart", () => {
+  // Verbatim shape from llama.cpp serving DeepSeek-V4: the whole first act of
+  // a reply streams as `reasoning_content` with `content` absent. A client
+  // that reads only `content` renders nothing for minutes — a real user
+  // watched "thinking" produce no answer and reasonably called chat broken.
+  const thinkChunk = JSON.stringify({
+    choices: [{ delta: { reasoning_content: "Analyze the request. " } }],
+  });
+  assertEquals(deltaReasoning(thinkChunk), "Analyze the request. ");
+  assertEquals(deltaText(thinkChunk), "", "reasoning is not the answer");
+
+  const answerChunk = JSON.stringify({
+    choices: [{ delta: { content: "Hello!" } }],
+  });
+  assertEquals(deltaText(answerChunk), "Hello!");
+  assertEquals(deltaReasoning(answerChunk), "");
+  assertEquals(deltaReasoning("not json"), "");
 });
 
 Deno.test("sse: CRLF framing and keep-alive frames are handled", () => {
@@ -1402,10 +1465,92 @@ Deno.test("tune: a context from another model never leaks into this one", () => 
   assertEquals(overPinned.settings.ctxSize, 4096, "still capped at trained");
 });
 
+Deno.test("tune: a pin that does not fit fails LOUD, with the shortfall named", () => {
+  // The report, verbatim: "even if I set context size to 1M, the projection
+  // looks the same — so what memory is missing? And when I run the server it
+  // sets back to 17k." The pin was a search ceiling, so the tuner silently
+  // settled lower and no surface ever showed what 1M would cost. A pin is an
+  // instruction: hold it, and when it cannot run, say exactly how far short
+  // the machine falls — in a plan that shows the overflow.
+  const big = meta({ nCtxTrain: 1_048_576, nCtxOrig: 65_536 });
+  const machine = hw({ gpus: [gpu(24, 0)] });
+
+  const t = tune(big, machine, defaults(), "vram", 1_048_576);
+  assertEquals(t.possible, false, "1M does not fit a 24 GB card");
+  assertEquals(
+    t.settings.ctxSize,
+    1_048_576,
+    "the returned settings CARRY the pin, so the projection shows the overflow instead of a fitting plan at some other size",
+  );
+  assertStringIncludes(t.blocker, "pinned 1,048,576");
+  assertStringIncludes(t.blocker, "more", "the missing bytes are named");
+  assertStringIncludes(t.blocker, "Auto", "and the way out is offered");
+
+  // A pin that fits is exact, not merely an upper bound.
+  const fits = tune(big, machine, defaults(), "vram", 8192);
+  assertEquals(fits.possible, true);
+  assertEquals(fits.settings.ctxSize, 8192);
+  assert(
+    fits.reasons.some((r) => r.includes("pinned")),
+    `the reason says it was pinned: ${JSON.stringify(fits.reasons)}`,
+  );
+});
+
+Deno.test("tune: the measured fit is a search ceiling, never a pin", () => {
+  // `cfg.fitCtx` records the largest context that actually generated. The
+  // automatic path must not aim past it (that is the retry ladder's slow way
+  // down), but it must also keep ADAPTING below it — a game taking VRAM means
+  // less fits today than fitted yesterday, and holding the old number exact
+  // would flip the placement to impossible instead of settling lower.
+  const m = meta({ nCtxTrain: 262_144 });
+  const roomy = hw({ gpus: [gpu(48, 0)] });
+  const capped = tune(m, roomy, defaults(), "vram", undefined, 16_384);
+  assertEquals(capped.possible, true);
+  assert(
+    Number(capped.settings.ctxSize) <= 16_384,
+    `never past the measured ceiling: ${capped.settings.ctxSize}`,
+  );
+  assert(
+    capped.reasons.some((r) => r.includes("actually started")),
+    "the cap is explained",
+  );
+
+  // Tight machine: the same ceiling, but less fits now — settle lower, do not
+  // refuse.
+  const tight = tune(
+    m,
+    hw({ gpus: [gpu(8, 0)] }),
+    defaults(),
+    "vram",
+    undefined,
+    262_144,
+  );
+  assertEquals(tight.possible, true);
+  assert(
+    Number(tight.settings.ctxSize) < 262_144,
+    "adapts below the ceiling instead of failing at it",
+  );
+});
+
 // ── build readiness ────────────────────────────────────────────────────────
 
 const FULL = new Set(["cmake", "compiler", "cuda", "vulkan", "spirv", "hip"]);
 const BARE = new Set(["cmake", "compiler"]);
+
+Deno.test("backend: the sched-cap bypass is one define, off by default", () => {
+  // `GGML_SCHED_MAX_SPLIT_INPUTS` is #ifndef-guarded upstream — the define is
+  // the supported way past the stock 30 that aborts extreme contexts with
+  // experts in RAM (measured: 256k generates, 512k asserts). The raised value
+  // covers the model's full 1M with margin.
+  assertEquals(schedCapFlags(false), []);
+  assertEquals(schedCapFlags(true), [
+    `-DGGML_SCHED_MAX_SPLIT_INPUTS=${SCHED_SPLIT_CAP}`,
+  ]);
+  assert(
+    SCHED_SPLIT_CAP >= 30 * 4,
+    "the raise must cover 1M where ~30 carried ~256k",
+  );
+});
 
 Deno.test("backend: a CPU source build needs only cmake and a compiler", () => {
   assertEquals(canCompile("cpu", BARE, "linux").ok, true);
@@ -1954,6 +2099,72 @@ Deno.test("serverlog: 'exited with code 1' becomes the actual reason", () => {
   );
 });
 
+Deno.test("serverlog: a per-card allocation failure names the card and the size", () => {
+  // Verbatim from the run that exposed the split bug. "The GPU ran out of
+  // memory" is true and useless here: 42 GB of VRAM was free across two cards
+  // and 34 GB of it was asked of one. The number and the device index are the
+  // whole diagnosis.
+  const d = diagnoseServerExit(1, [
+    "0.00.293.391 I srv    load_model: loading model '/models/big-00001-of-00004.gguf'",
+    "1.51.022.152 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 34020.32 MiB on device 1: cudaMalloc failed: out of memory",
+    "1.51.022.161 E alloc_tensor_range: failed to allocate CUDA1 buffer of size 35672889856",
+    "1.51.856.158 E llama_model_load: error loading model: unable to allocate CUDA1 buffer",
+  ]);
+  assertStringIncludes(d.reason, "Card 1");
+  assertStringIncludes(d.reason, "33.2 GB");
+  assertStringIncludes(d.reason, "divided badly");
+  assertStringIncludes(
+    d.steps.map((s2) => s2.text).join(" "),
+    "Tensor split",
+  );
+});
+
+Deno.test("serverlog: a generation-time OOM is memory advice, not a driver mismatch", () => {
+  // Captured live: the CUDA pool OOM at the first real batch matched the
+  // generic /CUDA error/ signature and told the user "the build and the
+  // installed driver do not match — use the Vulkan build". They believed it and
+  // switched backends, when a smaller context was the actual fix.
+  const d = diagnoseServerExit(134, [
+    "/src/ggml-cuda/ggml-cuda.cu:106: CUDA error",
+    "2.17.177.475 E CUDA error: out of memory",
+    "2.17.177.483 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl at /src/ggml-cuda/common.cuh:1622",
+    "2.17.177.484 E   cudaFuncGetAttributes(&attr, kernel)",
+  ]);
+  assertStringIncludes(d.reason, "during generation");
+  assert(!d.reason.includes("driver"), "an OOM is not a driver mismatch");
+
+  // A genuine device rejection still gets the driver answer.
+  const drv = diagnoseServerExit(1, [
+    "0.00.100.000 E CUDA error: forward compatibility was attempted on non supported HW",
+  ]);
+  assertStringIncludes(drv.reason, "driver");
+});
+
+Deno.test("serverlog: a scheduler-limit assert is named, not blamed on memory", () => {
+  // Verbatim from a 524,288-token pin of DeepSeek-V4 on 2×24 GB: the assert
+  // line carries no timestamp and no severity column, so extractErrors missed
+  // it and the diagnosis fell through to "died on SIGABRT — crash inside
+  // llama.cpp". The user's next question was "so not enough RAM?" — wrong
+  // trail, and the answer was sitting in the captured log.
+  const lines = [
+    "0.00.440.832 I srv    load_model: loading model '/m/big.gguf'",
+    "/home/dev/src/ggml/src/ggml-backend.cpp:1367: GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS) failed",
+    "[llama.master] llama-server exited with code 134",
+  ];
+  const errs = extractErrors(lines);
+  assert(
+    errs.some((e) => e.includes("GGML_SCHED_MAX_SPLIT_INPUTS")),
+    `the bare assert line is extracted: ${JSON.stringify(errs)}`,
+  );
+  const d = diagnoseServerExit(134, lines);
+  assertStringIncludes(d.reason, "not a memory shortage");
+  assertStringIncludes(d.reason, "hard limit");
+  assert(
+    d.steps.some((s2) => s2.text.includes("Lower the pinned context")),
+    "the lever is named",
+  );
+});
+
 Deno.test("serverlog: signals are named, and a clean stop is not a crash", () => {
   assertEquals(signalOf(143), "SIGTERM (asked to stop)");
   assertEquals(signalOf(139), "SIGSEGV (segmentation fault)");
@@ -2256,8 +2467,13 @@ Deno.test("tune: a MoE model that cannot fit still keeps attention on the GPU", 
   );
 
   // Even on a card too small for a full offload, experts leave before layers do.
+  // 2 GB rather than 1: at `-ngl >= 1` llama.cpp offloads the output head as
+  // well (it is the last of the `nLayer + 1` slots), so this fixture's 300 MB
+  // head plus the compute buffers plus the reserve is most of a 1 GB card
+  // before a single layer is placed. That is a real constraint, not a fixture
+  // detail — the old plan simply did not charge the head at partial offload.
   const tiny =
-    tune(m, hw({ gpus: [gpu(1, 0)] }), defaults(), "hybrid").settings;
+    tune(m, hw({ gpus: [gpu(2, 0)] }), defaults(), "hybrid").settings;
   assert(Number(tiny.nCpuMoe) > 0, "experts still move first");
   assert(Number(tiny.ngl) > 0, "and something still runs on the GPU");
 });
@@ -2642,21 +2858,28 @@ Deno.test("ollama: a broken manifest is distinguished from a cloud-only one", ()
 });
 
 Deno.test("context: the preset ladder is the one people recognise", () => {
-  // Powers of two, because that is how models and benchmarks describe context —
-  // and because the KV cache doubles with each rung, so the ladder is also the
-  // cost ladder.
+  // Powers of two up to 128k — how models and benchmarks describe context —
+  // then 128k steps to the top: 256k straight to 512k skipped exactly the
+  // sizes a long-context machine wants to try.
   assertEquals(CTX_PRESETS.map(ctxLabel), [
     "16k",
     "32k",
     "64k",
     "128k",
     "256k",
+    "384k",
     "512k",
+    "640k",
+    "768k",
+    "896k",
     "1M",
   ]);
-  // Ascending, and every rung a real power of two.
+  // Ascending: doubling below 128k, 128k steps above it.
+  const STEP = 131_072;
   for (let i = 1; i < CTX_PRESETS.length; i++) {
-    assertEquals(CTX_PRESETS[i], CTX_PRESETS[i - 1]! * 2);
+    const prev = CTX_PRESETS[i - 1]!;
+    const cur = CTX_PRESETS[i]!;
+    assertEquals(cur, prev < STEP ? prev * 2 : prev + STEP);
   }
   assert(CTX_PRESETS[0]! > MIN_CTX, "every preset is a usable context");
   // The label is what a user reads, not a byte count.
@@ -2867,12 +3090,24 @@ Deno.test("tune: a quantised cache is also taken to keep work off the host", () 
 
   assertEquals(chosen.settings.cacheTypeK, "q8_0");
   assertEquals(chosen.settings.cacheTypeV, "q8_0");
-  // It was not the context that motivated it: the full trained length is reached
-  // either way, so the only thing q8_0 can be buying here is residency.
-  assertEquals(chosen.ctx, optimalCtx(m), "full trained context is reached");
+  // What it buys moved when the objective did. The tuner now fixes residency
+  // FIRST and grows the context only as far as that allows, so halving the
+  // cache no longer rescues bytes from the host — it buys the context those
+  // bytes were blocking. Either way it has to buy something, and say which.
   assert(
-    chosen.reasons.some((r) => r.includes("back onto the GPU")),
-    `and the reason says residency, not context: ${chosen.reasons.join(" | ")}`,
+    chosen.reasons.some((r) =>
+      r.includes("back onto the GPU") || r.includes("lifts the context")
+    ),
+    `q8_0 must state what it bought: ${chosen.reasons.join(" | ")}`,
+  );
+  const asF16Ctx = tune(m, machine, {
+    ...defaults(),
+    cacheTypeK: "f16",
+    cacheTypeV: "f16",
+  }, "hybrid");
+  assert(
+    chosen.ctx >= asF16Ctx.ctx,
+    `q8_0 must not cost context: ${chosen.ctx} vs ${asF16Ctx.ctx}`,
   );
   // The counterfactual: this exact placement with a full-precision cache does
   // NOT fit the cards, which is what q8_0 is paying for.
@@ -2881,9 +3116,13 @@ Deno.test("tune: a quantised cache is also taken to keep work off the host", () 
     cacheTypeK: "f16",
     cacheTypeV: "f16",
   });
+  // `fits`, not `vram.overB`: on two cards a placement can be inside the total
+  // and still have no division of the layers that any single card can hold.
   assert(
-    asF16.vram.overB > 0,
-    `f16 at the same placement must overflow VRAM, got ${asF16.vram.overB}`,
+    !asF16.fits,
+    `f16 at the same placement must not fit the cards: over by ${asF16.vram.overB}, per-card ${
+      JSON.stringify(asF16.devices.bytesB)
+    } of ${JSON.stringify(asF16.devices.budgetsB)}`,
   );
 });
 
@@ -2918,6 +3157,20 @@ Deno.test("tune: the context bands are ordered, clamped, and honest about Max", 
   // And the shape on a normal long-context model is the documented one.
   const long = ctxBands(meta({ nCtxTrain: 131072 }));
   assertEquals(long, { min: 4096, opt: 32768, big: 65536, max: 131072 });
+
+  // A YaRN-stretched model: Max is the ADVERTISED length — the Models page
+  // reads nCtxTrain directly, and the same file must not have two maxima
+  // (DeepSeek-V4 showed 1,048,576 there and 65,536 on the all-in-one page).
+  // The native pre-stretch length is the one quality fact in the header, so
+  // it anchors Big, with Opt at half of it; the tuner's own aim stays native.
+  const ds = meta({ nCtxTrain: 1_048_576, nCtxOrig: 65_536 });
+  assertEquals(ctxBands(ds), {
+    min: 4096,
+    opt: 32_768,
+    big: 65_536,
+    max: 1_048_576,
+  });
+  assertEquals(optimalCtx(ds), 65_536, "the auto-tuner still aims native");
 
   // Exactly one band is presented as measured.
   assertEquals(
@@ -3357,4 +3610,545 @@ Deno.test("speed: the bands are anchored on reading speed", () => {
   assertEquals(tpsBand(19.9), "ok");
   assertEquals(tpsBand(20), "great");
   assertEquals(tpsBand(Number.NaN), "poor");
+});
+
+// ── which card holds which layer (src/lib/devsplit.ts) ─────────────────────
+
+Deno.test("devsplit: -ngl counts the output head as a slot", () => {
+  // llama.cpp offloads the last N of `nLayer + 1` slots. So `-ngl 43` on a
+  // 43-layer model is NOT "every layer": it is layers 1..42 plus the output,
+  // with layer 0 left on the host. Only `-ngl > nLayer` takes everything.
+  const all = offloadRange(43, { ...defaults(), ngl: 999 });
+  assertEquals({ start: all.start, count: all.count, slots: all.slots }, {
+    start: 0,
+    count: 44,
+    slots: 44,
+  });
+  assert(slotOnGpu(0, all) && slotOnGpu(43, all), "layers and the head");
+
+  const exact = offloadRange(43, { ...defaults(), ngl: 43 });
+  assertEquals({ start: exact.start, count: exact.count }, {
+    start: 1,
+    count: 43,
+  });
+  assert(!slotOnGpu(0, exact), "layer 0 stays on the host at -ngl 43");
+  assert(slotOnGpu(43, exact), "and the output head is offloaded anyway");
+
+  const none = offloadRange(43, { ...defaults(), ngl: 0 });
+  assertEquals(none.count, 0);
+  assert(!slotOnGpu(43, none));
+});
+
+Deno.test("devsplit: slots are packed into the cards in order, or not at all", () => {
+  // Contiguous and in order is llama.cpp's rule, not a simplification of it:
+  // each card gets one run of consecutive layers.
+  const cheap = Array.from({ length: 10 }, () => 1);
+  assertEquals(packSlots(cheap, [4, 6]), [4, 6]);
+  assertEquals(loadPerDevice(cheap, [4, 6]), [4, 6]);
+
+  // The shape `--n-cpu-moe` produces: a long cheap head and a heavy tail.
+  const moe = [...Array.from({ length: 8 }, () => 1), 10, 10, 10];
+  assertEquals(packSlots(moe, [18, 20]), [9, 2], "card 0 takes the cheap run");
+  assertEquals(loadPerDevice(moe, [9, 2]), [18, 20]);
+
+  assertEquals(
+    packSlots([30], [20, 20]),
+    null,
+    "one slot bigger than any card",
+  );
+  assertEquals(packSlots([1], []), null, "nowhere to put it");
+});
+
+Deno.test("plan: the device plan carries a per-card picture, even when packing fails", () => {
+  // "I really don't have a good idea what takes what size, why it overflows"
+  // — because the map pooled two cards into one VRAM bar. The plan knows the
+  // per-card placement; it now says it: weights from the slot packing, KV
+  // apportioned by each card's share of the offloaded slots, compute scratch
+  // per device — and when NO cut fits, a best-effort fill plus the remainder
+  // with nowhere to go, which is the picture that explains the refusal.
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 3400 * MB, 3250 * MB),
+  });
+  const machine = hw({
+    gpus: [gpu(24, 0.5), gpu(24, 0.1)],
+    backend: "cuda",
+  });
+
+  const fitting = tune(m, machine, defaults(), "hybrid");
+  const p = plan(m, machine, fitting.settings);
+  assertEquals(p.devices.cards.length, 2, "one entry per card");
+  for (const c of p.devices.cards) {
+    assert(c.capacityB > 0);
+    assert(
+      c.otherB + c.weightsB + c.kvB + c.computeB <= c.capacityB + c.overB,
+      "a card's parts never silently exceed what it can hold",
+    );
+  }
+  if (p.devices.fits) {
+    assertEquals(p.devices.unplacedB, 0);
+  }
+
+  // Force an impossible placement: everything on the GPUs, experts included,
+  // at a long context. The picture must still exist — cards filled as far as
+  // they go, the rest reported as unplaced rather than drawn nowhere.
+  const doomed = plan(m, machine, {
+    ...defaults(),
+    ngl: 999,
+    nCpuMoe: 0,
+    ctxSize: 131_072,
+  });
+  if (!doomed.devices.fits) {
+    assert(
+      doomed.devices.unplacedB > 0,
+      `the bytes with nowhere to go are named: ${doomed.devices.unplacedB}`,
+    );
+    assert(
+      doomed.notes.some((n) => n.includes("no card")),
+      `and the note says so: ${JSON.stringify(doomed.notes)}`,
+    );
+  }
+});
+
+Deno.test("devsplit: -ts boundaries land between slots, never on one", () => {
+  // Emitting the counts themselves puts the boundary exactly on `k / n`, where
+  // llama.cpp's `upper_bound` decides on the equality of two floats it computed
+  // separately. Midpoints cannot be off by one card.
+  assertEquals(tensorSplitValue([37, 7]), "36.5,7.5");
+  assertEquals(tensorSplitValue([10, 20, 14]), "9.5,20,14.5");
+  assertEquals(tensorSplitValue([44]), "", "one card needs no split");
+  assertEquals(tensorSplitValue([44, 0]), "", "nor does one card doing it all");
+});
+
+Deno.test("tune: an expert-heavy tail is split by bytes, not by layer count", () => {
+  // The failure this pins, from a real run: DeepSeek-V4-Flash on two 24 GB
+  // cards. `--n-cpu-moe 34` holds the first 34 layers' experts in RAM, so the
+  // last 9 layers are ~3.2 GB each and the first 34 are ~0.15 GB each. Split by
+  // COUNT — which is what llama.cpp does, using free VRAM only to choose the
+  // proportions — the heavy tail lands on one card:
+  //
+  //   allocating 34020.32 MiB on device 1: cudaMalloc failed: out of memory
+  //
+  // The totals were never the problem: 38 GB of plan, 42 GB of free VRAM.
+  const MB = 1024 * 1024;
+  const m = meta({
+    name: "Expert-heavy",
+    nLayer: 43,
+    nCtxTrain: 32768,
+    nHeadKv: 1,
+    keyLength: 512,
+    valueLength: 512,
+    swaWindow: 128,
+    swaPattern: 1,
+    nExpert: 256,
+    nExpertUsed: 6,
+    embdBytes: 1000 * MB,
+    outputBytes: 1000 * MB,
+    layers: layers(43, 3400 * MB, 3250 * MB),
+  });
+  const machine = hw({
+    gpus: [gpu(24, 5.6), gpu(24, 0.1)],
+    backend: "cuda",
+    mem: {
+      totalB: 186 * GB,
+      availableB: 167 * GB,
+      usedB: 19 * GB,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+  });
+
+  const t = tune(m, machine, defaults(), "hybrid");
+  assertEquals(t.possible, true);
+
+  const p = plan(m, machine, t.settings);
+  assert(
+    p.devices.fits,
+    "a division of the layers exists that both cards hold",
+  );
+  assertEquals(p.vram.overB, 0);
+  for (let d = 0; d < p.devices.bytesB.length; d++) {
+    assert(
+      (p.devices.bytesB[d] ?? 0) <= (p.devices.budgetsB[d] ?? 0),
+      `card ${d} is asked for ${p.devices.bytesB[d]} of ${
+        p.devices.budgetsB[d]
+      }`,
+    );
+  }
+  // And the split is actually emitted, so llama.cpp does not have to guess.
+  assert(
+    String(t.settings.tensorSplit).includes(","),
+    `a two-card placement must pin -ts, got ${
+      JSON.stringify(t.settings.tensorSplit)
+    }`,
+  );
+  assertEquals(
+    argv("server", { bin: "s", model: "m", settings: t.settings }).includes(
+      "-ts",
+    ),
+    true,
+  );
+
+  // The counterfactual: llama.cpp's own default, which divides the SLOT COUNT
+  // in proportion to each card's free VRAM, overloads one card at this exact
+  // placement. That is the whole reason an explicit split is emitted.
+  const off = offloadRange(m.nLayer, t.settings);
+  const free = machine.gpus.map((g) => g.vramTotalB - g.vramUsedB);
+  const total = free.reduce((a, b) => a + b, 0);
+  const firstCard = Math.round(off.count * (free[0] ?? 0) / total);
+  const byCount = loadPerDevice(
+    // Re-derive the per-slot costs the same way the plan does.
+    Array.from({ length: off.count }, (_, i) => {
+      const slot = off.start + i;
+      if (slot >= m.nLayer) return m.outputBytes;
+      const l = m.layers[slot]!;
+      const expert = slot < Number(t.settings.nCpuMoe) ? 0 : l.expert;
+      return l.bytes - l.expert + expert;
+    }),
+    [firstCard, off.count - firstCard],
+  );
+  assert(
+    (byCount[1] ?? 0) > (machine.gpus[1]?.vramTotalB ?? 0),
+    `the default split must overflow card 1 — that is the bug: ${
+      JSON.stringify(byCount)
+    }`,
+  );
+});
+
+Deno.test("tune: never emits two flags that are the same llama.cpp setting", () => {
+  // `--mlock` and `--no-mmap` both assign `params.load_mode` (`common/arg.cpp`),
+  // so passing both is not "locked and unmapped" — it is whichever came last,
+  // silently. The app would then print a reason claiming --mlock while shipping
+  // an argv that cancelled it. Checked across the shapes that reach the branch:
+  // a MoE with experts on the host, a dense model, and a machine with no room.
+  const MB = 1024 * 1024;
+  const roomy = {
+    totalB: 186 * GB,
+    availableB: 167 * GB,
+    usedB: 19 * GB,
+    swapTotalB: 0,
+    swapUsedB: 0,
+  };
+  const cases: [string, ModelMeta, Hw][] = [
+    ["dense, roomy", meta(), hw({ gpus: [gpu(24, 0.5)], mem: roomy })],
+    [
+      "MoE on two cards",
+      meta({
+        nLayer: 43,
+        nExpert: 256,
+        nExpertUsed: 6,
+        swaWindow: 128,
+        layers: layers(43, 3400 * MB, 3250 * MB),
+      }),
+      hw({ gpus: [gpu(24, 5.6), gpu(24, 0.1)], mem: roomy, backend: "cuda" }),
+    ],
+    [
+      "MoE, tight RAM",
+      moeMeta(),
+      hw({
+        gpus: [gpu(8, 0.5)],
+        mem: {
+          totalB: 32 * GB,
+          availableB: 20 * GB,
+          usedB: 12 * GB,
+          swapTotalB: 0,
+          swapUsedB: 0,
+        },
+      }),
+    ],
+  ];
+  for (const [name, m, machine] of cases) {
+    for (const p of ["vram", "hybrid", "cpu"] as const) {
+      const { settings } = tune(m, machine, defaults(), p);
+      const cmd = argv("server", { bin: "s", model: "m", settings });
+      assert(
+        !(cmd.includes("--mlock") && cmd.includes("--no-mmap")),
+        `${name} / ${p}: both flags emitted — ${cmd.join(" ")}`,
+      );
+      // Routed experts on the host get llama.cpp's mmap default, and NO flag:
+      // --no-mmap re-copied the whole file on every start (160 s where mmap
+      // takes 6 warm, and 8.9 tok/s where mmap generates 9.6), and --mlock
+      // would ask to pin more than stock memlock limits allow, so its stated
+      // effect would not happen. Measured on the 145 GB DeepSeek-V4.
+      if (Number(settings.nCpuMoe ?? 0) > 0) {
+        assert(
+          !cmd.includes("--no-mmap") && !cmd.includes("--mlock"),
+          `${name} / ${p}: experts on host must stay memory-mapped — ${
+            cmd.join(" ")
+          }`,
+        );
+      }
+    }
+  }
+});
+
+// ── measuring what cannot be predicted (src/lib/fitladder.ts) ──────────────
+
+Deno.test("fitladder: only an allocation failure is worth retrying smaller", () => {
+  assert(isFitFailure([
+    "E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 18432.00 MiB on device 0: cudaMalloc failed: out of memory",
+    "E llama_init_from_model: failed to initialize the context: failed to allocate buffer for kv cache",
+  ]));
+  assert(isFitFailure([
+    "E ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 71912704256",
+    "E graph_reserve: failed to allocate compute buffers",
+  ]));
+  // A shorter context does not fix any of these, and four slow retries that end
+  // in the same error are worse than the error.
+  assert(!isFitFailure(["E error loading model: no such file"]));
+  assert(!isFitFailure(["E unknown argument: --nope"]));
+  assert(!isFitFailure([]));
+});
+
+Deno.test("fitladder: a generation-time CUDA pool OOM is a fit failure", () => {
+  // Captured live from DeepSeek-V4 on 2×24 GB: the server passed /health, then
+  // the first prompt OOM'd allocating compute scratch. Note the word "buffer"
+  // appears nowhere — requiring it made the ladder blind to exactly the
+  // failure it exists for, and the run was reported instead of retried.
+  assert(isFitFailure([
+    "/src/ggml-cuda/ggml-cuda.cu:106: CUDA error",
+    "2.17.177.475 E CUDA error: out of memory",
+    "2.17.177.483 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl at /src/ggml-cuda/common.cuh:1622",
+    "2.17.177.484 E   cudaFuncGetAttributes(&attr, kernel)",
+  ]));
+  // A CUDA error that is NOT an allocation failure still is not one: a smaller
+  // context does not fix a rejected device.
+  assert(
+    !isFitFailure([
+      "E CUDA error: no CUDA-capable device is detected",
+    ]),
+  );
+});
+
+Deno.test("fitladder: the ladder reaches the context this model actually needs", () => {
+  // Measured on a 2x24 GB machine: DeepSeek-V4-Flash declares 1,048,576, and
+  // 64k still failed to allocate its compute buffer. 32,768 started. A ladder
+  // that gave up at 64k would have stopped one rung short of the answer.
+  let ctx = 1_048_576;
+  const rungs: number[] = [];
+  for (let tries = 0; tries < MAX_FIT_RETRIES; tries++) {
+    const d = fitDecision({
+      lines: [
+        "E cudaMalloc failed: out of memory",
+        "E failed to allocate compute buffers",
+      ],
+      ctx,
+      tries,
+      auto: true,
+    });
+    if (d.kind !== "retry") break;
+    ctx = d.ctx;
+    rungs.push(ctx);
+  }
+  assertEquals(rungs, [524_288, 262_144, 131_072, 65_536, 32_768, 16_384]);
+  assert(rungs.includes(32_768), "the measured working context is reachable");
+});
+
+Deno.test("fitladder: a context the user chose is never silently halved", () => {
+  const lines = [
+    "E cudaMalloc failed: out of memory",
+    "E failed to allocate buffer for kv cache",
+  ];
+  assertEquals(
+    fitDecision({ lines, ctx: 131_072, tries: 0, auto: false }).kind,
+    "none",
+    "auto off — the number is an instruction, not a suggestion",
+  );
+  assertEquals(
+    fitDecision({ lines, ctx: 131_072, tries: MAX_FIT_RETRIES, auto: true })
+      .kind,
+    "none",
+    "and the ladder is bounded",
+  );
+});
+
+Deno.test("fitladder: the retry is the same command, one number smaller", () => {
+  // Re-composing from settings would pick up anything edited since Start; this
+  // rewrites what actually ran, so the preview stays honest.
+  const cmd = [
+    "/bin/llama-server",
+    "-m",
+    "/m.gguf",
+    "-ngl",
+    "999",
+    "--n-cpu-moe",
+    "33",
+    "-ts",
+    "36.5,7.5",
+    "-c",
+    "1048576",
+    "-fa",
+    "on",
+    "--port",
+    "8080",
+  ];
+  assertEquals(ctxOf(cmd), 1_048_576);
+  const next = withCtx(cmd, 32_768);
+  assertEquals(ctxOf(next), 32_768);
+  assertEquals(next.length, cmd.length, "nothing else moved");
+  assertEquals(
+    next.filter((_, i) => cmd[i] !== next[i]),
+    ["32768"],
+    "exactly one token differs",
+  );
+  // No -c at all means llama.cpp would use the model's full trained length —
+  // precisely the value that just failed — so one is added.
+  assertEquals(ctxOf(withCtx(["s", "-m", "x"], 4096)), 4096);
+});
+
+Deno.test("fitladder: a measured context is a ceiling, not a target", () => {
+  assertEquals(
+    openingCtx(32_768, 1_048_576),
+    32_768,
+    "measured wins over hoped",
+  );
+  assertEquals(
+    openingCtx(32_768, 8_192),
+    8_192,
+    "but never raises a smaller aim",
+  );
+  assertEquals(openingCtx(0, 1_048_576), 1_048_576, "never measured: aim high");
+});
+
+Deno.test("loadprogress: the bar is measured, labelled, and never overshoots", () => {
+  const GB = 1024 ** 3;
+  // Mid-load: 20 GB has landed on the cards, 30 GB is resident on the host,
+  // against a 100 GB plan — half way, and the log says which phase.
+  const p = loadProgress({
+    lines: [
+      "llama_model_loader: loaded meta data",
+      "load_tensors: loading model tensors, this can take a while...",
+    ],
+    startFreeVramB: 44 * GB,
+    freeVramB: 24 * GB,
+    rssB: 30 * GB,
+    plannedB: 100 * GB,
+  });
+  assertEquals(p.loadedB, 50 * GB);
+  assertEquals(p.fraction, 0.5);
+  assertEquals(p.phase, "loading weights");
+
+  // More measured than planned — the plan is an estimate — must clamp, not
+  // render a 130% bar.
+  const over = loadProgress({
+    lines: [],
+    startFreeVramB: 44 * GB,
+    freeVramB: 4 * GB,
+    rssB: 90 * GB,
+    plannedB: 100 * GB,
+  });
+  assertEquals(over.fraction, 1);
+
+  // No plan to compare against: no fraction, never NaN.
+  const unknown = loadProgress({
+    lines: [],
+    startFreeVramB: 0,
+    freeVramB: 0,
+    rssB: 5 * GB,
+    plannedB: 0,
+  });
+  assertEquals(unknown.fraction, null);
+  assertEquals(unknown.loadedB, 5 * GB);
+});
+
+Deno.test("loadprogress: the newest log line names the phase", () => {
+  assertEquals(loadPhase([]), "starting");
+  assertEquals(
+    loadPhase([
+      "load_tensors: loading model tensors",
+      "llama_kv_cache: size 1024.00 MiB",
+    ]),
+    "allocating the KV cache",
+    "the LATER line wins — the load has moved on",
+  );
+  assertEquals(
+    loadPhase(["main: warming up the model with an empty run"]),
+    "warming up",
+  );
+  assertEquals(elapsedLabel(95_000), "1:35");
+  assertEquals(elapsedLabel(4_000), "0:04");
+});
+
+Deno.test("tune: aimFull hunts to the advertised maximum, not the native aim", () => {
+  // "Max on VRAM / Max on Hybrid": the user has said context is the priority,
+  // so the search ceiling is the model's advertised edge — past the
+  // native-first automatic aim, past the measured ceiling. Memory still has
+  // the only vote on where it stops.
+  const m = meta({ nCtxTrain: 1_048_576, nCtxOrig: 65_536 });
+  const machine = hw({ gpus: [gpu(80, 0)] });
+  const auto = tune(m, machine, defaults(), "vram");
+  const full = tune(m, machine, defaults(), "vram", undefined, undefined, true);
+  assert(
+    Number(auto.settings.ctxSize) <= 65_536,
+    `auto aims native: ${auto.settings.ctxSize}`,
+  );
+  assert(
+    Number(full.settings.ctxSize) > Number(auto.settings.ctxSize),
+    `full aim goes past it when memory allows: ${full.settings.ctxSize}`,
+  );
+  assert(Number(full.settings.ctxSize) <= 1_048_576, "never past advertised");
+
+  // And the measured ceiling does not cap the hunt — it caps the AUTO path.
+  const measured = tune(m, machine, defaults(), "vram", undefined, 32_768);
+  assert(Number(measured.settings.ctxSize) <= 32_768);
+  const fullPastMeasured = tune(
+    m,
+    machine,
+    defaults(),
+    "vram",
+    undefined,
+    32_768,
+    true,
+  );
+  assert(
+    Number(fullPastMeasured.settings.ctxSize) >
+      Number(measured.settings.ctxSize),
+    "aimFull is the explicit way past the measured ceiling",
+  );
+});
+
+Deno.test("tune: aimFull drops the residency anchor — context outranks speed", () => {
+  // The report: a pinned 262,144 ran fine on hybrid while Max·Hybrid offered
+  // 17,920. Same machine, two answers — because the automatic search refuses
+  // to push weights back to the host to buy context, and the pin skipped that
+  // rule while the button did not. Pressing "Max on Hybrid" IS choosing that
+  // trade, so the full-aim hunt only requires placeability, like the pin.
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nCtxTrain: 262_144,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 100 * MB, 700 * MB),
+  });
+  // A card small enough that the anchor BINDS: the attention weights nearly
+  // fill it, so any real context must either stop early (the automatic rule)
+  // or push weights back to the host (the trade this button exists to make).
+  const machine = hw({
+    gpus: [gpu(6, 0.5)],
+    backend: "cuda",
+  });
+
+  const auto = tune(m, machine, defaults(), "hybrid");
+  const full = tune(
+    m,
+    machine,
+    defaults(),
+    "hybrid",
+    undefined,
+    undefined,
+    true,
+  );
+  assert(auto.possible && full.possible);
+  assert(
+    full.ctx > auto.ctx,
+    `the full hunt goes past the residency-bound ${auto.ctx}: got ${full.ctx}`,
+  );
+  assert(
+    full.reasons.some((r) => r.includes("Context first")),
+    "and says which trade was made",
+  );
 });

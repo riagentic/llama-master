@@ -1824,6 +1824,41 @@ input[type="checkbox"] {
   color: var(--text-faint);
 }
 
+/* A reasoning model's think-first act: visible so "thinking" is never a
+   spinner over nothing, folded so it never drowns the answer. */
+.msg-think {
+  border-left: 2px solid var(--line-soft);
+  padding-left: 8px;
+  margin: 2px 0;
+}
+
+.msg-think > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.msg-think > summary::before {
+  content: "▸ ";
+}
+
+.msg-think[open] > summary::before {
+  content: "▾ ";
+}
+
+.msg-think-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-dim);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
 .chat-input {
   display: flex;
   gap: 6px;
@@ -2059,9 +2094,11 @@ input[type="checkbox"] {
   gap: 12px;
 }
 
+/* Sized so the four vitals tile 2×2 inside a one-third column; 230px left the
+   column one pixel short and the grid collapsed to a tall single file. */
 .one-vitals {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 14px;
 }
 
@@ -2790,21 +2827,95 @@ input[type="checkbox"] {
   box-shadow: 0 0 0 1px var(--panel);
 }
 
-/* ── all-in-one: one window, two columns ──────────────────────────────────
-   The page fills the content area instead of scrolling it: the left column is
-   the decision (machine → what is → settings → what would be), the right is the
-   conversation. Chat as a full-height column rather than a panel at the bottom
-   of a scroll is the whole point — the reply is what you are waiting for, so it
-   sits beside the numbers that produced it. */
+/* ── all-in-one: one window, three columns ────────────────────────────────
+   The page fills the content area instead of scrolling it. Three columns, one
+   question each: the machine (vitals and both memory states), the decision
+   (the run strip, its errors, and the log they point at), the conversation.
+   Every section is exactly one column wide — a panel that spanned two made
+   the eye track across the fold and back — and each column scrolls alone, so
+   an open flag catalog never pushes the chat off screen. */
 .one-page {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 30%);
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr) minmax(320px, 5fr);
   gap: 12px;
   height: 100%;
   min-height: 0;
 }
 
-.one-main,
+.one-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Panels keep their height in a scrolling flex column instead of being
+   squashed to fit it. */
+.one-col > .panel {
+  flex-shrink: 0;
+}
+
+/* …except the one panel asked to FILL: the server log takes every remaining
+   pixel of its column — during a long load it is the page — and scrolls
+   inside itself. */
+.one-col > .panel-fill {
+  flex: 1 1 240px;
+  display: flex;
+  flex-direction: column;
+  min-height: 240px;
+}
+
+.one-col > .panel-fill > .panel-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-fill .log-fill {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
+/* The load-in-progress note: phase, measured bytes against the plan, elapsed. */
+.load-note {
+  display: grid;
+  gap: 6px;
+}
+
+.load-note-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.load-note-head .spacer {
+  flex: 1;
+}
+
+.load-note-nums {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.load-note-fit {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  margin: 0;
+}
+
+/* Layer bytes with nowhere to go — the map's honest remainder when no cut of
+   the cards can hold the model. */
+.map-unplaced {
+  font-size: var(--fs-xs);
+  color: var(--bad);
+  font-family: var(--mono);
+}
+
 .one-side {
   display: flex;
   flex-direction: column;
@@ -2868,11 +2979,27 @@ input[type="checkbox"] {
   color: var(--text);
 }
 
-/* On a narrow window the columns stack rather than crushing the chat. */
-@media (max-width: 1100px) {
+/* On a narrow window the columns fold rather than crushing their controls:
+   first the chat drops below the two decision columns, then everything
+   stacks. */
+@media (max-width: 1500px) {
   .one-page {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     height: auto;
+  }
+
+  .one-col,
+  .one-side {
+    overflow-y: visible;
+  }
+
+  /* Stacked layouts have no leftover height to fill — cap the log again. */
+  .panel-fill .log-fill {
+    max-height: 300px;
+  }
+
+  .one-side {
+    grid-column: 1 / -1;
   }
 
   .one-side > .panel:first-child {
@@ -2881,5 +3008,15 @@ input[type="checkbox"] {
 
   .one-side .one-chatlog {
     max-height: 300px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .one-page {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .one-side {
+    grid-column: auto;
   }
 }

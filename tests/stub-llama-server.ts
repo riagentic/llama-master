@@ -1,8 +1,9 @@
 #!/usr/bin/env -S deno run -A
 // test/stub-llama-server.ts — a llama-server impersonator.
 //
-// Speaks the three endpoints llama.master actually uses (`/health`, `/props`,
-// `/v1/chat/completions` with SSE) and accepts llama.cpp's flags. It exists so
+// Speaks the endpoints llama.master actually uses (`/health`, `/props`,
+// `/completion` for the readiness probe, `/v1/chat/completions` with SSE) and
+// accepts llama.cpp's flags. It exists so
 // the server lifecycle and the chat stream can be tested against a REAL child
 // process over a REAL socket — spawn, health poll, stream, SIGTERM — instead of
 // against a mock that agrees with whatever the code does.
@@ -60,6 +61,34 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
       : Response.json({ status: "loading model" }, { status: 503 });
   }
 
+  // The generation probe (`srv.server.ts:probe`). `--oom-on-generate`
+  // reproduces the failure that motivated it, with the stderr captured from a
+  // real DeepSeek-V4 run on 2×24 GB: the server loads, passes /health, and dies
+  // of a pool allocation the moment it is asked to produce a token. Note the
+  // word "buffer" appears nowhere — that is the point; the fit ladder must
+  // recognise this shape without it.
+  if (url.pathname === "/completion") {
+    if (!ready()) {
+      return Response.json({ error: "loading" }, { status: 503 });
+    }
+    if (args.includes("--oom-on-generate")) {
+      console.error(
+        "/src/ggml-cuda/ggml-cuda.cu:106: CUDA error",
+      );
+      console.error("2.17.177.475 E CUDA error: out of memory");
+      console.error(
+        "2.17.177.483 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl at /src/ggml-cuda/common.cuh:1622",
+      );
+      console.error("2.17.177.484 E   cudaFuncGetAttributes(&attr, kernel)");
+      // SIGABRT's exit status, as ggml_abort produces. The handler never
+      // answers — the process dies under the request and the connection drops,
+      // exactly as a real abort mid-generation looks to the probe.
+      setTimeout(() => Deno.exit(134), 10);
+      return new Promise<Response>(() => {});
+    }
+    return Response.json({ content: " ok", tokens_predicted: 2 });
+  }
+
   if (url.pathname === "/props") {
     return Response.json({
       model_path: model,
@@ -72,6 +101,16 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
     const body = new ReadableStream<Uint8Array>({
       start(c) {
         const enc = new TextEncoder();
+        // Reasoning first, exactly as llama.cpp streams a thinking model:
+        // `reasoning_content` deltas with `content` absent. A client that
+        // only reads `content` renders nothing for this whole phase.
+        for (const word of ["Consider", " the greeting."]) {
+          c.enqueue(
+            enc.encode(
+              sse({ choices: [{ delta: { reasoning_content: word } }] }),
+            ),
+          );
+        }
         for (const word of ["Hello", " from", " the", " stub"]) {
           c.enqueue(
             enc.encode(sse({ choices: [{ delta: { content: word } }] })),

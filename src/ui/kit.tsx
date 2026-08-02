@@ -29,10 +29,17 @@ export function Panel(props: {
   icon?: string;
   right?: JSX.Node;
   wide?: boolean;
+  /** Grow to take the remaining height of a flex column, body scrolling
+   *  inside. What the all-in-one server log wants; a fixed panel elsewhere. */
+  fill?: boolean;
   children?: JSX.Node;
 }) {
   return (
-    <section class={props.wide ? "panel panel-wide" : "panel"}>
+    <section
+      class={`panel${props.wide ? " panel-wide" : ""}${
+        props.fill ? " panel-fill" : ""
+      }`}
+    >
       <header class="panel-head">
         <h2 t={`panel-${props.title}`}>
           {props.icon ? <span class="panel-icon">{props.icon}</span> : null}
@@ -330,16 +337,38 @@ export function JobProgress(props: {
 }
 
 /** Scrolling log tail. Newest at the bottom, capped upstream. */
+/**
+ * A reasoning model's think-first act, folded so it never drowns the answer.
+ *
+ * llama.cpp streams the `<think>` block as `reasoning_content`, with the
+ * answer's `content` empty the whole while — on DeepSeek-V4 that is the entire
+ * first half of every reply. Invisible thinking read as a broken chat; a wall
+ * of raw reasoning would bury the answer. Folded is both honest and readable:
+ * open and live while it is all there is, a one-line "thought first" once the
+ * answer exists.
+ */
+export function Thinking(props: { text?: string; live?: boolean }) {
+  if (!props.text) return null;
+  return (
+    <details class="msg-think" open={props.live} t="msg-think">
+      <summary>{props.live ? "thinking…" : "thought first"}</summary>
+      <div class="msg-think-body">{props.text}</div>
+    </details>
+  );
+}
+
 export function LogView(props: { lines: string[]; t?: string; rows?: number }) {
   // Newest at the bottom, and the app's diagnoses all end with "the log below" —
   // so a new line must not land out of sight.
   const box = useStickyBottom(props.lines.length);
+  // rows 0 = fill: no cap of its own, the flex parent decides (`panel-fill`).
+  const fill = props.rows === 0;
   return (
     <pre
-      class="log"
+      class={fill ? "log log-fill" : "log"}
       t={props.t ?? "log"}
       ref={box}
-      style={{ maxHeight: `${(props.rows ?? 14) * 16}px` }}
+      style={fill ? undefined : { maxHeight: `${(props.rows ?? 14) * 16}px` }}
     >
       {props.lines.length === 0 ? "—" : props.lines.join("\n")}
     </pre>

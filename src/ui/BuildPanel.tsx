@@ -7,7 +7,7 @@
 import { builds } from "../cell/builds.ts";
 import { hw } from "../cell/hw.ts";
 import { availableBackends, pickAsset } from "../lib/assets.ts";
-import { targetReadiness } from "../lib/backend.ts";
+import { SCHED_SPLIT_CAP, targetReadiness } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
 import { bytes, duration, stamp } from "../lib/format.ts";
 import {
@@ -151,6 +151,13 @@ function Chooser() {
                 label="-march=native"
                 tip="Tune for THIS CPU. Faster here, not portable to another machine."
                 onChange={(v) => builds.setNative(v)}
+              />
+              <Toggle
+                checked={builds.bypassSchedCap}
+                label="Bypass llama.cpp's graph-split limit"
+                tip={`Compile with GGML_SCHED_MAX_SPLIT_INPUTS=${SCHED_SPLIT_CAP} instead of the stock 30. llama.cpp's scheduler caps how many tensors one graph split may pull across a device boundary, and with routed experts in RAM that cap aborts extreme contexts — measured: 256k generates, 512k dies at the assert with memory to spare. Raised, contexts up to the model's full advertised length (1M) stop hitting it. Costs kilobytes of bookkeeping per split; source builds only.`}
+                t="bypass-sched-cap"
+                onChange={(v) => builds.setBypassSchedCap(v)}
               />
             </div>
           </div>
@@ -318,7 +325,19 @@ function Installed() {
                     />
                   </td>
                   <td class="mono">{b.ref}</td>
-                  <td>{b.backend}</td>
+                  <td>
+                    {b.backend}
+                    {b.schedCap
+                      ? (
+                        <span
+                          class="dim"
+                          title={`Compiled with GGML_SCHED_MAX_SPLIT_INPUTS=${b.schedCap} (stock: 30) — the graph-split limit that aborts extreme contexts is raised in this build.`}
+                        >
+                          · split cap {b.schedCap}
+                        </span>
+                      )
+                      : null}
+                  </td>
                   <td>{b.origin}</td>
                   <td>{stamp(b.createdAt)}</td>
                   <td class="mono">{bytes(b.sizeB)}</td>

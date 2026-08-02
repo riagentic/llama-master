@@ -18,6 +18,7 @@ import {
   assertThrows,
 } from "@std/assert";
 import { join } from "@std/path";
+import type { Settings } from "../src/lib/types.ts";
 
 // Point the app home at a temp dir BEFORE anything resolves paths: `start()`
 // refuses to run a binary outside its own builds directory, and this is how the
@@ -92,6 +93,11 @@ Deno.test({
     }, "the server to report healthy");
 
     assertEquals(srv.healthy, true);
+    assertEquals(
+      srv.proven,
+      true,
+      "ready was entered through a real generation, not just /health",
+    );
     assertEquals(srv.loadedModel(), "/models/fixture.gguf");
     assertEquals(srv.props?.n_ctx, 8192);
     assert(
@@ -110,6 +116,11 @@ Deno.test({
     assertEquals(chat.messages.length, 2);
     assertEquals(chat.messages[0]?.role, "user");
     assertEquals(chat.messages[1]?.content, "Hello from the stub");
+    assertEquals(
+      chat.messages[1]?.thinking,
+      "Consider the greeting.",
+      "the reasoning channel is kept — a thinking model's whole first act arrives there, and dropping it rendered 'thinking' as nothing",
+    );
     assertEquals(chat.lastTps, 42.5);
 
     await srv.stop();
@@ -141,6 +152,71 @@ Deno.test({
     assertEquals(srv.exitCode, 3);
     assertStringIncludes(srv.lastError, "exited with code 3");
     assertEquals(srv.healthy, false);
+  },
+});
+
+Deno.test({
+  name:
+    "srv: an OOM at first generation is provoked by the probe and walks the ladder",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // The failure that motivated the probe, end to end: the server loads,
+    // passes /health, and dies of a CUDA pool OOM the moment it generates —
+    // measured on DeepSeek-V4, where "ready" at 17,408 tokens could not answer
+    // "Hi". The probe provokes that death BEFORE ready is claimed, the crash is
+    // recognised as a fit failure (its stderr never says "buffer"), and the
+    // ladder steps the context down: 8192 → 4096 → 2048, then stops at MIN_CTX
+    // with the honest diagnosis. `proven` must never have been set, so the
+    // crashing context is never recorded as a working one.
+    const bin = await installStub();
+    const port = freePort();
+    using _boot = await bootCells([srv]);
+
+    await srv.start(
+      [
+        bin,
+        "-m",
+        "/m.gguf",
+        "--port",
+        String(port),
+        "-c",
+        "8192",
+        "--oom-on-generate",
+      ],
+      `http://127.0.0.1:${port}`,
+      {
+        model: "/m.gguf",
+        settings: { ctxSize: 8192 } as unknown as Settings,
+        autoFit: true,
+      },
+    );
+
+    await waitFor(
+      async () => {
+        await srv.poll();
+        return srv.status === "crashed" && srv.diagnosis !== null;
+      },
+      "the ladder to run dry",
+      30_000,
+    );
+
+    assertEquals(srv.fitTries, 2, "8192 → 4096 → 2048, each rung measured");
+    assert(
+      srv.argv.join(" ").includes("-c 2048"),
+      `the final command carries the last rung; got ${srv.argv.join(" ")}`,
+    );
+    assertEquals(srv.runSettings?.ctxSize, 2048);
+    assertEquals(
+      srv.proven,
+      false,
+      "no rung generated, so nothing may be remembered as working",
+    );
+    assertStringIncludes(
+      srv.diagnosis?.reason ?? "",
+      "during generation",
+      "the OOM is explained as memory, not as a driver mismatch",
+    );
   },
 });
 

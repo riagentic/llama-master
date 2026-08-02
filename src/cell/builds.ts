@@ -12,6 +12,7 @@ import type { Asset } from "../lib/assets.ts";
 import { appendLog } from "../lib/buildlog.ts";
 import type { Upstream } from "../lib/update.ts";
 import { updateFor, updateTarget } from "../lib/update.ts";
+import { SCHED_SPLIT_CAP } from "../lib/backend.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Backend, Build, Job } from "../lib/types.ts";
 import type { MethodDraftMeta } from "aio";
@@ -32,6 +33,11 @@ export type BuildsState = {
   jobs: number;
   /** `-DGGML_NATIVE`: fastest here, not portable to another CPU. */
   native: boolean;
+  /** Compile with `GGML_SCHED_MAX_SPLIT_INPUTS` raised (source route only):
+   *  llama.cpp's stock cap of 30 cross-device inputs per graph split aborts
+   *  extreme contexts when the experts live in RAM — measured: 256k runs,
+   *  512k asserts. The raised cap is what "supports up to 1M" actually needs. */
+  bypassSchedCap: boolean;
   /** Prebuilt assets published for `ref`, once looked up. */
   assets: Asset[];
   assetName: string;
@@ -44,6 +50,9 @@ export type BuildsState = {
   /** The build every other panel uses. */
   activeId: string;
   scanning: boolean;
+  /** Monotonic scan generation — the last scan to START is the one whose
+   *  result may land; a superseded one discards its own (see `scan`). */
+  scanEpoch: number;
   /** What upstream offers, refreshed by a 5-minute poll (src/app.ts). */
   upstream: Upstream;
   checkingUpdate: boolean;
@@ -79,6 +88,7 @@ export const builds = cell("builds", {
       "origin",
       "jobs",
       "native",
+      "bypassSchedCap",
       "activeId",
     ],
   },
@@ -93,6 +103,7 @@ export const builds = cell("builds", {
     origin: "release" as Origin,
     jobs: 0,
     native: true,
+    bypassSchedCap: false,
     assets: [] as Asset[],
     assetName: "",
     assetsLoading: false,
@@ -102,6 +113,7 @@ export const builds = cell("builds", {
     installed: [] as Build[],
     activeId: "",
     scanning: false,
+    scanEpoch: 0,
     upstream: { latestTag: "", masterSha: "", checkedAt: 0 } as Upstream,
     checkingUpdate: false,
     lastError: "",
@@ -152,6 +164,9 @@ export const builds = cell("builds", {
     },
     setNative(s, native: boolean) {
       s.native = native;
+    },
+    setBypassSchedCap(s, on: boolean) {
+      s.bypassSchedCap = on;
     },
     setAsset(s, name: string) {
       s.assetName = name;
@@ -245,11 +260,19 @@ export const builds = cell("builds", {
     },
 
     async scan(s) {
-      if (s.scanning) return;
+      // Newest wins, never first-wins. The old guard (`if (s.scanning) return`)
+      // made a concurrent `await scan()` a silent no-op — the caller believed
+      // `installed` reflected the disk and it reflected nothing — and a scan
+      // that started earlier could resolve later and overwrite fresher state
+      // with an older directory listing. Both are the same bug: the LAST scan
+      // to start must be the one whose result stands. The epoch does that; a
+      // superseded scan discards its own result instead of racing.
+      const epoch = ++s.scanEpoch;
       s.scanning = true;
       try {
         const io = await import("./builds.server.ts");
         const list = await io.listBuilds();
+        if (epoch !== s.scanEpoch) return; // aiol-ok — superseded, discard
         s.installed = list;
         // Keep the active selection valid without silently switching away from
         // a build the user chose.
@@ -259,7 +282,7 @@ export const builds = cell("builds", {
       } catch (e) {
         s.lastError = String(e);
       } finally {
-        s.scanning = false;
+        if (epoch === s.scanEpoch) s.scanning = false; // aiol-ok — see above
       }
     },
 
@@ -333,6 +356,7 @@ export const builds = cell("builds", {
               // and the last two cores buy back almost no wall-clock.
               jobs: s.jobs || autoJobs(),
               native: s.native,
+              schedCap: s.bypassSchedCap ? SCHED_SPLIT_CAP : 0,
               signal,
             },
             onProgress,

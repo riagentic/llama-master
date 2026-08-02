@@ -14,7 +14,7 @@ import { GROUPS, num, PARAMS } from "../lib/params.ts";
 import { DevicePicker } from "./DevicePicker.tsx";
 import type { Param } from "../lib/types.ts";
 import { plan as computePlan } from "../lib/plan.ts";
-import { optimalCtx, pinnedCtx, PLACEMENTS } from "../lib/tune.ts";
+import { pinnedCtx, PLACEMENTS, trainedCtx } from "../lib/tune.ts";
 import { applyOptimal, currentStability, runLocked } from "./actions.ts";
 import { Empty, ErrorNote, Panel, Pill, Segmented, Toggle } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
@@ -191,7 +191,9 @@ function StabilityNote() {
 export function TunePanel() {
   const m = currentModel();
   const meta = m?.meta ?? null;
-  const target = meta ? optimalCtx(meta) : 0;
+  // The pin ceiling is the ADVERTISED length; the auto-tuner's native-first
+  // aim stays its own business (see the same note in OnePage).
+  const target = meta ? trainedCtx(meta) : 0;
   // The same clamp the tuner applies, so the number shown is the number that
   // would run (`pinnedCtx`, src/lib/tune.ts).
   const ctxNow = pinnedCtx(

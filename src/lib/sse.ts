@@ -40,6 +40,27 @@ export function deltaText(json: string): string {
   }
 }
 
+/**
+ * The REASONING token in a streaming chunk, when the model thinks first.
+ *
+ * llama.cpp parses a reasoning model's `<think>` block out of the text and
+ * streams it as `delta.reasoning_content`, with `content` empty the whole
+ * while — measured on DeepSeek-V4: the entire first half of every reply
+ * arrives here. A client that only reads `content` shows NOTHING while the
+ * model thinks and, if generation stops mid-think, appends no message at all;
+ * a user watched exactly that and reasonably concluded chat was broken.
+ */
+export function deltaReasoning(json: string): string {
+  try {
+    const o = JSON.parse(json) as {
+      choices?: { delta?: { reasoning_content?: string } }[];
+    };
+    return o.choices?.[0]?.delta?.reasoning_content ?? "";
+  } catch {
+    return "";
+  }
+}
+
 /** llama.cpp reports timings on the final chunk; surface tokens/second. */
 export function timingsTps(json: string): number | null {
   try {

@@ -10,15 +10,29 @@ import { srv } from "../cell/srv.ts";
 import { num } from "../lib/params.ts";
 import { tps } from "../lib/format.ts";
 import { endpoint } from "./actions.ts";
-import { Empty, ErrorNote, Panel, Pill, Waiting } from "./kit.tsx";
+import { Empty, ErrorNote, Panel, Pill, Thinking, Waiting } from "./kit.tsx";
 import { canSend } from "./derive.ts";
 import { useStickyBottom } from "./sticky.ts";
 
-function Message(props: { role: string; content: string; tps?: number }) {
+function Message(
+  props: {
+    role: string;
+    content: string;
+    thinking?: string;
+    live?: boolean;
+    tps?: number;
+  },
+) {
   return (
     <div class={`msg msg-${props.role}`}>
       <div class="msg-role">{props.role}</div>
-      <div class="msg-body">{props.content}</div>
+      <Thinking text={props.thinking} live={props.live && !props.content} />
+      <div class="msg-body">
+        {props.content ||
+          (props.thinking && !props.live
+            ? "(the reply ended while still thinking — its reasoning is above)"
+            : props.content)}
+      </div>
       {props.tps ? <div class="msg-meta">{tps(props.tps)} tok/s</div> : null}
     </div>
   );
@@ -76,13 +90,23 @@ export function ChatPanel() {
                     key={String(i)}
                     role={m.role}
                     content={m.content}
+                    thinking={m.thinking}
                     tps={m.tps}
                   />
                 ))}
-                {chat.partial
-                  ? <Message role="assistant" content={chat.partial} />
+                {chat.partial || chat.partialThink
+                  ? (
+                    <Message
+                      role="assistant"
+                      content={chat.partial}
+                      thinking={chat.partialThink}
+                      live
+                    />
+                  )
                   : null}
-                {chat.streaming && !chat.partial ? <Waiting /> : null}
+                {chat.streaming && !chat.partial && !chat.partialThink
+                  ? <Waiting />
+                  : null}
               </>
             )}
         </div>

@@ -9,10 +9,15 @@
 
 import { assert, assertEquals, assertStringIncludes } from "@std/assert";
 import { cpuJson, gguf, gpuJson, memJson } from "../src/cell/wasm.server.ts";
-import { defaultDirs, readMeta, scan } from "../src/cell/models.server.ts";
+import {
+  defaultDirs,
+  readMeta,
+  readModel,
+  scan,
+} from "../src/cell/models.server.ts";
 import { snapshot } from "../src/cell/hw.server.ts";
 import { join } from "@std/path";
-import { moeGguf, q4kBytes } from "./gguf-fixture.ts";
+import { moeGguf, q4kBytes, shardName, splitMoeGguf } from "./gguf-fixture.ts";
 
 Deno.test("wasm: a GGUF header parses into exact per-layer byte accounting", async () => {
   const r = await gguf(moeGguf());
@@ -141,6 +146,87 @@ Deno.test("models: a header larger than the first read is retried, not truncated
     const { meta, error } = await readMeta(path);
     assertEquals(error, null);
     assertEquals(meta?.nLayer, 4);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+/**
+ * The bug this exists to stop: a split model read as its first part.
+ *
+ * Part 1 of DeepSeek-V4-Flash parses perfectly and describes 38 tensors and 37
+ * GB — of the 1,328 tensors and 145 GB on disk. Nothing downstream can tell:
+ * the planner sized it at a quarter, "VRAM only" looked possible on 48 GB of
+ * cards, the tuner proposed it, and llama-server was killed loading the rest.
+ */
+Deno.test("models: a split model is read as one model, not as its first part", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "llama-master-test-" });
+  try {
+    const parts = splitMoeGguf(3);
+    const stem = join(dir, "split-moe");
+    let sizeB = 0;
+    for (let i = 0; i < parts.length; i++) {
+      await Deno.writeFile(shardName(stem, i + 1, parts.length), parts[i]!);
+      sizeB += parts[i]!.length;
+    }
+    const first = shardName(stem, 1, parts.length);
+
+    // What the old code saw, and why it looked like a whole model.
+    const one = await readMeta(first);
+    assertEquals(one.meta?.splitCount, 3, "the part knows it is a part");
+    assertEquals(one.meta?.nTensors, 6, "…and holds 6 of the 14 tensors");
+
+    const { meta, error } = await readModel(first, sizeB);
+    assertEquals(error, null);
+    assertEquals(meta?.nTensors, 14, "every tensor across every part");
+    assertEquals(meta?.splitTensors, 14);
+    assertEquals(meta?.nLayer, 6);
+    assertEquals(
+      meta?.layers.filter((l) => l.bytes > 0).length,
+      6,
+      "parts 2 and 3 declare no block_count, and their layers are still layers",
+    );
+    const attn = q4kBytes(2048 * 2048);
+    const experts = q4kBytes(2048 * 2048 * 8);
+    for (const l of meta!.layers) {
+      assertEquals(l.bytes, attn + experts, `layer ${l.i}`);
+      assertEquals(l.expert, experts, `layer ${l.i} experts`);
+    }
+    assertEquals(
+      meta?.outputBytes,
+      2048 * 4,
+      "output_norm only — not 8/14ths of the model filed as the output head",
+    );
+    assert(
+      meta!.tensorBytes > one.meta!.tensorBytes * 2.5,
+      "the merge is most of the model, not a third of it",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+/** A partial set is not a smaller model. llama.cpp cannot load it either, and a
+ *  plan drawn over the readable parts is a plan for something that does not
+ *  exist — so it has to fail loud rather than quietly shrink. */
+Deno.test("models: a split model missing a part is an error, not a smaller model", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "llama-master-test-" });
+  try {
+    const parts = splitMoeGguf(3);
+    const stem = join(dir, "split-moe");
+    let sizeB = 0;
+    for (let i = 0; i < parts.length; i++) {
+      sizeB += parts[i]!.length;
+      if (i === 1) continue; // part 2 never finished downloading
+      await Deno.writeFile(shardName(stem, i + 1, parts.length), parts[i]!);
+    }
+    const { meta, error } = await readModel(
+      shardName(stem, 1, parts.length),
+      sizeB,
+    );
+    assertEquals(meta, null, "no meta means no plan, which is the point");
+    assertStringIncludes(error ?? "", "incomplete");
+    assertStringIncludes(error ?? "", "2 of 3 parts");
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

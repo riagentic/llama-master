@@ -8,6 +8,8 @@ export type ModelsState = {
   dirs: string[];
   items: Model[];
   scanning: boolean;
+  /** Monotonic scan generation — newest scan wins (see `scan`). */
+  scanEpoch: number;
   /** Live scan progress — GGUF headers take a moment each. */
   progress: { done: number; total: number; current: string } | null;
   lastScan: number;
@@ -25,6 +27,7 @@ export const models = cell("models", {
     dirs: [] as string[],
     items: [] as Model[],
     scanning: false,
+    scanEpoch: 0,
     progress: null as ModelsState["progress"],
     lastScan: 0,
     selected: "",
@@ -47,7 +50,11 @@ export const models = cell("models", {
     },
 
     async scan(s) {
-      if (s.scanning) return;
+      // Newest wins, never first-wins — same rule as `builds.scan`, same bug:
+      // a concurrent `await scan()` used to be a silent no-op the caller could
+      // not tell from a real scan, and an older scan could resolve after a
+      // newer one and overwrite it with a stale listing.
+      const epoch = ++s.scanEpoch;
       s.scanning = true;
       s.progress = { done: 0, total: 0, current: "" };
       try {
@@ -60,6 +67,7 @@ export const models = cell("models", {
         const found = await io.scan(s.dirs.slice(), (done, total, current) => { // aiol-ok
           s.progress = { done, total, current };
         });
+        if (epoch !== s.scanEpoch) return; // aiol-ok — superseded, discard
         s.items = found;
         s.lastScan = Date.now();
         s.lastError = "";
@@ -73,8 +81,10 @@ export const models = cell("models", {
       } catch (e) {
         s.lastError = String(e);
       } finally {
-        s.scanning = false;
-        s.progress = null;
+        if (epoch === s.scanEpoch) { // aiol-ok — see above
+          s.scanning = false;
+          s.progress = null;
+        }
       }
     },
   },

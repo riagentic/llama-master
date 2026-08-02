@@ -68,6 +68,23 @@ export type ModelMeta = {
   outputBytes: number;
   /** Tensors whose ggml type this build does not know — sizes exclude them. */
   unknownTypes: number;
+  /** Which part of a split set this header came from, and how many parts there
+   *  are (`split.no`, `split.count`). A model over ~40 GB is always split, and
+   *  each part holds only its own slice of the tensor table — so every byte
+   *  count above describes ONE PART until `mergeShards` has run over all of
+   *  them (`src/lib/shards.ts`). 0 = a single-file model. */
+  /** Sparse-attention indexer top-k (`attention.indexer.top_k`). Non-zero means
+   *  the compute buffer scales with the CONTEXT, not just the micro-batch —
+   *  see `plan.ts:computeScratch`. 0 = ordinary attention. */
+  /** The context the model was really trained at, before RoPE scaling stretched
+   *  the advertised one (`rope.scaling.original_context_length`). 0 = unscaled. */
+  nCtxOrig: number;
+  indexerTopK: number;
+  splitNo: number;
+  splitCount: number;
+  /** Tensors across every part (`split.tensors.count`) — the check that a merge
+   *  actually saw the whole model. */
+  splitTensors: number;
   layers: LayerBytes[];
 };
 
@@ -202,6 +219,10 @@ export type Build = {
    *  a tag is its own version, but "master" means nothing without the commit,
    *  and the update check has to compare against something. */
   sourceSha?: string;
+  /** `GGML_SCHED_MAX_SPLIT_INPUTS` this build was compiled with, when raised
+   *  above llama.cpp's stock 30 — the "bypass the graph-split limit" option.
+   *  Absent = stock. Recorded so a build that behaves differently says why. */
+  schedCap?: number;
 };
 
 export type Backend = "cpu" | "cuda" | "vulkan" | "hip" | "metal";
@@ -239,6 +260,11 @@ export type Prereq = {
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
+  /** The model's reasoning, when it thinks before answering — llama.cpp
+   *  streams a reasoning model's `<think>` block as `reasoning_content`,
+   *  separate from the answer. Kept so the reply's first half is never
+   *  invisible, shown folded so it never drowns the answer. */
+  thinking?: string;
   /** Server-reported timings, when the response carried them. */
   tps?: number;
 };

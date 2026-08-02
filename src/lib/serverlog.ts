@@ -27,6 +27,11 @@ export function extractErrors(lines: readonly string[]): string[] {
       /^(error|fatal|terminate called|Segmentation fault)/i.test(l.trim())
     ) {
       out.push(l.trim());
+    } // A ggml assert prints as `<path>.cpp:1367: GGML_ASSERT(...) failed` —
+    // no timestamp, no severity, and it IS the whole diagnosis. Missing it
+    // reduced a named hard limit to "exited with code 134".
+    else if (/GGML_ASSERT|ggml_abort|CUDA error/.test(l)) {
+      out.push(l.trim());
     }
   }
   return out;
@@ -51,26 +56,65 @@ export function signalOf(code: number): string | null {
 type Sig = {
   match: RegExp;
   reason: (m: RegExpExecArray) => string;
-  steps: Step[];
+  steps: Step[] | ((m: RegExpExecArray) => Step[]);
+};
+
+/**
+ * The allocation that failed, when llama.cpp named it: which card, how much.
+ *
+ * A failure on card 1 or later is PROOF the machine has more than one GPU, and
+ * that changes the diagnosis completely. llama.cpp divides the offloaded layers
+ * across cards by COUNT — free VRAM only chooses the proportions — so with
+ * `--n-cpu-moe` holding the first N layers' experts in RAM, the layers that
+ * still own their experts are many times heavier and all sit at the end, on the
+ * last card. That put 34 GB of a 38 GB plan on one 24 GB card while the other
+ * sat half empty, with 42 GB free across the machine (`src/lib/devsplit.ts`).
+ *
+ * Card 0 proves nothing — a single-GPU machine reports the same index — so it
+ * gets the ordinary "out of VRAM" answer.
+ */
+const CUDA_ALLOC =
+  /allocating\s+([\d.]+)\s*MiB on device (\d+):\s*cudaMalloc failed/i;
+
+const RESTART_OTHER: Step = {
+  text:
+    "If another llama-server is still running, stop it first — it holds its VRAM until it exits.",
 };
 
 const SIGNATURES: Sig[] = [
   {
     match:
       /cudaMalloc failed: out of memory|unable to allocate CUDA\d* buffer/i,
-    reason: () =>
-      "The GPU ran out of memory while loading the model. Something else is already using the VRAM, or too many layers were offloaded.",
-    steps: [
-      {
-        text:
-          "If another llama-server is still running, stop it first — it holds its VRAM until it exits.",
-      },
-      {
-        text:
-          "Otherwise lower “GPU layers” on the Tune tab, or shrink the context, and watch the VRAM bar: it shows what is already in use by other processes.",
-        action: { kind: "open-tab", tab: "dashboard" },
-      },
-    ],
+    reason: (m) => {
+      const a = CUDA_ALLOC.exec(m.input);
+      if (!a || Number(a[2]) < 1) {
+        return "The GPU ran out of memory while loading the model. Something else is already using the VRAM, or too many layers were offloaded.";
+      }
+      return `Card ${a[2]} was asked for ${
+        (Number(a[1]) / 1024).toFixed(1)
+      } GB in a single allocation and did not have it. With more than one card that usually means the layers are divided badly rather than that the model is too big: llama.cpp splits them by count, and a layer that keeps its experts is many times heavier than one that does not.`;
+    },
+    steps: (m) => {
+      const a = CUDA_ALLOC.exec(m.input);
+      if (a && Number(a[2]) >= 1) {
+        return [
+          {
+            text:
+              "Re-run the tuner — it sizes each card separately and writes an explicit “Tensor split” for this model. Left empty, llama.cpp divides the layers by count from free memory, which is the guess that fails here.",
+            action: { kind: "open-tab", tab: "settings" },
+          },
+          RESTART_OTHER,
+        ];
+      }
+      return [
+        RESTART_OTHER,
+        {
+          text:
+            "Otherwise lower “GPU layers” on the Tune tab, or shrink the context, and watch the VRAM bar: it shows what is already in use by other processes.",
+          action: { kind: "open-tab", tab: "dashboard" },
+        },
+      ];
+    },
   },
   {
     match:
@@ -119,6 +163,53 @@ const SIGNATURES: Sig[] = [
     ],
   },
   {
+    // AFTER the cudaMalloc signature (a named allocation is more specific) and
+    // BEFORE the generic CUDA-error one: `CUDA error: out of memory` is not a
+    // driver mismatch, it is VRAM running out at the first real forward pass —
+    // CUDA allocates its compute scratch (activation-quantise buffers, cuBLAS
+    // workspace, graphs) lazily, so a run can pass /health and die on the first
+    // prompt. Telling that user "the build and driver do not match, use Vulkan"
+    // sent a real user to a slower backend when a smaller context was the fix.
+    match: /CUDA error: out of memory/i,
+    reason: () =>
+      "The GPU ran out of memory during generation, after loading fine: CUDA allocates compute scratch at the first real batch, and the card had nothing left to give. The plan was too tight, not wrong — a smaller context or one fewer GPU layer is the fix.",
+    steps: [
+      {
+        text:
+          "Press Start again with “Optimal automatically” on — the app steps the context down by itself when a run dies for want of memory, and remembers the size that works.",
+      },
+      {
+        text:
+          "Or lower the context or “GPU layers” by hand on the Tune tab, and watch the VRAM bar while generating.",
+        action: { kind: "open-tab", tab: "dashboard" },
+      },
+    ],
+  },
+  {
+    // Not memory at all: a hard compile-time cap in llama.cpp's backend
+    // scheduler. With part of the model on the CPU (routed experts) and the
+    // rest across GPUs, every step's graph is cut at the device boundaries,
+    // and past a model-specific context one split needs more cross-device
+    // inputs than GGML_SCHED_MAX_SPLIT_INPUTS allows. Measured on
+    // DeepSeek-V4 on 2×24 GB: 262,144 generates, 524,288 trips this assert
+    // during load — before any large allocation was attempted. Reporting it
+    // as "crash inside llama.cpp, try another backend" sent the user counting
+    // RAM they did not lack.
+    match: /GGML_SCHED_MAX_SPLIT_INPUTS/,
+    reason: () =>
+      "llama.cpp hit a hard limit building the compute graph — not a memory shortage. With part of the model in system RAM and the rest on the GPUs, an extreme context needs more cross-device transfers per step than llama.cpp's scheduler supports, and it stops at an assert before allocating anything.",
+    steps: [
+      {
+        text:
+          "Lower the pinned context. The largest size that has actually generated on this machine is remembered and used as the automatic ceiling — the bands on the context control are safe picks.",
+      },
+      {
+        text:
+          "CPU only sidesteps the limit entirely (one device, no graph splits) — at CPU speed, which for an extreme context means very long prompt processing.",
+      },
+    ],
+  },
+  {
     match: /CUDA error|no CUDA-capable device|forward compatibility/i,
     reason: () =>
       "The CUDA runtime rejected the device. The build and the installed driver do not match.",
@@ -148,7 +239,12 @@ export function diagnoseServerExit(
 
   for (const s of SIGNATURES) {
     const m = s.match.exec(haystack);
-    if (m) return { reason: s.reason(m), steps: s.steps };
+    if (m) {
+      return {
+        reason: s.reason(m),
+        steps: typeof s.steps === "function" ? s.steps(m) : s.steps,
+      };
+    }
   }
 
   const sig = code === null ? null : signalOf(code);

@@ -35,7 +35,8 @@ import {
   startServer,
   stopServer,
 } from "./actions.ts";
-import { optimalCtx, pinnedCtx, PLACEMENTS } from "../lib/tune.ts";
+import { pinnedCtx, PLACEMENTS, trainedCtx } from "../lib/tune.ts";
+import { elapsedLabel } from "../lib/loadprogress.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { CtxControls } from "./CtxControls.tsx";
 import { MemoryDetail } from "./MemoryDetail.tsx";
@@ -47,6 +48,7 @@ import {
   Pill,
   Ring,
   Spark,
+  Thinking,
   Toggle,
   Waiting,
 } from "./kit.tsx";
@@ -62,6 +64,7 @@ import {
   currentStatePlan,
   driftNow,
   headroomNow,
+  loadingNow,
   memoryIsLive,
   projectedSpeed,
   projectedStatePlan,
@@ -222,6 +225,27 @@ function RunStrip() {
     tunedFor.current = key;
     applyOptimal();
   });
+  // Write down a context that ACTUALLY generated. `proven`, not `healthy`:
+  // /health only proves the weights loaded, and a DeepSeek-V4 run passed it at
+  // 17,408 tokens then OOM'd on its first prompt — recording at /health wrote
+  // that lie down as a fact, and rememberFit only ever grows, so it would have
+  // opened every later run at a size measured to crash. For a model whose
+  // buffers the planner cannot derive from its header this is the only measured
+  // fact the app will ever have (`src/lib/fitladder.ts`). Keyed so it fires
+  // once per successful start, not once per frame.
+  const notedFit = useRef("");
+  afterRender(() => {
+    if (!srv.proven || !srv.runModel) return;
+    const ctx = Number(srv.runSettings?.ctxSize ?? 0);
+    const k = `${srv.runModel}|${ctx}|${srv.startedAt}`;
+    if (notedFit.current === k || ctx <= 0) return;
+    notedFit.current = k;
+    // A run that walked the ladder is a measurement that the RECORD was too
+    // high — the opening bid is capped at the record, and the ladder only
+    // engages after that bid actually died. Replace it; growing-only would
+    // re-run the crash at the top of every session.
+    cfg.rememberFit({ model: srv.runModel, ctx, exact: srv.fitTries > 0 });
+  });
   // Learn this machine's real bandwidth from the reply it just produced. The
   // speed estimate is bandwidth ÷ bytes-per-token, and bandwidth is the one term
   // that cannot be read off the machine — so the app ships a labelled default and
@@ -240,7 +264,12 @@ function RunStrip() {
   const locked = runLocked();
   const st = currentStability();
   const all = placements();
-  const target = m?.meta ? optimalCtx(m.meta) : 0;
+  // The PIN ceiling is the advertised length (`trainedCtx`), not the tuner's
+  // native-first aim: DeepSeek-V4 advertises 1,048,576 over a 65,536 native
+  // range, and clamping a user's Max to 64k here contradicted the Models page
+  // showing 1M for the same file. The auto-tuner still aims at the native
+  // length on its own (`optimalCtx`, src/lib/tune.ts).
+  const target = m?.meta ? trainedCtx(m.meta) : 0;
   // What would actually run: while a server is up, its context; otherwise the
   // context the SELECTED placement reaches. Showing `cfg.settings.ctxSize`
   // instead would display a number left over from the last model until the user
@@ -367,6 +396,7 @@ function RunStrip() {
       </div>
 
       <DriftNote />
+      <LoadNote />
 
       <div class="run-actions">
         <StatusBig />
@@ -448,6 +478,41 @@ function RunStrip() {
  * instead of failing at Start, and one that can says how much context it
  * reaches — which is the whole basis for choosing between them.
  */
+/**
+ * Minutes of "loading model" with nothing moving reads as a hang.
+ *
+ * Everything an honest bar needs is already measured every second: the
+ * device-wide VRAM drop since the spawn plus the process RSS, against the
+ * plan's total for the running command; the server's own log names the phase.
+ * The total is an estimate and says so — the movement is what matters.
+ */
+function LoadNote() {
+  const lp = loadingNow();
+  if (!lp) return null;
+  const m = shownModel();
+  return (
+    <div class="info-note load-note" t="load-note">
+      <div class="load-note-head">
+        <span>
+          Loading <b>{m?.file ?? "model"}</b> — {lp.phase}
+        </span>
+        <span class="spacer" />
+        <span class="load-note-nums">
+          {bytes(lp.loadedB)} of ~{bytes(lp.totalB)} ·{" "}
+          {elapsedLabel(Date.now() - lp.startedAt)}
+        </span>
+      </div>
+      <Bar
+        value={lp.loadedB}
+        max={Math.max(lp.totalB, lp.loadedB)}
+        tone="accent"
+        height={8}
+      />
+      {lp.note ? <p class="load-note-fit">{lp.note}</p> : null}
+    </div>
+  );
+}
+
 /**
  * The machine moved after this model was loaded.
  *
@@ -550,6 +615,13 @@ function PlacementAdvice(
 function PlacementPicker(
   props: { all: Record<Placement, Tuning> | null; locked: boolean },
 ) {
+  // With a PINNED context a refused placement stays selectable: the refusal
+  // is the compute-scratch estimate talking, the estimate is deliberately
+  // pessimistic, and it has been measured wrong in this direction (a 512k
+  // pin ran where the plan said no). The pin is an instruction and the
+  // allocator has the final say at Start — hard-disabling the button made an
+  // estimate overrule both.
+  const pinned = ctxOverride() > 0;
   return (
     <div class="placements" t="placements">
       {PLACEMENTS.map((p) => {
@@ -562,8 +634,12 @@ function PlacementPicker(
             type="button"
             class={`placement${on ? " on" : ""}${dead ? " dead" : ""}`}
             t={`placement-${p.id}`}
-            disabled={props.locked || dead}
-            title={props.locked ? LOCK_REASON : t?.blocker || p.tip}
+            disabled={props.locked || (dead && !pinned)}
+            title={props.locked
+              ? LOCK_REASON
+              : dead && pinned
+              ? `${t?.blocker} That is the plan's ESTIMATE — the compute scratch cannot be read from the header, and it has been measured pessimistic. You can still select this placement and Start; the allocator has the final say.`
+              : t?.blocker || p.tip}
             onClick={() => cfg.setPlacement(p.id)}
           >
             <span class="placement-name">{p.label}</span>
@@ -574,6 +650,8 @@ function PlacementPicker(
                 ? `${t.ctx.toLocaleString()} ctx${
                   t.ctx >= t.optimalCtx ? " · full" : ""
                 }`
+                : pinned
+                ? "estimate says no — yours to try"
                 : "does not fit"}
             </span>
           </button>
@@ -687,18 +765,27 @@ function MiniChat() {
                     {msg.role}
                     {msg.tps ? ` · ${tps(msg.tps)} tok/s` : ""}
                   </div>
-                  <div class="msg-body">{msg.content}</div>
+                  <Thinking text={msg.thinking} />
+                  <div class="msg-body">
+                    {msg.content ||
+                      (msg.thinking
+                        ? "(the reply ended while still thinking — its reasoning is above)"
+                        : msg.content)}
+                  </div>
                 </div>
               ))}
-              {chat.partial
+              {chat.partial || chat.partialThink
                 ? (
                   <div class="msg msg-assistant">
                     <div class="msg-role">assistant</div>
+                    <Thinking text={chat.partialThink} live={!chat.partial} />
                     <div class="msg-body">{chat.partial}</div>
                   </div>
                 )
                 : null}
-              {chat.streaming && !chat.partial ? <Waiting /> : null}
+              {chat.streaming && !chat.partial && !chat.partialThink
+                ? <Waiting />
+                : null}
             </>
           )}
       </div>
@@ -755,21 +842,18 @@ export function OnePage() {
   const projected = projectedStatePlan();
   return (
     <div class="one-page" t="one-page">
-      <div class="one-main">
-        <OrphanBanner />
-        {srv.diagnosis && srv.status === "crashed"
-          ? (
-            <Guidance
-              diagnosis={srv.diagnosis}
-              tone="error"
-              t="one-srv-failed"
-            />
-          )
-          : <ErrorNote message={srv.lastError || chat.lastError} />}
+      {
+        /* Three columns, each one section wide, each the answer to one question:
+           what the machine is doing (left), what to run on it (middle), what it
+           says back (right). Every panel spans exactly its column — a panel that
+           spanned two made the eye track across the fold and back, and the page
+           read as a scroll instead of a glance. Each column scrolls alone, so a
+           long flag catalog never pushes the chat off screen. */
+      }
+      <div class="one-col" t="one-col-machine">
         <Panel
           title="Machine"
           icon="▦"
-          wide
           right={
             <>
               <Pill tone={hw.paused ? "warn" : "ok"}>
@@ -789,17 +873,14 @@ export function OnePage() {
         </Panel>
 
         {
-          /* The page reads top to bottom as the decision itself: what the machine
-           is doing NOW, then the settings that change it, then what those
-           settings would give. Both states are on screen at once because they
-           answer different questions and the user needs both while choosing —
-           one visualisation with a mode switch made whichever question you were
+          /* Both memory states are on screen at once because they answer
+           different questions and the user needs both while choosing — one
+           visualisation with a mode switch made whichever question you were
            not currently asking unavailable. */
         }
         <Panel
           title="Current Memory State"
           icon="▤"
-          wide
           right={
             <Pill tone={live ? "ok" : "idle"}>
               {live ? "a model is running" : "nothing running"}
@@ -820,28 +901,8 @@ export function OnePage() {
         </Panel>
 
         <Panel
-          title={running ? "Running" : "Run a model"}
-          icon="▶"
-          wide
-          right={chat.lastTps > 0
-            ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
-            : null}
-        >
-          <RunStrip />
-          <AllSettings />
-        </Panel>
-
-        {
-          /* Memory gets its own panel because it is the question this app exists
-           to answer, and it needs the room: the picture, then every byte of it
-           in words. While a server is up both describe THAT process, computed
-           from the command it was started with — not from whatever has since
-           been typed into the form. */
-        }
-        <Panel
           title="Projected Memory State"
           icon="▦"
-          wide
           right={
             <Pill tone="idle">
               {live ? "after replacing what runs" : "after starting"}
@@ -886,6 +947,41 @@ export function OnePage() {
       </div>
 
       {
+        /* The decision column: everything that changes what runs, with every
+          message about the run — the orphan banner, the diagnosis, and the
+          server log the diagnosis points at — in the same column, so "the log
+          below" is literally below. */
+      }
+      <div class="one-col" t="one-col-run">
+        <OrphanBanner />
+        {srv.diagnosis && srv.status === "crashed"
+          ? (
+            <Guidance
+              diagnosis={srv.diagnosis}
+              tone="error"
+              t="one-srv-failed"
+            />
+          )
+          : <ErrorNote message={srv.lastError || chat.lastError} />}
+        <Panel
+          title={running ? "Running" : "Run a model"}
+          icon="▶"
+          right={chat.lastTps > 0
+            ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
+            : null}
+        >
+          <RunStrip />
+          <AllSettings />
+        </Panel>
+        {
+          /* The log takes every remaining pixel of the column — during a long
+          load it IS the page, and capping it at ten rows wasted the space
+          under it. */
+        }
+        {srv.log.length > 0 ? <ServerLog fill /> : null}
+      </div>
+
+      {
         /* Chat is a column, not a panel at the bottom of a scroll. A reply is the
           thing you are waiting for, so it should be beside the numbers that
           produced it rather than below them — and given the full height, it
@@ -895,12 +991,6 @@ export function OnePage() {
         <Panel title="Chat" icon="✉">
           <MiniChat />
         </Panel>
-        {
-          /* The diagnosis says "the log below" — so it has to be on this page,
-            not one tab away. Absent until the server has actually said
-            something. */
-        }
-        {srv.log.length > 0 ? <ServerLog rows={10} /> : null}
       </aside>
     </div>
   );

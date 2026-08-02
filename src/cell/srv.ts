@@ -10,6 +10,7 @@ import { cell, own } from "aio";
 import type { CellEffect } from "aio";
 import { appendLog } from "../lib/buildlog.ts";
 import { diagnoseServerExit } from "../lib/serverlog.ts";
+import { ctxOf, fitDecision, withCtx } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
 
@@ -44,6 +45,18 @@ export type SrvState = {
   /** `/health` result, refreshed by the poll while running. */
   healthy: boolean;
   healthDetail: string;
+  /** A probe is in flight. Polls overlap — each is an async dispatch on a 1 s
+   *  schedule, and the probe takes seconds on a big model — so without this
+   *  three concurrent polls each ran their own probe (observed live: three
+   *  27-token generations in the server log before the first chat). */
+  probing: boolean;
+  /** This run has produced tokens — /health only proves the weights loaded,
+   *  and a plan that is too tight can pass /health and still OOM at the first
+   *  real batch, because CUDA allocates its compute scratch lazily. `ready` is
+   *  only entered through a one-shot generation probe, and THIS is the flag
+   *  `cfg.rememberFit` waits for: recording a context at /health once wrote
+   *  down 17,408 as a working size for a model that could not answer "Hi". */
+  proven: boolean;
   /** `/props` — what the server reports it actually loaded. */
   props: Record<string, unknown> | null;
   log: string[];
@@ -57,6 +70,20 @@ export type SrvState = {
   orphans: { pid: number; argv: string }[];
   freeing: boolean;
   lastError: string;
+  /** Automatic retries already spent on this Start.
+   *
+   *  Some models cannot be sized from their header — a sparse-attention MoE
+   *  asked for a 68 GiB compute buffer where the planner predicted 730 MB — so
+   *  when a run dies for want of memory the app halves the context and tries
+   *  again rather than reporting a number it had no way to know
+   *  (`src/lib/fitladder.ts`). Reset by a Start the user asked for, so a manual
+   *  attempt never inherits an exhausted ladder. */
+  fitTries: number;
+  /** Whether this run may be retried at all: off when the user is driving the
+   *  settings by hand, because shrinking a context they chose is not a fix. */
+  autoFit: boolean;
+  /** What the last automatic step-down did, in words, for the panel. */
+  fitNote: string;
 };
 
 export const srv = cell("srv", {
@@ -77,6 +104,8 @@ export const srv = cell("srv", {
     url: "",
     healthy: false,
     healthDetail: "",
+    probing: false,
+    proven: false,
     props: null as Record<string, unknown> | null,
     log: [] as string[],
     seq: 0,
@@ -84,6 +113,9 @@ export const srv = cell("srv", {
     orphans: [] as { pid: number; argv: string }[],
     freeing: false,
     lastError: "",
+    fitTries: 0,
+    autoFit: false,
+    fitNote: "",
   } as SrvState,
   methods: {
     /** Spawn llama-server with the exact command shown in the UI.
@@ -103,14 +135,26 @@ export const srv = cell("srv", {
         model: string;
         settings: Settings;
         freeAtStart?: { vramB: number; ramB: number };
+        /** May this run be retried at a smaller context if it dies for want of
+         *  memory? On when the tuner chose the settings, off when the user did. */
+        autoFit?: boolean;
+        /** Set only by the retry itself, so the ladder is not reset by its own
+         *  next rung. */
+        retry?: boolean;
       },
     ): Promise<CellEffect | void> {
       if (s.status === "starting" || s.status === "ready") return;
       s.status = "starting";
+      if (!run?.retry) {
+        s.fitTries = 0;
+        s.fitNote = "";
+        s.autoFit = run?.autoFit ?? false;
+      }
       s.lastError = "";
       s.exitCode = null;
       s.healthy = false;
       s.healthDetail = "";
+      s.proven = false;
       s.props = null;
       s.log = [];
       s.diagnosis = null;
@@ -171,6 +215,7 @@ export const srv = cell("srv", {
         s.pid = 0;
         s.healthy = false;
         s.healthDetail = "";
+        s.proven = false;
         s.props = null;
         s.runSettings = null;
         s.runModel = "";
@@ -211,10 +256,55 @@ export const srv = cell("srv", {
           const d = diagnoseServerExit(st.exitCode, st.lines);
           s.diagnosis = d;
           s.lastError = d.reason;
+
+          // ...unless a smaller context would fix it, in which case try that
+          // before reporting anything. For models whose buffers cannot be
+          // derived from the header this is not a fallback, it is the only way
+          // the right number is ever found — the planner's estimate is the
+          // opening bid and the allocator has the final say. Rewriting `-c` in
+          // the argv we already ran keeps "what you see is what runs" true:
+          // this IS the command, one number smaller.
+          const decision = fitDecision({
+            lines: st.lines,
+            ctx: ctxOf(s.argv),
+            tries: s.fitTries,
+            auto: s.autoFit,
+          });
+          if (decision.kind === "retry") {
+            const next = withCtx(s.argv, decision.ctx);
+            s.fitTries += 1;
+            s.fitNote = decision.note;
+            s.argv = next;
+            if (s.runSettings) s.runSettings.ctxSize = decision.ctx;
+            s.log = appendLog(s.log.slice(), [
+              `[llama.master] ${decision.note}`,
+            ]);
+            s.status = "starting";
+            s.diagnosis = null;
+            s.lastError = "";
+            s.exitCode = null;
+            s.healthy = false;
+            s.proven = false;
+            s.rssB = 0;
+            try {
+              const { pid } = io.start(next);
+              s.pid = pid;
+              s.startedAt = Date.now();
+              return own.set("srv:process", () => ({
+                close: () => {
+                  void io.stopOwned(pid);
+                },
+              }));
+            } catch (e) {
+              s.status = "crashed";
+              s.lastError = String(e);
+            }
+          }
         }
         s.pid = 0;
         s.exitCode = st.exitCode;
         s.healthy = false;
+        s.proven = false;
         s.rssB = 0;
         return;
       }
@@ -234,8 +324,38 @@ export const srv = cell("srv", {
       s.healthDetail = h.detail;
       if (h.ok) {
         if (s.status !== "ready") { // aiol-ok — see the note above
-          s.status = "ready";
-          s.props = await io.props(s.url);
+          // One real forward pass before claiming ready: /health only proves
+          // the weights loaded, and a too-tight plan OOMs at the first real
+          // batch because CUDA allocates compute scratch lazily. If the probe
+          // kills the process, the next poll's crash branch diagnoses it and
+          // the fit ladder steps the context down — which is the ladder doing
+          // its job on generation, not just on loading.
+          //
+          // One probe, not one per poll: polls overlap (the probe takes
+          // seconds, the schedule fires every one), and the check-and-set is
+          // adjacent synchronous statements so a second poll cannot slip
+          // between them.
+          if (s.probing) return; // aiol-ok — see the note above
+          s.probing = true;
+          s.healthDetail = "proving a first reply";
+          try {
+            const p = await io.probe(s.url); // aiol-ok — see the note above
+            if (p.kind === "dead") {
+              // The connection dropped mid-probe: the process is most likely
+              // dying of the OOM the probe provoked. Say nothing yet — the
+              // next poll sees the exit and owns the diagnosis.
+              s.healthDetail = p.detail;
+              return;
+            }
+            // `refused` (an old build without /completion) still becomes
+            // ready — but unproven, so the fit is never recorded off it.
+            s.proven = p.kind === "ok";
+            s.status = "ready";
+            s.healthDetail = "ready";
+            s.props = await io.props(s.url);
+          } finally {
+            s.probing = false;
+          }
         }
       } else if (s.status === "ready") { // aiol-ok — see the note above
         // Was ready, now is not: the model is reloading or the server is wedged.

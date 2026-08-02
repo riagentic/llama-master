@@ -10,7 +10,7 @@
 
 import { cell } from "aio";
 import type { MethodDraftMeta } from "aio";
-import { deltaText, parseSse, timingsTps } from "../lib/sse.ts";
+import { deltaReasoning, deltaText, parseSse, timingsTps } from "../lib/sse.ts";
 import type { ChatMessage } from "../lib/types.ts";
 
 export type ChatState = {
@@ -20,6 +20,10 @@ export type ChatState = {
   streaming: boolean;
   /** Text of the in-flight assistant reply, before it is committed. */
   partial: string;
+  /** The in-flight reasoning, for models that think before answering. A
+   *  reasoning model's whole first act arrives on this channel with `content`
+   *  empty — leaving it out rendered "thinking" as a spinner over nothing. */
+  partialThink: string;
   /** Tokens/second reported by llama-server for the last completion. */
   lastTps: number;
   lastError: string;
@@ -39,6 +43,7 @@ export const chat = cell("chat", {
     system: "",
     streaming: false,
     partial: "",
+    partialThink: "",
     lastTps: 0,
     lastError: "",
   } as ChatState,
@@ -53,6 +58,7 @@ export const chat = cell("chat", {
     clear(s) {
       s.messages = [];
       s.partial = "";
+      s.partialThink = "";
       s.lastError = "";
       s.lastTps = 0;
     },
@@ -88,6 +94,7 @@ export const chat = cell("chat", {
       s.input = "";
       s.streaming = true;
       s.partial = "";
+      s.partialThink = "";
       s.lastError = "";
 
       try {
@@ -115,6 +122,7 @@ export const chat = cell("chat", {
         const dec = new TextDecoder();
         let buf = "";
         let acc = "";
+        let think = "";
         let tps = 0;
         let lastFlush = 0;
 
@@ -128,28 +136,49 @@ export const chat = cell("chat", {
           for (const e of events) {
             if (e.data === "[DONE]") continue;
             acc += deltaText(e.data);
+            // A reasoning model's whole first act arrives on this channel
+            // with `content` empty (measured on DeepSeek-V4). Reading only
+            // `content` showed a spinner over nothing for the entire think,
+            // and a reply that stopped mid-think appended no message at all.
+            think += deltaReasoning(e.data);
             tps = timingsTps(e.data) ?? tps;
           }
           const now = Date.now();
           if (now - lastFlush >= FLUSH_MS) {
             lastFlush = now;
             s.partial = acc;
+            s.partialThink = think;
           }
         }
 
-        if (acc) s.messages.push({ role: "assistant", content: acc, tps });
+        // Anything arrived — answer, reasoning, or both — is a message. A
+        // reply that ran out of tokens mid-think must say so on screen, not
+        // vanish.
+        if (acc || think) {
+          s.messages.push({
+            role: "assistant",
+            content: acc,
+            ...(think ? { thinking: think } : {}),
+            tps,
+          });
+        }
         s.lastTps = tps;
       } catch (e) {
         if (s.$signal?.aborted) {
           // A user-cancelled stream is not an error; keep whatever arrived.
-          if (s.partial) {
-            s.messages.push({ role: "assistant", content: s.partial });
+          if (s.partial || s.partialThink) {
+            s.messages.push({
+              role: "assistant",
+              content: s.partial,
+              ...(s.partialThink ? { thinking: s.partialThink } : {}),
+            });
           }
         } else {
           s.lastError = String(e);
         }
       } finally {
         s.partial = "";
+        s.partialThink = "";
         s.streaming = false;
       }
     },

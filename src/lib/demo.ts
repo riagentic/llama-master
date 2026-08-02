@@ -88,6 +88,11 @@ function meta(over: Partial<ModelMeta>): ModelMeta {
     embdBytes: 0,
     outputBytes: 0,
     unknownTypes: 0,
+    nCtxOrig: 0,
+    indexerTopK: 0,
+    splitNo: 0,
+    splitCount: 0,
+    splitTensors: 0,
     layers: [],
     ...over,
   };

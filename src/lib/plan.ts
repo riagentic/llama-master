@@ -11,6 +11,14 @@
 
 import type { Gpu, Hw, ModelMeta, Settings } from "./types.ts";
 import { bool, num, str } from "./params.ts";
+import {
+  deviceBudgets,
+  loadPerDevice,
+  offloadRange,
+  packSlots,
+  slotOnGpu,
+  tensorSplitValue,
+} from "./devsplit.ts";
 
 /** Bytes per cached element, by `-ctk`/`-ctv` value. Block quants carry their
  *  scales, hence the fractional sizes (q8_0 = 34 bytes per 32 elements). */
@@ -74,8 +82,48 @@ export type Plan = {
   kvPerTokenB: number;
   kvTotalB: number;
   fits: boolean;
+  /** How the offloaded slots divide across the cards — the answer to "will one
+   *  of them be asked for more than it has", which the aggregate cannot give.
+   *  Empty on a single-GPU or CPU-only plan. */
+  devices: DevicePlan;
   /** Plain-language observations, ordered most important first. */
   notes: string[];
+};
+
+/** Per-card placement, and the `-ts` that pins it. */
+export type DevicePlan = {
+  /** Bytes each card holds, in `hw.gpus` order. */
+  bytesB: number[];
+  /** Room each card had for them. */
+  budgetsB: number[];
+  /** The `-ts` value that produces this placement, or "" when none is needed. */
+  tensorSplit: string;
+  /** False when no contiguous division of the layers fits the cards, however
+   *  well the totals add up. */
+  fits: boolean;
+  /**
+   * What each CARD is asked to hold, for the picture. A second GPU is not a
+   * bigger GPU, and one pooled VRAM bar hid exactly the question a two-card
+   * machine asks: which card is full, with what. Weights come from the slot
+   * packing; the KV cache follows its layers (apportioned by each card's
+   * share of the offloaded slots); compute scratch is per device. When the
+   * packing fails, this is the best-effort fill — cards to their budgets, in
+   * order — so the picture still shows how far the model got.
+   */
+  cards: {
+    name: string;
+    capacityB: number;
+    /** Already in use by everything else, measured now. */
+    otherB: number;
+    weightsB: number;
+    kvB: number;
+    computeB: number;
+    /** Past this card's capacity, after everything above. */
+    overB: number;
+  }[];
+  /** Layer bytes no card could take at all — the part of the model with
+   *  nowhere to go, distinct from any single card running over. */
+  unplacedB: number;
 };
 
 const MB = 1024 * 1024;
@@ -227,6 +275,11 @@ export const NO_MODEL: ModelMeta = {
   embdBytes: 0,
   outputBytes: 0,
   unknownTypes: 0,
+  nCtxOrig: 0,
+  indexerTopK: 0,
+  splitNo: 0,
+  splitCount: 0,
+  splitTensors: 0,
   layers: [],
 };
 
@@ -276,50 +329,65 @@ function vramInUse(gpus: Gpu[]): number {
  * Place a model under one settings map on one machine.
  *
  * Placement rules mirror llama.cpp:
- * - `-ngl N` offloads the **last** N transformer layers.
- * - `-ngl > nLayer` also offloads the output head and the embedding table.
+ * - `-ngl N` offloads the last N **slots**, and there are `nLayer + 1` of them —
+ *   the output head counts as one. So `-ngl 43` on a 43-layer model offloads
+ *   layers 1..42 AND the output, leaving layer 0 on the host; only
+ *   `-ngl > nLayer` offloads every layer (`src/lib/devsplit.ts:offloadRange`).
+ * - The token embedding table is NEVER offloaded. llama.cpp classifies it as an
+ *   input tensor and pins those to the CPU regardless of `-ngl` — "there is very
+ *   little benefit to offloading the input layer" (`llama-model.cpp`,
+ *   `dev_input`). Billing it to VRAM cost ~1 GB of a card's budget that was
+ *   always going to be spent on the host.
  * - `--n-cpu-moe N` keeps the routed experts of the **first** N layers in RAM,
  *   even when those layers are otherwise on the GPU.
  * - `-nkvo` moves the whole KV cache to RAM regardless of layer placement.
  */
 export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   const nLayer = meta.nLayer;
-  const ngl = num(s, "ngl");
-  const layersOnGpu = Math.max(0, Math.min(ngl, nLayer));
-  const fullOffload = ngl > nLayer;
+  const off = offloadRange(nLayer, s);
   const moeOnCpu = Math.max(0, Math.min(num(s, "nCpuMoe"), nLayer));
   const ctx = effectiveCtx(meta, s);
   const kvPerTokenB = kvPerToken(meta, s);
   const kvTotalB = kvTotal(meta, s, ctx);
   const kvOnCpu = bool(s, "noKvOffload");
+  const outputOnGpu = slotOnGpu(nLayer, off);
 
-  // Layer placement: the last `layersOnGpu` indices go to the GPU.
-  const firstGpuLayer = nLayer - layersOnGpu;
+  // Per-slot GPU bytes, in slot order — the shape `devsplit` needs to cut into
+  // per-card ranges, and the sums the pools need. Slot `nLayer` is the output.
+  const kvPerLayerB = kvOnCpu || nLayer <= 0 ? 0 : kvTotalB / nLayer;
+  const slotCostsB: number[] = [];
   let gpuDense = 0;
   let gpuExperts = 0;
   let cpuWeights = 0;
-  for (const l of meta.layers) {
+  let layersOnGpu = 0;
+  for (let i = 0; i < nLayer; i++) {
+    const l = meta.layers[i];
     // Same reasoning as `kvPerToken`: these come out of the file, and a layer
     // whose experts are larger than the layer itself would otherwise make the
     // dense figure negative and every total after it wrong.
-    const bytes = whole(l.bytes);
-    const expert = Math.min(whole(l.expert), bytes);
+    const bytes = whole(l?.bytes ?? 0);
+    const expert = Math.min(whole(l?.expert ?? 0), bytes);
     const dense = bytes - expert;
-    const onGpu = l.i >= firstGpuLayer;
-    const expertsHere = l.i < moeOnCpu ? 0 : expert;
+    const onGpu = slotOnGpu(i, off);
+    const expertsHere = i < moeOnCpu ? 0 : expert;
     if (onGpu) {
+      layersOnGpu++;
       gpuDense += dense;
       gpuExperts += expertsHere;
       cpuWeights += expert - expertsHere;
+      slotCostsB.push(dense + expertsHere + kvPerLayerB);
     } else {
       cpuWeights += bytes;
     }
   }
-  if (fullOffload) {
-    gpuDense += whole(meta.outputBytes) + whole(meta.embdBytes);
+  // The output head moves with `-ngl`; the embedding table never does.
+  if (outputOnGpu) {
+    gpuDense += whole(meta.outputBytes);
+    slotCostsB.push(whole(meta.outputBytes));
   } else {
-    cpuWeights += meta.outputBytes + meta.embdBytes;
+    cpuWeights += whole(meta.outputBytes);
   }
+  cpuWeights += whole(meta.embdBytes);
 
   // KV follows its layer, unless -nkvo pins all of it to the host.
   const kvGpuShare = nLayer > 0 ? layersOnGpu / nLayer : 0;
@@ -331,7 +399,7 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   // shape of the graph; the backend context is a flat per-process cost.
   const ubatch = Math.max(1, num(s, "ubatchSize"));
   const activation = ubatch * whole(meta.nEmbd) * 4;
-  const usingGpu = layersOnGpu > 0 || fullOffload;
+  const usingGpu = off.count > 0 && hw.gpus.length > 0;
 
   // Speculative decoding with the model's own MTP block costs a SECOND context —
   // llama.cpp measures "only context+compute are new", because the drafting
@@ -346,7 +414,7 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
 
   const gpuCompute = usingGpu
     ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length) +
-      mtpDraftB
+      mtpDraftB + computeScratch(meta, ubatch, ctx)
     : 0;
   // On a CPU-only run the draft context is just as real, minus the GPU backend
   // half — it lands in RAM, where a tight MTP run is exactly the case that
@@ -354,6 +422,80 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   const cpuCompute =
     (layersOnGpu < nLayer || !usingGpu ? activation * 2 : 32 * MB) +
     (usingGpu ? 0 : mtpKvB);
+
+  // Where each slot actually lands. The aggregate above says whether the model
+  // fits the machine; this says whether any single card is being asked for more
+  // than it has, which is a different question and the one that OOMs.
+  // The scratch lands ON a device, so it comes out of that device's budget too.
+  const perDeviceOverheadB = usingGpu
+    ? BACKEND_CONTEXT_B + activation * 4 + computeScratch(meta, ubatch, ctx)
+    : 0;
+  const budgetsB = deviceBudgets(hw.gpus, perDeviceOverheadB);
+  const counts = usingGpu ? packSlots(slotCostsB, budgetsB) : [];
+
+  // The per-card picture — including when the packing FAILS. That is the
+  // moment the user most needs to see it, so the display falls back to a
+  // best-effort fill (cards to their budgets, in order) and reports the
+  // remainder as bytes with nowhere to go.
+  let displayCounts = counts;
+  let unplacedB = 0;
+  if (usingGpu && counts === null) {
+    const dc = budgetsB.map(() => 0);
+    let dev = 0;
+    let used = 0;
+    for (const cost of slotCostsB) {
+      while (dev < budgetsB.length && used + cost > (budgetsB[dev] ?? 0)) {
+        dev++;
+        used = 0;
+      }
+      if (dev >= budgetsB.length) {
+        unplacedB += cost;
+        continue;
+      }
+      dc[dev] = (dc[dev] ?? 0) + 1;
+      used += cost;
+    }
+    displayCounts = dc;
+  }
+  const perCardBytes = displayCounts
+    ? loadPerDevice(slotCostsB, displayCounts)
+    : [];
+  const slotsPlaced = displayCounts
+    ? displayCounts.reduce((a, c) => a + c, 0)
+    : 0;
+  const cards = usingGpu
+    ? hw.gpus.map((g, i) => {
+      const n = displayCounts?.[i] ?? 0;
+      const weightsB = perCardBytes[i] ?? 0;
+      const kvB = slotsPlaced > 0 && !kvOnCpu
+        ? whole(kvOnGpu * (n / slotsPlaced))
+        : 0;
+      const computeB = n > 0 || i === 0 ? perDeviceOverheadB : 0;
+      const otherB = g.vramUsedB;
+      const overB = Math.max(
+        0,
+        otherB + weightsB + kvB + computeB - g.vramTotalB,
+      );
+      return {
+        name: g.name || `GPU ${i}`,
+        capacityB: g.vramTotalB,
+        otherB,
+        weightsB,
+        kvB,
+        computeB,
+        overB,
+      };
+    })
+    : [];
+
+  const devices: DevicePlan = {
+    bytesB: counts ? loadPerDevice(slotCostsB, counts) : [],
+    budgetsB,
+    tensorSplit: counts ? tensorSplitValue(counts) : "",
+    fits: counts !== null,
+    cards,
+    unplacedB,
+  };
 
   const vramCapacity = sum(hw.gpus.map((g) => g.vramTotalB));
   const ramCapacity = hw.mem?.totalB ?? 0;
@@ -391,13 +533,29 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
       } — the OS will swap or the load will be killed.`,
     );
   }
+  // The failure the totals cannot see: enough VRAM across the machine, and no
+  // way to cut the layers so that each card holds its share. llama.cpp divides
+  // the offloaded run by COUNT, and `--n-cpu-moe` makes the last layers many
+  // times heavier than the first, so they pile onto the last card.
+  if (vram.overB === 0 && !devices.fits && hw.gpus.length > 1) {
+    notes.push(
+      `This fits across the cards but not on them: llama.cpp splits the layers by count, and with the experts held back the last layers are far heavier than the first. Lower GPU layers or move more experts to RAM.`,
+    );
+  }
+  if (unplacedB > 0) {
+    notes.push(
+      `${
+        fmtGb(unplacedB)
+      } of layers have no card that can hold them — the map shows each card filled as far as it goes, and this remainder is what does not fit anywhere.`,
+    );
+  }
   // Advice needs something to advise about. With no model (the "what is the
   // machine doing right now" view goes through here as NO_MODEL) a note telling
   // the user to raise their GPU layers is noise attached to an idle machine.
   const haveModel = nLayer > 0;
   if (hw.gpus.length === 0) {
     notes.push("No GPU detected — everything runs on the CPU.");
-  } else if (haveModel && layersOnGpu === 0 && !fullOffload) {
+  } else if (haveModel && off.count === 0) {
     notes.push(
       "GPU layers is 0, so the GPU is idle. Raise it to use the card.",
     );
@@ -414,16 +572,59 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
 
   return {
     nLayer,
-    layersOnGpu: fullOffload ? nLayer : layersOnGpu,
+    layersOnGpu,
     moeOnCpu,
     ctx,
     vram,
     ram,
     kvPerTokenB,
     kvTotalB,
-    fits: vram.overB === 0 && ram.overB === 0,
+    fits: vram.overB === 0 && ram.overB === 0 && devices.fits,
+    devices,
     notes,
   };
+}
+
+/**
+ * Attention scratch that grows with the CONTEXT — the term that was missing.
+ *
+ * For ordinary attention the compute buffer is a flat per-process cost plus a
+ * few micro-batch-sized activations, which is what the rest of `plan` assumes
+ * and what holds for almost every model. A sparse-attention model breaks it:
+ * DeepSeek-V4's "lightning indexer" scores the WHOLE context for every token in
+ * the micro-batch, so the graph holds tensors of `ubatch x ctx`, and the cost
+ * rises linearly with the context instead of not at all.
+ *
+ * How wrong that was: at a 1,048,576 context llama.cpp asked for a **68.5 GiB**
+ * compute buffer where this function's absence left the estimate at 730 MB. The
+ * app therefore proposed a context that could not be allocated on any machine
+ * and any split — 68 GiB of scratch does not fit two 24 GB cards however the
+ * layers are divided. Every "it still crashed" came back to this number.
+ *
+ * `SCRATCH_TENSORS` is MEASURED, not derived: 68.5 GiB / (512 x 1,048,576 x 4 B)
+ * = 34.3 score-sized tensors live in the graph at once. A GGUF header does not
+ * say how many, so this is calibrated against a real allocation and rounded up.
+ * Being a little pessimistic here is the right direction: it costs some context,
+ * where being optimistic costs a failed load after a two-minute wait.
+ *
+ * Gated on the model DECLARING the indexer, so nothing changes for the models
+ * where the flat estimate was already correct.
+ *
+ * Wiring this in was only safe once the tuner stopped maximising the context:
+ * priced honestly against the old objective, the search bought context by
+ * evicting layers and settled on `-ngl 1` at a 654,848 context — which fits,
+ * and runs at CPU speed. `tune.ts` now fixes residency first, so a scratch that
+ * grows with the context costs CONTEXT, which is the correct thing for it to
+ * cost.
+ */
+export function computeScratch(
+  meta: ModelMeta,
+  ubatch: number,
+  ctx: number,
+): number {
+  if (whole(meta.indexerTopK) <= 0) return 0;
+  const SCRATCH_TENSORS = 34;
+  return whole(Math.max(1, ubatch) * whole(ctx) * 4 * SCRATCH_TENSORS);
 }
 
 function fmtGb(b: number): string {

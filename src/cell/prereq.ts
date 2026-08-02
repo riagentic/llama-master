@@ -9,6 +9,8 @@ import { appendLog } from "../lib/buildlog.ts";
 export type PrereqState = {
   items: Prereq[];
   scanning: boolean;
+  /** Monotonic scan generation — newest scan wins (see `scan`). */
+  scanEpoch: number;
   lastScan: number;
   /** Non-null while CMake is downloading — drives the progress bar. */
   install: { label: string; received: number; total: number | null } | null;
@@ -30,6 +32,7 @@ export const prereq = cell("prereq", {
   state: {
     items: [] as Prereq[],
     scanning: false,
+    scanEpoch: 0,
     lastScan: 0,
     install: null as PrereqState["install"],
     plans: {} as Record<string, FixPlan>,
@@ -40,7 +43,10 @@ export const prereq = cell("prereq", {
   } as PrereqState,
   methods: {
     async scan(s) {
-      if (s.scanning) return;
+      // Newest wins, never first-wins — same rule as `builds.scan`: a
+      // concurrent `await scan()` must not be a silent no-op, and an older
+      // scan must not overwrite a newer one's result.
+      const epoch = ++s.scanEpoch;
       s.scanning = true;
       try {
         const io = await import("./prereq.server.ts");
@@ -48,6 +54,7 @@ export const prereq = cell("prereq", {
         // commit points, and the panel rendered half-populated between them.
         const items = await io.detect();
         const plans = await io.plansFor(items.map((i) => i.id));
+        if (epoch !== s.scanEpoch) return; // aiol-ok — superseded, discard
         s.items = items;
         s.plans = plans;
         s.lastScan = Date.now();
@@ -55,7 +62,7 @@ export const prereq = cell("prereq", {
       } catch (e) {
         s.lastError = String(e);
       } finally {
-        s.scanning = false;
+        if (epoch === s.scanEpoch) s.scanning = false; // aiol-ok — see above
       }
     },
     /** Install one missing prerequisite. Streams the installer's own output —

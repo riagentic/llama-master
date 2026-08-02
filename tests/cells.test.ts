@@ -6,7 +6,7 @@
 // on this machine — because a mocked filesystem would only prove the mock
 // agrees with the code.
 
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { bootCells, testCell } from "aio/testing";
 import { join } from "@std/path";
 
@@ -56,9 +56,16 @@ testCell(
 testCell(
   cfg,
   "an unknown parameter throws rather than writing a dead field",
-  (t) => {
+  async (t) => {
     t.init();
-    assertThrows(() => t.send.set("nglll", "8"), Error, "unknown parameter");
+    // aio alpha43: a call starts when made and a method's throw REJECTS, as in
+    // production — `assertThrows` around a dispatch asserts nothing, and the
+    // unawaited rejection used to cancel every later test in this file.
+    await assertRejects(
+      () => Promise.resolve(t.send.set("nglll", "8")),
+      Error,
+      "unknown parameter",
+    );
     t.expect.state((s) => s.settings.nglll === undefined);
   },
 );
@@ -83,6 +90,23 @@ testCell(cfg, "reset returns every parameter to its default", (t) => {
   t.expect.state((s) => s.touched.length === 0);
   t.expect.state((s) => s.settings.mlock === false);
 });
+
+testCell(
+  cfg,
+  "rememberFit grows by default, replaces when the ladder ran",
+  (t) => {
+    t.init();
+    t.send.rememberFit({ model: "/m.gguf", ctx: 32_768 });
+    // A smaller PROVEN run by choice does not shrink the record…
+    t.send.rememberFit({ model: "/m.gguf", ctx: 8_192 });
+    t.expect.state((s) => s.fitCtx["/m.gguf"] === 32_768);
+    // …but a ladder run measured the record itself as too high: the opening bid
+    // is capped at the record, and the ladder only engages after that bid died.
+    // Growing-only here re-ran the crash at the top of every session.
+    t.send.rememberFit({ model: "/m.gguf", ctx: 16_384, exact: true });
+    t.expect.state((s) => s.fitCtx["/m.gguf"] === 16_384);
+  },
+);
 
 testCell(cfg, "resetOne only touches its own parameter", (t) => {
   t.init();
@@ -214,6 +238,11 @@ testCell(
     t.expect.state((s) => s.jobs === 0);
     t.send.setJobs(9999);
     t.expect.state((s) => s.jobs === 512);
+    // Off by default — a stock llama.cpp unless the user asks — and plain
+    // state once asked.
+    t.expect.state((s) => s.bypassSchedCap === false);
+    t.send.setBypassSchedCap(true);
+    t.expect.state((s) => s.bypassSchedCap === true);
   },
 );
 

@@ -341,6 +341,51 @@ export async function health(
   }
 }
 
+/**
+ * One real forward pass, so "ready" means "can actually answer".
+ *
+ * /health only proves the weights loaded. CUDA allocates its compute scratch
+ * (activation-quantise buffers, cuBLAS workspace, graphs) lazily at the first
+ * real batch, so a run planned too tight passes /health and dies on the first
+ * prompt — measured on DeepSeek-V4: healthy at 17,408 tokens of context, then
+ * `CUDA error: out of memory` inside `quantize_row_q8_1_cuda` the moment the
+ * user said "Hi". A few dozen prompt tokens and a couple of generated ones walk
+ * the same allocation path, which makes the fit ladder's verdict cover
+ * generation instead of just loading.
+ *
+ * Three outcomes, and the caller treats them differently: `ok` (it generated),
+ * `refused` (the process is alive but the endpoint said no — an old build
+ * without /completion; readiness proceeds, the fit stays unproven), `dead`
+ * (the connection failed — the process is most likely dying of exactly the
+ * failure this probe exists to provoke; the poll's crash path will see it).
+ */
+export async function probe(
+  baseUrl: string,
+  timeoutMs = 120_000,
+): Promise<{ kind: "ok" | "refused" | "dead"; detail: string }> {
+  try {
+    const res = await fetch(`${baseUrl}/completion`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        // Long enough to exercise the batched prompt path, not just decode.
+        prompt:
+          "The quick brown fox jumps over the lazy dog. Counting to twelve: " +
+          "one two three four five six seven eight nine ten eleven twelve.",
+        n_predict: 2,
+        temperature: 0,
+        cache_prompt: false,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await res.text();
+    if (res.ok) return { kind: "ok", detail: "generated" };
+    return { kind: "refused", detail: `${res.status}: ${body.slice(0, 120)}` };
+  } catch (e) {
+    return { kind: "dead", detail: String(e) };
+  }
+}
+
 /** `/props` — what the server says it actually loaded. Worth showing, because
  *  it is the ground truth against which the settings panel is only a request. */
 export async function props(
