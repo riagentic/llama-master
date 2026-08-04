@@ -1,4 +1,5 @@
 {
+  "aioVersion": "v1.0.0-alpha44",
   "name": "llama-master",
   "title": "llama.master",
   "version": "0.3.0",
@@ -7,7 +8,12 @@
   "compilerOptions": {
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "lib": ["deno.ns", "deno.unstable", "dom", "dom.iterable"],
+    "lib": [
+      "deno.ns",
+      "deno.unstable",
+      "dom",
+      "dom.iterable"
+    ],
     "jsx": "react-jsx",
     "jsxImportSource": "aio"
   },
@@ -46,9 +52,19 @@
     "verify": "deno fmt --check src/ tests/ && deno lint src/ tests/ && deno check src/ tests/ && deno test -A tests/"
   },
   "fmt": {
-    "exclude": ["dep/", "dist/", "rust/target/", "node_modules/"]
+    "exclude": [
+      "dep/",
+      "dist/",
+      "rust/target/",
+      "node_modules/"
+    ]
   },
   "lint": {
-    "exclude": ["dep/", "dist/", "rust/", "node_modules/"]
+    "exclude": [
+      "dep/",
+      "dist/",
+      "rust/",
+      "node_modules/"
+    ]
   }
 }

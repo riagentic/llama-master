@@ -3,245 +3,85 @@
 A desktop app for [llama.cpp](https://github.com/ggml-org/llama.cpp): get it,
 find your models, work out what will actually fit, run it, talk to it.
 
-llama.cpp is excellent and its command line is long. The two questions that cost
-the most time are _"which build do I need on this machine?"_ and _"will this
-model fit, and at what context?"_ — this answers both, with real numbers, before
-anything is started.
-
 ![llama.master](docs/screenshot.png)
 
-<sub>Screenshot taken in demo mode (`LLAMA_MASTER_DEMO=1`): the machine, the
-models and the build shown in it are fictional.</sub>
+<sub>Demo mode (`LLAMA_MASTER_DEMO=1`) — the machine, the models and the build
+shown are fictional.</sub>
 
-> **0.1.3.** Developed and tested on Linux/x86_64 with NVIDIA and AMD hardware.
-> The macOS and Windows paths are implemented but have not been run by the
-> author; see [Status](#status).
->
-> _Since 0.1.1:_
->
-> - **Speculative decoding, on by default where the model supports it.** A model
->   that ships a multi-token-prediction block (`nextn_predict_layers`) now gets
->   `--spec-type draft-mtp` as part of optimal settings. It is lossless by
->   construction — the full model verifies every drafted token, so the output is
->   exactly what it would have been and only the speed changes — and the block
->   is loaded either way, so leaving it off paid for it and got nothing. Never
->   set for a model without one: llama.cpp refuses to load, and the control says
->   so rather than offering a flag that cannot work.
-> - **Every dropdown showed the wrong value.** Flash attention displayed `auto`
->   while `-fa on` ran; the KV cache type showed `f32` while `q8_0` ran. The
->   settings were right and the page was misreporting them, which is the exact
->   opposite of what this app promises. Found only by reading a live client —
->   the in-process test harness did not reproduce it.
-> - **Prerequisites and Storage are their own pages.** Storage says which of the
->   disk is _ours_ — `df` tells you a disk is full, not that 40 GB of it is
->   three builds you stopped using.
-> - **The all-in-one page fits one window**, with chat as a full-height column
->   beside the numbers rather than a panel below them.
-> - **Estimated tokens/second**, with a meter banded on reading speed: under 5
->   tok/s you wait for the model, over 20 it outruns your eyes. Bytes-per-token
->   are exact; the bandwidth starts from a labelled default and calibrates from
->   your first real reply.
-> - **Context has named Min / Opt / Big / Max sizes** and a drawn usable range,
->   on both the all-in-one and Tune pages. Only Max is read from the model; the
->   rest are marked `≈`.
-> - Per-method performance budgets replace one global ceiling, and the memory
->   plan accounts for the MTP draft context before it is enabled.
-
-## What it does
-
-**Gets llama.cpp.** Prebuilt release or built from source, for CPU, CUDA,
-Vulkan, ROCm or Metal. It works out whether the build you picked can actually
-succeed _before_ enabling the button — a missing `nvcc`, a CUDA toolkit older
-than your GPU, Vulkan without SPIRV-Headers — and when something can be
-installed for you, it offers to, showing the exact command first.
-
-**Finds your models.** Plain `.gguf` trees, LM Studio, and ollama — including
-ollama's blob store, which contains no `.gguf` files at all and is only
-navigable through its manifests.
-
-**Says what will fit.** The GGUF header is parsed in Rust and walked
-tensor-by-tensor, so weights, routed experts and KV cache are counted exactly
-rather than estimated — including sliding-window and MLA attention, which a
-uniform formula overstates several-fold. Only the compute buffer is an estimate,
-and it is labelled as one everywhere it appears.
-
-**Chooses settings.** One set of optimal settings; you choose _where_ the model
-runs:
-
-|               |                                                                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **VRAM only** | Every layer on the GPU. Fastest, and bounded by the card.                                                                                               |
-| **Hybrid**    | GPU for what fits, RAM for the rest. On a mixture-of-experts model the routed experts move first — they are most of the bytes and least of the latency. |
-| **CPU only**  | No GPU. Works anywhere.                                                                                                                                 |
-
-Each aims at the model's **trained context** — the longest context at which it
-still performs as designed — and takes the largest that fits without exceeding
-it. The picker shows what each placement would give, so a placement that cannot
-run this model says so instead of failing at load.
-
-**Runs it, and tells the truth about it.** One model at a time. While it runs,
-the memory view describes _that process_, computed from the command it was
-started with and shown next to its measured RSS — not a projection of whatever
-has since been typed into the form. A server that dies is diagnosed from its own
-output ("the GPU ran out of memory", with the stray process still holding the
-VRAM offered up for stopping), never as a bare exit code.
-
-## Requirements
-
-- **Linux, macOS or Windows** on x86_64 or arm64
-- **[Deno](https://deno.com) 2.9+**
-- Nothing else. CMake and SPIRV-Headers are downloaded into the app's own
-  directory when a source build needs them; a prebuilt release needs no
-  toolchain at all.
-
-A GPU is optional — CPU only is a first-class placement, not a fallback.
-
-## Running it
-
-One line, from nothing: it installs Deno, the
-[aio](https://github.com/riagentic/aio) framework and `am` if they are missing,
-clones this repo, repairs the checkout, builds the production target and runs
-it.
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/riagentic/aio/main/run.sh | sh -s riagentic/llama-master
 ```
 
-PowerShell:
+Installs [Deno](https://deno.com) and the
+[aio](https://github.com/riagentic/aio) framework if they are missing, clones,
+builds and runs. Nothing else is needed: CMake and SPIRV-Headers are downloaded
+into the app's own directory if a source build of llama.cpp asks for them, and a
+prebuilt llama.cpp needs no toolchain.
 
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/riagentic/aio/main/run.ps1))) -Git riagentic/llama-master
-```
-
-### From a clone
-
-llama.master vendors aio by symlink rather than as a package, so clone the two
-side by side. **aio `1.0.0-alpha44` or newer** — this release is developed and
-tested against it.
+From a clone — aio is vendored by symlink, so the two sit side by side:
 
 ```sh
 git clone https://github.com/riagentic/aio.git
 git clone https://github.com/riagentic/llama-master.git
-cd llama-master
-mkdir -p dep && ln -s ../../aio dep/aio
-
-deno task install:electron   # once — allows electron's postinstall to run
-deno task dev                # the desktop app
-```
-
-Other entry points:
-
-```sh
-deno task dev:browser                 # the same app in a browser tab
-LLAMA_MASTER_DEMO=1 deno task dev     # fictional machine and models, for a look around
-```
-
-### Build it
-
-```sh
-deno task compile             # a self-contained binary → dist/
-deno task compile:electron    # a desktop package (AppImage on Linux, zip elsewhere)
-```
-
-Both land in `dist/` with a `manifest.json` beside them; the artifact needs no
-Deno, no node_modules and no checkout.
-
-### Run it as a managed app
-
-`am` is aio's app manager, and it is the fastest way to start, watch and
-question a running llama.master —
-[`dep/aio/docs/clients/app-manager.md`](https://github.com/riagentic/aio):
-
-```sh
-deno task am start            # start detached (refuses a second instance)
-deno task am status           # stopped | starting | started, with the port
-deno task am state hw.gpus    # any slice of live state, by dot-path
-deno task am surface 0        # every component and control on screen, by name
-deno task am trigger 0 "App/Rail:tab-server" click     # drive the real UI
-deno task am stop
-```
-
-And the thing it is all for — the llama.cpp server it started answers on its own
-port, so `curl` reaches it directly:
-
-```sh
-PORT=8080   # whatever the Port setting says; the app prints the URL
-
-curl -s 127.0.0.1:$PORT/health                    # is it up
-curl -s 127.0.0.1:$PORT/props | jq .model_path    # what is loaded
-curl -s 127.0.0.1:$PORT/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"hi"}],"stream":false}'
-```
-
-Turn **Available on LAN** on (all-in-one page → _How it runs_) and the same URLs
-work from any other machine on the network — the switch prints the address to
-use.
-
-### The client
-
-`client/` is a second, standalone app: a chat client for a llama.master running
-on another machine. It discovers one on the network or takes an address, shows
-what model is loaded and how busy the server is, and chats with it. It never
-starts, stops or configures anything.
-
-```sh
-cd client
-deno task install:electron
+cd llama-master && mkdir -p dep && ln -s ../../aio dep/aio
+deno task am fix    # import paths, electron, config
 deno task dev
 ```
 
-Everything the server app writes lives in `~/.llama-master/` —
-`data/files/builds/` holds the llama.cpp builds it installed, and `cache/` holds
-downloads and source trees and can be deleted at any time. Set
-`LLAMA_MASTER_HOME` to put it elsewhere (builds are gigabytes).
+`deno task compile` produces a self-contained binary in `dist/`;
+`compile:electron` a desktop package.
+
+## What it does
+
+- **Gets llama.cpp** — prebuilt or built from source, for CPU, CUDA, Vulkan,
+  ROCm or Metal. It checks the build can actually succeed before enabling the
+  button, and offers to install what is missing, showing the command first.
+- **Finds your models** — plain `.gguf` trees, LM Studio, and ollama's blob
+  store, which has no `.gguf` files in it at all.
+- **Says what will fit** — the GGUF header is parsed in Rust and walked
+  tensor-by-tensor, so weights, routed experts and KV cache are exact. Only the
+  compute buffer is an estimate, and it says so everywhere it appears.
+- **Chooses settings** — one set of optimal settings; you choose where it runs
+  (VRAM only · Hybrid · CPU only), each at the largest context that fits.
+- **Runs it, and tells the truth about it** — the memory view describes the
+  process that is running, not the form. A server that dies is diagnosed from
+  its own output, never as a bare exit code.
+- **Keeps the machine usable** — reserved VRAM and RAM the plan may not spend,
+  and llama.cpp at the lowest OS priority so the desktop stays responsive.
+
+`client/` is a second, standalone app: a chat client for a llama.master running
+on another machine. It finds one on the network, shows what is loaded and how
+busy it is, and chats with it — `cd client && deno task dev`.
 
 ## Status
 
-Honest about what has and has not been exercised:
-
-- **Linux/x86_64** — developed here. CPU, CUDA and Vulkan built from source and
-  run; CPU, Vulkan and ROCm installed from prebuilt releases and run. Real
-  models up to 39 GB, real inference.
-- **macOS / Windows / arm64** — the code paths exist and are unit-tested, but
-  nothing has been run on that hardware. Reports welcome.
-- **Metal** — refused with an explanation off Apple hardware; untested on it.
+Developed on Linux/x86_64 with NVIDIA and AMD hardware: CPU, CUDA and Vulkan
+built from source and run; CPU, Vulkan and ROCm installed from prebuilt releases
+and run; real models up to 145 GB. The macOS, Windows and arm64 paths are
+implemented and unit-tested but have not been run by the author. Metal is
+refused with an explanation off Apple hardware, and untested on it.
 
 ## Development
 
 ```sh
-deno task verify        # fmt · lint · check · test — the pre-merge gate
-deno task test:rust     # the Rust core
-deno task wasm          # rebuild src/llama-sys.wasm after editing rust/
-deno task aiol          # the aio framework linter
-deno task doctor        # the checkout itself: import map, jsx, electron, pin
-cd client && deno task verify   # the client has its own gate, and its own tests
+deno task verify                 # fmt · lint · check · test — the gate
+deno task test:rust              # the Rust core
+deno task am state hw.gpus       # question the running app
+cd client && deno task verify    # the client has its own gate
 ```
 
-The client shares llama.master's pure libraries — the SSE parser, the reply
-splitter, the formatters — as a policed copy: aio serves a browser bundle only
-from inside an app's own root, so `client/src/shared/` is generated by
-`cd client && deno task sync` and a test fails the moment it drifts.
-
-The app mark lives in `src/icon.svg`; the packagers read `src/icon.png`, so
-re-export it after editing the SVG (a guard test fails if the PNG is older):
-
-```sh
-inkscape --export-type=png --export-filename=src/icon.png -w 512 -h 512 src/icon.svg
-```
-
-Architecture, and the decisions worth knowing before changing anything, are in
-[CLAUDE.md](CLAUDE.md): `src/lib/` is pure and holds every rule, `src/cell/` is
-state, `src/ui/` is presentation, and the boundaries between them are
-load-bearing.
+Everything the app writes lives in `~/.llama-master/`; set `LLAMA_MASTER_HOME`
+to move it (builds are gigabytes). The decisions worth knowing before changing
+anything are in [CLAUDE.md](CLAUDE.md).
 
 ## Credits
 
 The engine is [llama.cpp](https://github.com/ggml-org/llama.cpp) by Georgi
 Gerganov and its contributors — all inference, and every binary this app builds
-or installs, is theirs. This is a front end.
-
-Built on [aio](https://github.com/riagentic/aio).
+or installs, is theirs. This is a front end. Built on
+[aio](https://github.com/riagentic/aio).
 
 ## License
 
