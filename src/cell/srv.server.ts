@@ -12,7 +12,7 @@
 
 import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
-import { paths, PLATFORM } from "./host.server.ts";
+import { exec, paths, PLATFORM } from "./host.server.ts";
 
 /** Trailing separator so `/builds-evil` cannot pass a `/builds` prefix test. */
 const BIN_NAME = PLATFORM === "windows" ? "llama-server.exe" : "llama-server";
@@ -202,6 +202,48 @@ export function status(): Status {
   };
 }
 
+/**
+ * Make a running llama-server yield to everything else on the machine.
+ *
+ * By pid, after the spawn, rather than by wrapping the command in `nice`:
+ * wrapping would put `/usr/bin/nice` at the front of the argv, and this module
+ * refuses any binary outside the builds root — a sandbox rule, not a formality
+ * — while the command strip would stop describing what actually runs
+ * (`src/lib/priority.ts` carries the whole reasoning).
+ *
+ * Never throws and never blocks a start: a machine without `renice`, or a
+ * container that refuses the idle I/O class, gets a line in the log saying so
+ * and a server that runs anyway.
+ */
+export async function lowerPriority(pid: number): Promise<string> {
+  const { ioFallback, priorityNote, prioritySteps } = await import(
+    "../lib/priority.ts"
+  );
+  const done: string[] = [];
+  const failed: string[] = [];
+  for (const step of prioritySteps(pid)) {
+    const r = await exec(step.cmd, step.args);
+    if (r.code === 0) {
+      done.push(step.what);
+      continue;
+    }
+    // The idle I/O class is refused on some kernels and in some containers.
+    // Best-effort at its lowest band always works, and is most of the benefit.
+    if (step.cmd === "ionice") {
+      const alt = ioFallback(pid);
+      const r2 = await exec(alt.cmd, alt.args);
+      if (r2.code === 0) {
+        done.push(alt.what);
+        continue;
+      }
+    }
+    failed.push(`${step.cmd}: ${(r.stderr || r.stdout || "failed").trim()}`);
+  }
+  const note = priorityNote(done, failed);
+  push(note);
+  return note;
+}
+
 /** Spawn llama-server. Throws if one is already running or the binary will not
  *  start — never returns a half-started state. */
 export function start(argv: string[]): { pid: number } {
@@ -326,7 +368,12 @@ export async function stop(graceMs = 5000): Promise<void> {
     }
     await s.child.status;
   }
-  slot = null;
+  // Only if it is still OURS. `stop` awaits the child's exit, and a start can
+  // land in that window — clearing the slot unconditionally then erased the
+  // record of a process that was up, and every later stop, rss reading and
+  // liveness poll worked from "nothing is running" while llama-server held
+  // 39 GB of VRAM.
+  if (slot === s) slot = null;
 }
 
 /** Ask the running server whether it is ready to serve. */

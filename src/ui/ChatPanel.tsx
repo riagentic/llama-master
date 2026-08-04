@@ -10,33 +10,10 @@ import { srv } from "../cell/srv.ts";
 import { num } from "../lib/params.ts";
 import { tps } from "../lib/format.ts";
 import { endpoint } from "./actions.ts";
-import { Empty, ErrorNote, Panel, Pill, Thinking, Waiting } from "./kit.tsx";
-import { canSend } from "./derive.ts";
+import { CopyButton, Empty, ErrorNote, Panel, Pill, Waiting } from "./kit.tsx";
+import { ChatMessage } from "./ChatMessage.tsx";
+import { canSend, chatHasContent, chatTranscript } from "./derive.ts";
 import { useStickyBottom } from "./sticky.ts";
-
-function Message(
-  props: {
-    role: string;
-    content: string;
-    thinking?: string;
-    live?: boolean;
-    tps?: number;
-  },
-) {
-  return (
-    <div class={`msg msg-${props.role}`}>
-      <div class="msg-role">{props.role}</div>
-      <Thinking text={props.thinking} live={props.live && !props.content} />
-      <div class="msg-body">
-        {props.content ||
-          (props.thinking && !props.live
-            ? "(the reply ended while still thinking — its reasoning is above)"
-            : props.content)}
-      </div>
-      {props.tps ? <div class="msg-meta">{tps(props.tps)} tok/s</div> : null}
-    </div>
-  );
-}
 
 export function ChatPanel() {
   const ready = srv.status === "ready";
@@ -57,7 +34,19 @@ export function ChatPanel() {
             {chat.lastTps > 0
               ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
               : null}
-            <button type="button" class="btn tiny" onClick={() => chat.clear()}>
+            <CopyButton
+              text={chatTranscript()}
+              title="Copy the whole conversation as markdown"
+              label="Copy chat"
+              t="chat-copy"
+            />
+            <button
+              type="button"
+              class="btn tiny"
+              t="chat-clear"
+              disabled={!chatHasContent()}
+              onClick={() => chat.clear()}
+            >
               Clear
             </button>
           </>
@@ -86,7 +75,7 @@ export function ChatPanel() {
             : (
               <>
                 {chat.messages.map((m, i) => (
-                  <Message
+                  <ChatMessage
                     key={String(i)}
                     role={m.role}
                     content={m.content}
@@ -96,7 +85,7 @@ export function ChatPanel() {
                 ))}
                 {chat.partial || chat.partialThink
                   ? (
-                    <Message
+                    <ChatMessage
                       role="assistant"
                       content={chat.partial}
                       thinking={chat.partialThink}

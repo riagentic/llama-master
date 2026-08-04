@@ -181,125 +181,140 @@ export function CtxControls(
         <span class="unit">tokens</span>
       </div>
 
-      <div class="ctx-bands" t={`${id}-bands`}>
-        {CTX_BANDS.map((band) => {
-          const n = bands?.[band.id] ?? 0;
-          return (
+      {
+        /* Everything below is disabled while a server is up — one model runs at
+           a time, and the context it runs at is fixed until it stops. Disabled
+           controls still cost their height, and on the all-in-one page that
+           height is the server log's: 180 pixels of buttons nobody can press,
+           above the output everybody reads during a load. So while the run is
+           locked they are not rendered at all; the number itself stays, because
+           what the running server is using is worth reading. */
+      }
+      {props.locked ? null : (
+        <>
+          <div class="ctx-bands" t={`${id}-bands`}>
+            {CTX_BANDS.map((band) => {
+              const n = bands?.[band.id] ?? 0;
+              return (
+                <button
+                  key={band.id}
+                  type="button"
+                  class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
+                  t={`${id}-${band.id}`}
+                  disabled={props.locked || n === 0}
+                  title={n === 0
+                    ? "Select a model with a readable header first"
+                    : `${band.label} CTX size — ${n.toLocaleString()} tokens. ${band.tip}`}
+                  onClick={() => cfg.setCtxOverride(n, models.selected)}
+                >
+                  {band.label} CTX
+                  {band.estimated ? <span class="est">≈</span> : null}
+                </button>
+              );
+            })}
             <button
-              key={band.id}
               type="button"
-              class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
-              t={`${id}-${band.id}`}
-              disabled={props.locked || n === 0}
-              title={n === 0
-                ? "Select a model with a readable header first"
-                : `${band.label} CTX size — ${n.toLocaleString()} tokens. ${band.tip}`}
-              onClick={() => cfg.setCtxOverride(n, models.selected)}
+              class={`btn tiny${pinned ? "" : " on"}`}
+              t={`${id}-optimal`}
+              disabled={props.locked || props.target === 0}
+              title={props.target > 0
+                ? `Let the tuner choose: the largest context this placement can hold, up to the ${props.target.toLocaleString()} tokens this model was trained for.`
+                : "Select a model with a readable header first"}
+              onClick={() => cfg.setCtxOverride(0)}
             >
-              {band.label} CTX
-              {band.estimated ? <span class="est">≈</span> : null}
+              Auto
             </button>
-          );
-        })}
-        <button
-          type="button"
-          class={`btn tiny${pinned ? "" : " on"}`}
-          t={`${id}-optimal`}
-          disabled={props.locked || props.target === 0}
-          title={props.target > 0
-            ? `Let the tuner choose: the largest context this placement can hold, up to the ${props.target.toLocaleString()} tokens this model was trained for.`
-            : "Select a model with a readable header first"}
-          onClick={() => cfg.setCtxOverride(0)}
-        >
-          Auto
-        </button>
-        {
-          /* The priority most sessions actually have, as one click each:
+            {
+              /* The priority most sessions actually have, as one click each:
             THIS placement, at the biggest context it can hold. The decision
             walk is "VRAM only? no — hybrid? no — CPU", and these two buttons
             are its first two questions, answered with the number attached. */
-        }
-        {(["vram", "hybrid"] as const).map((pl) => {
-          const t = props.meta ? maxFor(pl) : null;
-          const ok = t !== null && t.possible && t.ctx > 0;
-          const label = pl === "vram" ? "Max·VRAM" : "Max·Hybrid";
-          return (
-            <button
-              key={pl}
-              type="button"
-              class={`btn tiny${
-                ok && pinned && props.ctxNow === t.ctx &&
-                  cfg.placement === pl
-                  ? " on"
-                  : ""
-              }`}
-              t={`${id}-max-${pl}`}
-              disabled={props.locked || !ok}
-              title={props.locked
-                ? LOCK_REASON
-                : !props.meta
-                ? "Select a model with a readable header first"
-                : ok
-                ? `${
-                  pl === "vram" ? "VRAM only" : "Hybrid"
-                } at the largest context it can hold here: ${t.ctx.toLocaleString()} tokens. Sets the placement and pins the context in one click.`
-                : `${pl === "vram" ? "VRAM only" : "Hybrid"}: ${
-                  t?.blocker || "not possible for this model here"
-                }`}
-              onClick={() => pinMaxFor(pl)}
-            >
-              {label}
-              {ok ? <span class="dim">{` ${ctxLabel(t.ctx)}`}</span> : null}
-            </button>
-          );
-        })}
-      </div>
+            }
+            {(["vram", "hybrid"] as const).map((pl) => {
+              const t = props.meta ? maxFor(pl) : null;
+              const ok = t !== null && t.possible && t.ctx > 0;
+              const label = pl === "vram" ? "Max·VRAM" : "Max·Hybrid";
+              return (
+                <button
+                  key={pl}
+                  type="button"
+                  class={`btn tiny${
+                    ok && pinned && props.ctxNow === t.ctx &&
+                      cfg.placement === pl
+                      ? " on"
+                      : ""
+                  }`}
+                  t={`${id}-max-${pl}`}
+                  disabled={props.locked || !ok}
+                  title={props.locked
+                    ? LOCK_REASON
+                    : !props.meta
+                    ? "Select a model with a readable header first"
+                    : ok
+                    ? `${
+                      pl === "vram" ? "VRAM only" : "Hybrid"
+                    } at the largest context it can hold here: ${t.ctx.toLocaleString()} tokens. Sets the placement and pins the context in one click.`
+                    : `${pl === "vram" ? "VRAM only" : "Hybrid"}: ${
+                      t?.blocker || "not possible for this model here"
+                    }`}
+                  onClick={() => pinMaxFor(pl)}
+                >
+                  {label}
+                  {ok ? <span class="dim">{` ${ctxLabel(t.ctx)}`}</span> : null}
+                </button>
+              );
+            })}
+          </div>
 
-      <div class="ctx-presets" t={`${id}-presets`}>
-        {CTX_PRESETS.map((n) => {
-          const tooBig = props.target > 0 && n > props.target;
-          return (
-            <button
-              key={String(n)}
-              type="button"
-              class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
-              t={`${id}-${ctxLabel(n)}`}
-              disabled={props.locked || tooBig}
-              title={props.locked
-                ? LOCK_REASON
-                : tooBig
-                ? `This model was trained for ${props.target.toLocaleString()} tokens — past that, answers degrade rather than improve.`
-                : `Set the context to ${n.toLocaleString()} tokens`}
-              onClick={() => cfg.setCtxOverride(n, models.selected)}
-            >
-              {ctxLabel(n)}
-            </button>
-          );
-        })}
-      </div>
+          <div class="ctx-presets" t={`${id}-presets`}>
+            {CTX_PRESETS.map((n) => {
+              const tooBig = props.target > 0 && n > props.target;
+              return (
+                <button
+                  key={String(n)}
+                  type="button"
+                  class={`btn tiny${props.ctxNow === n && pinned ? " on" : ""}`}
+                  t={`${id}-${ctxLabel(n)}`}
+                  disabled={props.locked || tooBig}
+                  title={props.locked
+                    ? LOCK_REASON
+                    : tooBig
+                    ? `This model was trained for ${props.target.toLocaleString()} tokens — past that, answers degrade rather than improve.`
+                    : `Set the context to ${n.toLocaleString()} tokens`}
+                  onClick={() => cfg.setCtxOverride(n, models.selected)}
+                >
+                  {ctxLabel(n)}
+                </button>
+              );
+            })}
+          </div>
 
-      {
-        /* Some limits are llama.cpp's own and no plan arithmetic can see them:
+          {
+            /* Some limits are llama.cpp's own and no plan arithmetic can see them:
           DeepSeek-V4 on two cards generates at a pinned 262,144 and dies at
           524,288 on a scheduler assert, with memory to spare. What the app
           DOES know is what has been measured to work — so a pin beyond it is
           flagged before Start, not discovered minutes into a load. */
-      }
-      {(() => {
-        const proven = cfg.fitCtx[models.selected] ?? 0;
-        return pinned && proven > 0 && props.ctxNow > proven
-          ? (
-            <p class="warn-note ctx-beyond" t="ctx-beyond-measured">
-              Beyond the largest size measured to work here ({proven
-                .toLocaleString()}{" "}
-              tokens). The plan can price the memory, but llama.cpp also has
-              internal limits it only reveals by refusing — expect the start
-              itself to have the final say.
-            </p>
-          )
-          : null;
-      })()}
-      {props.meta ? <CtxRange meta={props.meta} ctxNow={props.ctxNow} /> : null}
+          }
+          {(() => {
+            const proven = cfg.fitCtx[models.selected] ?? 0;
+            return pinned && proven > 0 && props.ctxNow > proven
+              ? (
+                <p class="warn-note ctx-beyond" t="ctx-beyond-measured">
+                  Beyond the largest size measured to work here ({proven
+                    .toLocaleString()}{" "}
+                  tokens). The plan can price the memory, but llama.cpp also has
+                  internal limits it only reveals by refusing — expect the start
+                  itself to have the final say.
+                </p>
+              )
+              : null;
+          })()}
+          {props.meta
+            ? <CtxRange meta={props.meta} ctxNow={props.ctxNow} />
+            : null}
+        </>
+      )}
     </div>
   );
 }

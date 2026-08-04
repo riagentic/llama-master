@@ -39,12 +39,21 @@ import {
   withoutOurUsage,
 } from "../src/lib/plan.ts";
 import {
+  deviceBudgets,
   loadPerDevice,
   offloadRange,
   packSlots,
   slotOnGpu,
   tensorSplitValue,
 } from "../src/lib/devsplit.ts";
+import {
+  displayUnknown,
+  MAX_RESERVE_GB,
+  reserveBytes,
+  reserveGb,
+  reserveOf,
+  vramReserveShares,
+} from "../src/lib/reserve.ts";
 import {
   ctxOf,
   fitDecision,
@@ -81,6 +90,7 @@ import { appendLog, isError, progressOf } from "../src/lib/buildlog.ts";
 import {
   deltaReasoning,
   deltaText,
+  flushDelayMs,
   parseSse,
   timingsTps,
 } from "../src/lib/sse.ts";
@@ -168,6 +178,26 @@ import {
   loadPhase,
   loadProgress,
 } from "../src/lib/loadprogress.ts";
+import { loadTone } from "../src/lib/thermal.ts";
+import {
+  ioFallback,
+  niceFromProcStat,
+  priorityNote,
+  prioritySteps,
+} from "../src/lib/priority.ts";
+import {
+  isLanExposed,
+  lanHost,
+  lanUrl,
+  lanWarning,
+  pickLanIp,
+} from "../src/lib/lan.ts";
+import {
+  inlineChunks,
+  parseInfo,
+  replyBlocks,
+  transcript,
+} from "../src/lib/richtext.ts";
 import { gpu, hw, layers, meta, moeMeta, NO_GPU } from "./fixtures.ts";
 
 const GB = 1024 ** 3;
@@ -764,6 +794,45 @@ Deno.test("sse: CRLF framing and keep-alive frames are handled", () => {
     "a role-only frame has no text",
   );
   assertEquals(deltaText("not json"), "");
+});
+
+Deno.test("sse: the flush cadence holds the byte rate flat, not the interval", () => {
+  // The defect: a fixed 60 ms flush re-sends the WHOLE reply 16.7 times a
+  // second to every client, so the wire cost of one answer is quadratic in its
+  // length. A 23-minute chat session logged a sustained
+  // `PRESSURE — 33 broadcasts/sec` against a threshold of 30, with two windows
+  // open. The cadence must therefore depend on the size of what it re-sends.
+  const rate = (bytes: number) => (bytes * 1000) / flushDelayMs(bytes);
+
+  // Short reply: as fast as before — a fixed 60 ms is the floor, not the rule.
+  assertEquals(flushDelayMs(0), 60);
+  assertEquals(flushDelayMs(1_000), 60);
+
+  // Long reply: slower, and never slower than half a second.
+  assert(flushDelayMs(32_000) > 60, "a 32 KB reply must not flush at 16 Hz");
+  assertEquals(flushDelayMs(1_000_000), 500);
+
+  // The point of the whole thing: bytes/second stays inside the budget while
+  // the budget is what binds, where a fixed interval grows without bound.
+  for (const b of [1_000, 8_000, 32_000]) {
+    assert(
+      rate(b) <= 70_000,
+      `a ${b}-byte reply pushes ${Math.round(rate(b))} B/s`,
+    );
+  }
+  // Past that the ½-second liveness cap binds instead, so the rate does climb
+  // again — but a long reply still costs an order of magnitude less than the
+  // fixed 60 ms cadence it replaces, which is the whole complaint.
+  for (const b of [64_000, 250_000]) {
+    assert(
+      rate(b) < (b * 1000) / 60 / 8,
+      `a ${b}-byte reply must beat the fixed cadence by 8x`,
+    );
+  }
+
+  // A hostile/absent length can never make the cadence a busy loop.
+  assertEquals(flushDelayMs(NaN), 60);
+  assertEquals(flushDelayMs(-1), 60);
 });
 
 Deno.test("sse: llama.cpp timings surface as tokens/second", () => {
@@ -4151,4 +4220,518 @@ Deno.test("tune: aimFull drops the residency anchor — context outranks speed",
     full.reasons.some((r) => r.includes("Context first")),
     "and says which trade was made",
   );
+});
+
+// ── the memory the user keeps for themselves ───────────────────────────────
+//
+// A reserve is not a safety margin. The margins in `tune.ts` and `devsplit.ts`
+// exist so the allocator does not fail and the user never sees them; this one is
+// the user saying "that card also draws my desktop". So the test of it is not
+// "did a warning appear" — it is that the plan is SMALLER, everywhere, by
+// exactly what was asked for.
+
+Deno.test("reserve: per-GPU is charged to every card, connected only to the one with a screen", () => {
+  const r = (perGpuB: number, connectedB: number) => ({
+    perGpuB,
+    connectedB,
+    ramB: 0,
+  });
+  // The case the feature exists for: a display card and a compute card. The
+  // 8 GB defends the desktop and costs the headless card nothing — the old
+  // proportional split took 6 GB off a card nobody was drawing on.
+  const mixed = [gpu(24, 0.5, true), gpu(24, 0.5, false)];
+  assertEquals(vramReserveShares(mixed, r(0, 8 * GB)), [8 * GB, 0]);
+  // Per-GPU is the other claim, and it IS charged to everything.
+  assertEquals(vramReserveShares(mixed, r(2 * GB, 0)), [2 * GB, 2 * GB]);
+  // Both set: they add on the card that qualifies for both.
+  assertEquals(vramReserveShares(mixed, r(2 * GB, 8 * GB)), [10 * GB, 2 * GB]);
+  // A machine that answers "no displays anywhere" is taken at its word.
+  assertEquals(
+    vramReserveShares([gpu(24, 0.5, false)], r(0, 8 * GB)),
+    [0],
+    "a headless machine has no desktop to defend",
+  );
+  // A machine that cannot be asked is assumed to draw its screen on card 0 —
+  // far more often true than not, and the other way round is a driver reset.
+  assertEquals(vramReserveShares([gpu(24), gpu(8)], r(0, 4 * GB)), [4 * GB, 0]);
+  assert(displayUnknown([gpu(24)]), "and the UI is told it is an assumption");
+  assert(!displayUnknown([gpu(24, 0.5, false)]));
+  // Never more than the card holds, whatever was typed.
+  assertEquals(vramReserveShares([gpu(4, 0, true)], r(0, 99 * GB)), [4 * GB]);
+  assertEquals(vramReserveShares([], r(4 * GB, 4 * GB)), []);
+  assertEquals(vramReserveShares([gpu(24)], r(0, 0)), [0]);
+});
+
+/** A number typed into a box reaches this, so it has to survive anything a
+ *  number box can produce. A NaN reserve would poison every fit test it
+ *  touched, silently, because NaN comparisons are all false. */
+Deno.test("reserve: a hostile or impossible value is clamped, never propagated", () => {
+  assertEquals(reserveBytes(Number.NaN), 0);
+  assertEquals(reserveBytes(-4), 0);
+  assertEquals(reserveBytes(1e9), MAX_RESERVE_GB * GB, "capped, not infinite");
+  assertEquals(reserveGb(4 * GB), 4, "and reads back as the number typed");
+  // Clamped to the machine it applies to: 64 GB reserved on a 24 GB card means
+  // the card is entirely spoken for — which is an honest (if useless) answer —
+  // and never a negative capacity.
+  const r = reserveOf(
+    hw({
+      gpus: [gpu(24)],
+      reserve: { perGpuB: 64 * GB, connectedB: 64 * GB, ramB: 999 * GB },
+    }),
+  );
+  assertEquals(r.perGpuB, 24 * GB);
+  assertEquals(r.connectedB, 24 * GB);
+  assertEquals(r.ramB, 64 * GB);
+});
+
+Deno.test("plan: a reserve is spent memory — free shrinks by it, and it is labelled apart", () => {
+  const m = meta();
+  const s = { ...defaults(), ngl: 999 };
+  const open = plan(m, hw({ gpus: [gpu(24)] }), s);
+  const held = plan(
+    m,
+    hw({
+      gpus: [gpu(24)],
+      reserve: { perGpuB: 0, connectedB: 4 * GB, ramB: 16 * GB },
+    }),
+    s,
+  );
+  assertEquals(held.vram.reservedB, 4 * GB);
+  assertEquals(held.ram.reservedB, 16 * GB);
+  assertEquals(
+    held.vram.otherB,
+    open.vram.otherB,
+    "the reserve is NOT filed as another process — it is the one the user can take back",
+  );
+  assertEquals(
+    open.vram.freeB - held.vram.freeB,
+    4 * GB,
+    "and it comes out of what is free, byte for byte",
+  );
+  assertEquals(open.ram.freeB - held.ram.freeB, 16 * GB);
+  assertEquals(
+    held.vram.capacityB,
+    open.vram.capacityB,
+    "the card is still the size it is — a reserve is not a smaller GPU",
+  );
+  // Per card, so the packing budgets shrink with it and the picture agrees.
+  assertEquals(held.devices.cards[0]?.reservedB, 4 * GB);
+});
+
+/** The failure this feature exists to prevent, and the one it must never cause
+ *  silently: a plan that no longer fits BECAUSE of the reserve says so, and says
+ *  which control gives the memory back. */
+Deno.test("plan: when the reserve is what does not fit, the note names it", () => {
+  const m = meta({ nLayer: 32, layers: layers(32, 600 * 1024 * 1024) });
+  const machine = { gpus: [gpu(24, 0.5)] };
+  const s = { ...defaults(), ngl: 999, ctxSize: 8192 };
+  const open = plan(m, hw(machine), s);
+  assertEquals(open.vram.overB, 0, "it fits with nothing held back");
+  const held = plan(
+    m,
+    hw({
+      ...machine,
+      reserve: { perGpuB: 0, connectedB: 6 * GB, ramB: 0 },
+    }),
+    s,
+  );
+  assert(held.vram.overB > 0, "and not once 6 GB is held back");
+  assert(
+    held.notes.some((n) => n.includes("reserving")),
+    `the way out is on screen: ${held.notes.join(" | ")}`,
+  );
+});
+
+Deno.test("tune: the reserve binds the tuner, and is given as a reason", () => {
+  const m = meta({ nCtxTrain: 131_072 });
+  const machine = { gpus: [gpu(24)], backend: "cuda" as const };
+  const open = tune(m, hw(machine), defaults(), "vram");
+  const held = tune(
+    m,
+    hw({
+      ...machine,
+      reserve: { perGpuB: 0, connectedB: 14 * GB, ramB: 16 * GB },
+    }),
+    defaults(),
+    "vram",
+  );
+  assert(open.possible && held.possible);
+  assert(
+    held.ctx < open.ctx,
+    `holding 14 GB back has to cost context: ${open.ctx} → ${held.ctx}`,
+  );
+  assert(
+    held.reasons.some((r) => r.includes("reserved for your own work")),
+    "and the user is told why the ceiling is where it is",
+  );
+  assert(
+    !open.reasons.some((r) => r.includes("reserved for your own work")),
+    "while a machine with no reserve says nothing about one",
+  );
+});
+
+/** A reserve big enough to block the placement must explain itself in the
+ *  blocker too — "does not fit" with no mention of the 20 GB the user is holding
+ *  is a refusal nobody can act on. */
+Deno.test("tune: a blocking reserve is named in the blocker, not just felt", () => {
+  const m = meta();
+  const held = tune(
+    m,
+    hw({
+      gpus: [gpu(24)],
+      reserve: { perGpuB: 0, connectedB: 23 * GB, ramB: 0 },
+    }),
+    defaults(),
+    "vram",
+  );
+  assertEquals(held.possible, false);
+  assertStringIncludes(held.blocker, "you reserve");
+});
+
+Deno.test("devsplit: the user's reserve narrows each card's budget on top of the fixed one", () => {
+  const gpus = [gpu(24, 0), gpu(24, 0)];
+  const open = deviceBudgets(gpus);
+  const held = deviceBudgets(gpus, 0, [3 * GB, 1 * GB]);
+  assertEquals((open[0] ?? 0) - (held[0] ?? 0), 3 * GB);
+  assertEquals((open[1] ?? 0) - (held[1] ?? 0), 1 * GB);
+  assert(
+    deviceBudgets([gpu(4, 0)], 0, [99 * GB])[0] === 0,
+    "and a card wholly reserved has a budget of zero, never a negative one",
+  );
+});
+
+/**
+ * A placement that has already happened is not a prediction to re-check.
+ *
+ * The fitter's per-card budgets hold back a safety reserve (5% of each card)
+ * and, in the live path, our own footprint is re-derived by proportion — so
+ * re-packing a model that is LOADED came up about a gigabyte short and the
+ * machine panel announced "1010 MB of layers have nowhere to go — no card has
+ * room for them, however the cut is made" about a server that was answering
+ * prompts, with `vram.overB` reading 0 on the same screen (measured, two 25.6 GB
+ * cards, DeepSeek-V4-Flash at `--n-cpu-moe 33`). The measurement decides for a
+ * live run; the packer decides for a proposal.
+ */
+Deno.test("plan: a running placement is described, not re-litigated", () => {
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nCtxTrain: 65_536,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 3400 * MB, 3260 * MB),
+  });
+  // The live shape: our own bytes have already been attributed to us
+  // (`plan.ts:withoutOurUsage`), so the cards read mostly free, the machine has
+  // the VRAM in aggregate — and the per-card budgets, after the safety reserve
+  // and this device's scratch, still cannot take the last of the heavy layers.
+  const machine = hw({ gpus: [gpu(24, 2.5), gpu(24, 2.5)], backend: "cuda" });
+  const s = { ...defaults(), ngl: 999, nCpuMoe: 33, ctxSize: 2560 };
+
+  const proposed = plan(m, machine, s);
+  assertEquals(
+    proposed.vram.overB,
+    0,
+    "the machine has the VRAM — this is the by-card failure, not the total",
+  );
+  assertEquals(
+    proposed.devices.fits,
+    false,
+    "as a PROPOSAL this cannot be cut across the cards, and saying so is the point",
+  );
+  assert(proposed.devices.unplacedB > 0);
+  assert(
+    proposed.notes.some((n) => n.includes("no card that can hold them")),
+    "and a proposal must say which layers have nowhere to go",
+  );
+
+  const running = plan(m, machine, s, "running");
+  assertEquals(
+    running.devices.fits,
+    true,
+    "the same arrangement, already loaded, is a fact — llama.cpp placed it",
+  );
+  assertEquals(running.devices.unplacedB, 0);
+  assert(
+    !running.notes.some((n) => n.includes("no card that can hold them")),
+    `nothing may claim a loaded model is unplaceable: ${
+      running.notes.join(" | ")
+    }`,
+  );
+  assert(
+    !running.notes.some((n) => n.includes("fits across the cards but not on")),
+    "nor its sibling note",
+  );
+  // Every other number is the same — this is one prediction being dropped, not
+  // a second accounting.
+  assertEquals(running.vram.usedB, proposed.vram.usedB);
+  assertEquals(running.ram.usedB, proposed.ram.usedB);
+  assertEquals(running.kvTotalB, proposed.kvTotalB);
+});
+
+/** And real pressure on a live run still lands: when the MEASUREMENT says the
+ *  machine is over, "running" changes nothing — that is the case `drift` reads
+ *  to tell the user they are being squeezed. */
+Deno.test("plan: a running model that is genuinely over capacity still says so", () => {
+  const MB = 1024 * 1024;
+  const m = meta({ nLayer: 32, layers: layers(32, 900 * MB) });
+  // Someone else took almost everything after the model loaded.
+  const machine = hw({ gpus: [gpu(24, 23.5)], backend: "cuda" });
+  const s = { ...defaults(), ngl: 999, ctxSize: 8192 };
+  const running = plan(m, machine, s, "running");
+  assert(running.vram.overB > 0, "the measurement is the authority");
+  assertEquals(running.fits, false);
+  assert(running.notes.some((n) => n.includes("Over VRAM")));
+});
+
+// ── what a reply is made of ────────────────────────────────────────────────
+//
+// A local model answers with markdown, and the two things it answers with most
+// are code and file contents. Every rule below is one the component must not be
+// allowed to get wrong on its own, which is why they are here.
+
+Deno.test("richtext: a fenced block is a block, and it knows what it holds", () => {
+  const blocks = replyBlocks(
+    "Here is the fix:\n\n```ts\nconst a = 1;\n```\n\nThat's all.",
+  );
+  assertEquals(blocks.map((b) => b.kind), ["text", "code", "text"]);
+  const code = blocks[1];
+  assert(code?.kind === "code");
+  assertEquals(code.text, "const a = 1;", "no fence, no header, just the code");
+  assertEquals(code.lang, "ts");
+  assertEquals(code.file, "");
+  assertEquals(code.open, false);
+});
+
+/** The four spellings a model actually emits. There is no standard for naming
+ *  the file a block belongs to, so refusing all but one would mean showing
+ *  "typescript" over a block whose own first line said `src/lib/plan.ts`. */
+Deno.test("richtext: every common way of naming the file is read", () => {
+  assertEquals(parseInfo("python"), { lang: "python", file: "" });
+  assertEquals(parseInfo("src/lib/plan.ts"), {
+    lang: "typescript",
+    file: "src/lib/plan.ts",
+  });
+  assertEquals(parseInfo("ts:src/lib/plan.ts"), {
+    lang: "ts",
+    file: "src/lib/plan.ts",
+  });
+  assertEquals(parseInfo('ts title="src/plan.ts"'), {
+    lang: "ts",
+    file: "src/plan.ts",
+  });
+  assertEquals(parseInfo("ts src/lib/plan.ts"), {
+    lang: "ts",
+    file: "src/lib/plan.ts",
+  });
+  assertEquals(parseInfo("file=app.js"), {
+    lang: "javascript",
+    file: "app.js",
+  });
+  // No extension and no slash: a language, not a file — otherwise every
+  // ```bash block would claim to be a file called "bash".
+  assertEquals(parseInfo("bash"), { lang: "bash", file: "" });
+  // Except the two that genuinely have no extension.
+  assertEquals(parseInfo("Dockerfile").file, "Dockerfile");
+  assertEquals(parseInfo(""), { lang: "", file: "" });
+});
+
+/** The case that decides whether this is usable while a model is answering: the
+ *  closing fence has not arrived yet. Rendering the half-written file as raw
+ *  text until it does means the block appears, reflows and re-indents at the
+ *  moment the model finishes — exactly when the user is reading it. */
+Deno.test("richtext: a block still being written is a block, and says so", () => {
+  const blocks = replyBlocks("Sure:\n\n```py\nimport os\nprint(1)");
+  assertEquals(blocks.length, 2);
+  const code = blocks[1];
+  assert(code?.kind === "code");
+  assertEquals(code.open, true);
+  assertEquals(code.text, "import os\nprint(1)");
+});
+
+/** A fence inside a fence. The outer block uses a longer marker precisely so
+ *  the inner one does not end it — get this wrong and a reply about markdown,
+ *  or any shell snippet with backticks, is cut in half. */
+Deno.test("richtext: a longer fence survives the fences inside it", () => {
+  const blocks = replyBlocks(
+    "````md\nSome docs:\n\n```ts\nx\n```\n\nend\n````",
+  );
+  assertEquals(blocks.length, 1);
+  const code = blocks[0];
+  assert(code?.kind === "code");
+  assertEquals(code.lang, "md");
+  assertStringIncludes(code.text, "```ts");
+  assertEquals(code.open, false);
+});
+
+Deno.test("richtext: an indented fence keeps the code's own shape", () => {
+  const blocks = replyBlocks("  ```ts\n  if (a) {\n      b();\n  }\n  ```");
+  const code = blocks[0];
+  assert(code?.kind === "code");
+  // The fence's own two spaces come off; the four that make the nesting stay.
+  assertEquals(code.text, "if (a) {\n    b();\n}");
+});
+
+Deno.test("richtext: inline code spans are spans, and a lone backtick is a backtick", () => {
+  const parts = inlineChunks("Run `deno task dev` first");
+  assertEquals(parts.map((p) => p.code), [false, true, false]);
+  assertEquals(parts[1]?.text, "deno task dev");
+  // Unclosed: one plain run, never a span that swallows the rest of the reply.
+  assertEquals(inlineChunks("a ` b").map((p) => p.code), [false]);
+  // Never across a line break.
+  assertEquals(inlineChunks("a `b\nc` d").map((p) => p.code), [false]);
+});
+
+/** What the copy-chat button puts on the clipboard. Markdown, because that is
+ *  what the reply already is — and nothing on screen is silently dropped. */
+Deno.test("richtext: the transcript is the conversation, fences and all", () => {
+  const text = transcript({
+    system: "Be brief.",
+    messages: [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "```ts\nconst a = 1;\n```",
+        thinking: "they said hi",
+        tps: 8.94,
+      },
+    ],
+    partial: "still writ",
+  });
+  assertStringIncludes(text, "### system\n\nBe brief.");
+  assertStringIncludes(text, "### user\n\nhi");
+  assertStringIncludes(text, "### assistant · 8.9 tok/s");
+  assertStringIncludes(text, "```ts\nconst a = 1;\n```");
+  assertStringIncludes(text, "> they said hi");
+  assertStringIncludes(
+    text,
+    "still writ",
+    "the reply still arriving is on screen, so it is in the copy",
+  );
+  // An empty conversation copies nothing rather than a pile of headings.
+  assertEquals(transcript({ messages: [] }).trim(), "");
+});
+
+/** Four dials, one scale. The quarters are the whole rule: an eye scanning CPU,
+ *  GPU, RAM and VRAM should not have to learn four of them. */
+Deno.test("thermal: a load reading is coloured by quarter", () => {
+  assertEquals(loadTone(0), "busy");
+  assertEquals(loadTone(24.9), "busy");
+  assertEquals(loadTone(25), "ok");
+  assertEquals(loadTone(49.9), "ok");
+  assertEquals(loadTone(50), "warn");
+  assertEquals(loadTone(74.9), "warn");
+  assertEquals(loadTone(75), "bad");
+  assertEquals(loadTone(100), "bad");
+  // A machine that has not been read yet is idle, not on fire: every figure
+  // that reaches this comes out of a division, and 0/0 is how a boot-time
+  // reading arrives.
+  assertEquals(loadTone(Number.NaN), "busy");
+  assertEquals(loadTone(-1), "busy");
+});
+
+// ── available on LAN ───────────────────────────────────────────────────────
+//
+// One llama.cpp flag, `--host`, behind one switch. The rules worth pinning are
+// the two that make it a decision rather than trivia: what counts as exposed,
+// and which address another machine should actually dial.
+
+Deno.test("lan: exposed means reachable from another machine, and 127.x never is", () => {
+  const at = (host: string) => ({ ...defaults(), host });
+  assertEquals(isLanExposed(at("127.0.0.1")), false, "llama.cpp's default");
+  assertEquals(isLanExposed(at("localhost")), false);
+  assertEquals(isLanExposed(at("::1")), false);
+  assertEquals(isLanExposed(at("0.0.0.0")), true);
+  assertEquals(isLanExposed(at("::")), true);
+  // A specific interface is reachable too — the switch is off, but the machine
+  // IS exposed, and a UI that showed "off" there would be lying.
+  assertEquals(isLanExposed(at("192.168.1.10")), true);
+  assertEquals(isLanExposed(defaults()), false, "off by default");
+  assertEquals(lanHost(true), "0.0.0.0");
+  assertEquals(lanHost(false), "127.0.0.1");
+});
+
+/** `0.0.0.0` is what llama-server BINDS; it is not what anyone dials. A
+ *  workstation reports half a dozen addresses — docker bridges, VPN tunnels,
+ *  loopback — and exactly one of them is worth printing. */
+Deno.test("lan: the address offered is one another machine can actually use", () => {
+  assertEquals(
+    pickLanIp(["127.0.0.1", "172.17.0.1", "192.168.1.24"]),
+    "172.17.0.1",
+    "both are private; the OS order decides between them",
+  );
+  assertEquals(pickLanIp(["127.0.0.1", "192.168.1.24"]), "192.168.1.24");
+  // Link-local only exists when DHCP failed, so it goes last rather than first.
+  assertEquals(
+    pickLanIp(["169.254.7.1", "10.0.0.5"]),
+    "10.0.0.5",
+  );
+  assertEquals(
+    pickLanIp(["127.0.0.1"]),
+    "",
+    "loopback is what we are escaping",
+  );
+  assertEquals(pickLanIp(["8.8.8.8"]), "", "a public address is not this");
+  assertEquals(pickLanIp([]), "");
+  assertEquals(lanUrl("192.168.1.24", 18080), "http://192.168.1.24:18080");
+  // Better nothing than `http://0.0.0.0:8080`, which reaches nothing.
+  assertEquals(lanUrl("", 8080), "");
+  assertEquals(lanUrl("192.168.1.24", 0), "");
+});
+
+/** llama-server has no password unless an API key is set — which is the whole
+ *  reason this switch says something instead of just flipping. */
+Deno.test("lan: the warning changes with the API key, and always names the risk", () => {
+  const open = lanWarning(defaults());
+  assertStringIncludes(open, "Anyone on your network");
+  assertStringIncludes(open, "API key");
+  const keyed = lanWarning({ ...defaults(), apiKey: "s3cret" });
+  assertStringIncludes(keyed, "who has the API key");
+});
+
+// ── letting the desktop go first ───────────────────────────────────────────
+
+Deno.test("priority: the two queues that make a machine feel slow, both lowered", () => {
+  const steps = prioritySteps(4242);
+  assertEquals(steps.map((s) => s.cmd), ["renice", "ionice"]);
+  assertEquals(steps[0]?.args, ["-n", "19", "-p", "4242"], "the politest nice");
+  // CPU is not the half that makes a load hurt: reading 145 GB of weights off
+  // an NVMe stutters a desktop whatever the nice value is.
+  assertEquals(steps[1]?.args, ["-c", "3", "-p", "4242"], "idle I/O class");
+  // The idle class is refused on some kernels and in some containers; the
+  // fallback is the lowest best-effort band, which never needs privileges.
+  assertEquals(ioFallback(4242).args, ["-c", "2", "-n", "7", "-p", "4242"]);
+  assertEquals(prioritySteps(0), [], "no pid, nothing to renice");
+  assertEquals(prioritySteps(-1), []);
+});
+
+/** A run left at normal priority while the switch said otherwise is the kind of
+ *  silent disagreement this app refuses everywhere else — so the log always
+ *  says what actually took effect. */
+Deno.test("priority: the log line says what happened, including when nothing did", () => {
+  assertStringIncludes(
+    priorityNote(["nice 19", "idle I/O"], []),
+    "nice 19 + idle I/O",
+  );
+  assertStringIncludes(priorityNote(["nice 19", "idle I/O"], []), "desktop");
+  const partial = priorityNote(["nice 19"], ["ionice: not found"]);
+  assertStringIncludes(partial, "nice 19");
+  assertStringIncludes(partial, "ionice: not found");
+  const none = priorityNote([], ["renice: not found"]);
+  assertStringIncludes(none, "could not lower the priority");
+  assertStringIncludes(none, "sluggish", "and what that means for the user");
+});
+
+/** `/proc/<pid>/stat` is how the test below checks the REAL process rather than
+ *  that a command was issued — and `comm` can contain spaces and parentheses,
+ *  which is why the parse starts after the last `)`. */
+Deno.test("priority: the nice value is read out of a hostile /proc line", () => {
+  const stat =
+    "1234 (llama server (x)) S 1 1234 1234 0 -1 4194304 100 0 0 0 5 2 0 0 20 19 4 0 999 0 0";
+  assertEquals(niceFromProcStat(stat), 19);
+  assertEquals(
+    niceFromProcStat("42 (sleep) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 7"),
+    0,
+  );
+  assertEquals(niceFromProcStat("nonsense"), null);
 });

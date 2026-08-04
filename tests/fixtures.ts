@@ -71,8 +71,13 @@ export function moeMeta(): ModelMeta {
   });
 }
 
-export function gpu(vramGb: number, usedGb = 0.5): Gpu {
+/** A card. `display` is left undefined on purpose — that is what a machine
+ *  which does not report display attachment looks like, and it is the reading
+ *  the connected-GPU reserve has to cope with (`src/lib/reserve.ts`). Pass it
+ *  explicitly to test a machine that does answer. */
+export function gpu(vramGb: number, usedGb = 0.5, display?: boolean): Gpu {
   return {
+    display,
     vendor: "nvidia",
     name: `Test GPU ${vramGb}G`,
     tempC: 42,

@@ -6,6 +6,7 @@
 // callbacks, which is what makes each piece renderable in a test in isolation.
 
 import type { JSX } from "aio/jsx-runtime";
+import { useLocal, useRef } from "aio/air";
 import {
   bytes as fmtBytes,
   pct as pctOf,
@@ -155,7 +156,7 @@ export type Segment = {
   key: string;
   label: string;
   bytes: number;
-  tone: Tone | "weights" | "experts" | "kv" | "compute" | "other";
+  tone: Tone | "weights" | "experts" | "kv" | "compute" | "other" | "reserved";
 };
 
 /**
@@ -223,11 +224,21 @@ export function Ring(props: {
   sub?: string;
   tone?: Tone;
   size?: number;
+  /** Drop the caption under the dial. For a surface that names the reading
+   *  above it — the all-in-one vitals — the label under the ring was the same
+   *  word again, in the smallest type on the page. `label` is still the
+   *  tooltip, so the dial never becomes an unlabelled number. */
+  hideLabel?: boolean;
 }) {
   const size = props.size ?? 62;
   const v = Math.max(0, Math.min(100, props.value));
   return (
-    <div class={`ring-wrap tone-${props.tone ?? "accent"}`} title={props.label}>
+    <div
+      class={`ring-wrap tone-${props.tone ?? "accent"}${
+        props.hideLabel ? " no-label" : ""
+      }`}
+      title={props.label}
+    >
       <svg class="ring" viewBox="0 0 36 36" width={size} height={size}>
         <circle
           class="ring-track"
@@ -253,7 +264,7 @@ export function Ring(props: {
         <b>{Math.round(v)}</b>
         <small>{props.sub ?? "%"}</small>
       </div>
-      <div class="ring-label">{props.label}</div>
+      {props.hideLabel ? null : <div class="ring-label">{props.label}</div>}
     </div>
   );
 }
@@ -385,6 +396,51 @@ export function Thinking(props: { text?: string; live?: boolean }) {
       <summary>{props.live ? "thinking…" : "thought first"}</summary>
       <div class="msg-think-body">{props.text}</div>
     </details>
+  );
+}
+
+/**
+ * Take this — one button, one clipboard write, one visible acknowledgement.
+ *
+ * The acknowledgement is the point. A copy button that looks identical before
+ * and after the click leaves the user guessing whether it fired, and the usual
+ * answer to that guess is to press it again and paste twice. The tick is local
+ * per-instance state (`useLocal`), so ten of these on a page each answer for
+ * themselves, and it reverts on its own — a button stuck on "copied" is a lie
+ * about the current contents of the clipboard.
+ *
+ * `navigator.clipboard` is optional-chained: it is absent in a non-secure
+ * context and in the test harness, and a copy button is never worth a crash.
+ */
+export function CopyButton(props: {
+  text: string;
+  title: string;
+  /** Shown beside the icon. Omit for the icon-only form used in dense headers. */
+  label?: string;
+  t?: string;
+}) {
+  const [copied, setCopied] = useLocal(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  return (
+    <button
+      type="button"
+      class={copied ? "btn tiny copy-btn is-copied" : "btn tiny copy-btn"}
+      t={props.t}
+      title={props.title}
+      aria-label={props.title}
+      disabled={!props.text}
+      onClick={() => {
+        void navigator.clipboard?.writeText(props.text);
+        setCopied(true);
+        clearTimeout(timer.current);
+        timer.current = setTimeout(() => setCopied(false), 1400);
+      }}
+    >
+      <span class="copy-icon" aria-hidden="true">{copied ? "✔" : "⧉"}</span>
+      {props.label
+        ? <span class="copy-label">{copied ? "copied" : props.label}</span>
+        : null}
+    </button>
   );
 }
 

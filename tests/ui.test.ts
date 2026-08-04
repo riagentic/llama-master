@@ -58,6 +58,7 @@ import {
   hwSnapshot,
   paramBlocker,
   planningHw,
+  projectedStatePlan,
 } from "../src/ui/derive.ts";
 import { chat } from "../src/cell/chat.ts";
 import {
@@ -118,7 +119,13 @@ function roomyMachine() {
       swapTotalB: 0,
       swapUsedB: 0,
     },
-    gpus: [card, { ...card }],
+    // Card 0 draws the desktop, card 1 is headless — the machine the
+    // connected-GPU reserve is for, and the one that shows the difference
+    // between "on every GPU" and "on the one with a screen".
+    gpus: [{ ...card, display: true }, { ...card, display: false }],
+    // A machine with a LAN address and the usual noise around it: the
+    // "Available on LAN" line has to pick the one another machine can dial.
+    lanIps: ["127.0.0.1", "192.168.1.24"],
     os: "linux",
     arch: "x86_64",
     lastRefresh: 1,
@@ -129,7 +136,7 @@ function roomyMachine() {
 
 testUI(
   App,
-  "boots with the brand, every tab, and the command strip",
+  "boots with the brand and every tab",
   async (ui_) => {
     await ui_.settle();
     const html = ui_.html();
@@ -139,9 +146,6 @@ testUI(
     ) {
       assertStringIncludes(html, label);
     }
-    // The command strip is always present and always read-only.
-    assertStringIncludes(html, "llama-server");
-    assertStringIncludes(html, "llama-cli");
   },
 );
 
@@ -176,9 +180,16 @@ testUI(App, "the theme toggle flips the whole shell", async (ui_) => {
 // ── the command preview ────────────────────────────────────────────────────
 
 testUI(
-  App,
-  "the command strip shows exactly what a setting change produces",
+  OnePage as never,
+  "the command section shows exactly what a setting change produces",
   async (ui_) => {
+    // Mounted directly rather than through App: `ui.tab` is persisted and
+    // rehydrates asynchronously, so "the default tab happens to be the one with
+    // the command on it" is a race, not a fact. The command lives on the pages
+    // where the settings are edited now (all-in-one, Tune, Server) instead of
+    // in a strip pinned under every tab.
+    await ui_.settle();
+    if (!ui.showCommand) ui.toggleCommand();
     await ui_.settle();
     assert(!ui_.html().includes("-ngl"), "a default config emits no -ngl");
 
@@ -187,12 +198,29 @@ testUI(
     await ui_.settle();
 
     const html = ui_.html();
+    assertStringIncludes(html, "llama-server", "the command that Start issues");
+    assert(
+      !html.includes("llama-cli"),
+      "the cli equivalent is a reference, and it is on the pages with room for one",
+    );
     assertStringIncludes(html, "-ngl 99");
     assertStringIncludes(html, "-c 16384");
     // Server-only flags must not appear in the cli line, and vice versa.
     await cfg.set("port", "9099");
     await ui_.settle();
     assertStringIncludes(ui_.html(), "--port 9099");
+
+    // And it folds away — on a column that is a screenful of flags, and the
+    // preference is persisted (`ui.showCommand`), so it must actually bind.
+    ui_.find("OnePage")["one-cmd-toggle"].click();
+    await ui_.expectCell(ui, (s) => s.showCommand === false);
+    await ui_.settle();
+    assert(
+      !ui_.html().includes("--port 9099"),
+      "hidden means hidden, not merely collapsed to a scroll",
+    );
+    ui_.find("OnePage")["one-cmd-toggle"].click();
+    await ui_.expectCell(ui, (s) => s.showCommand === true);
   },
 );
 
@@ -989,6 +1017,13 @@ for (const [name, Surface] of SERVER_SURFACES) {
       // The real report: the server dies because something else holds the
       // VRAM. The app must say so, and show the output it points at.
       await withStubBuild(async (bin) => {
+        // Known slate first. `srv.start` returns immediately when the status is
+        // already "starting" or "ready" — one model runs at a time — so a
+        // server left up by an earlier test means nothing is spawned here, no
+        // crash happens, and this fails five seconds later on a missing
+        // diagnosis. The cells are singletons across every test in the process.
+        await srv.stop();
+        await srv.poll();
         await srv.start([bin, "--oom"], "http://127.0.0.1:1");
         // Wait for what is actually asserted, not a proxy for it: the status
         // turns "crashed" the moment the process is gone, while the diagnosis
@@ -1102,6 +1137,21 @@ testUI(
         // leaves `activeBuild()` null and every start blocked — an order-dependent
         // failure that had nothing to do with what was under test.
         await builds.setActive("stub");
+        // And select the model this test scanned for. `scan` keeps a valid
+        // selection, but only when its results are the ones that land: it is
+        // newest-wins by epoch, so a scan racing with the scheduled one (or
+        // with another test's) returns having discarded its own findings, and
+        // `models.selected` is then whatever the previous test left — often a
+        // fixture in a temp directory that no longer exists. `startBlocker()`
+        // said "No model selected — scan for models first" immediately after a
+        // scan, roughly one full-suite run in six.
+        await ui_.waitFor(
+          () => models.items.some((x) => x.meta),
+          "the fixture model is in the library",
+        );
+        const model = models.items.find((x) => x.meta);
+        assertExists(model);
+        models.select(model.path);
         const port = freePort();
         await cfg.set("port", String(port));
         await ui_.settle();
@@ -1383,6 +1433,127 @@ testUI(
 
 testUI(
   OnePage as never,
+  "OnePage: the chat can be cleared without leaving the page",
+  async (ui_) => {
+    // The all-in-one page is where a conversation actually happens, so the one
+    // gesture that ends it must be here too — otherwise the only way to drop a
+    // stale context is a trip to the Chat tab. Driven through the real send
+    // path against a real stream, so this clears a genuine conversation.
+    await ui_.settle();
+    const port = freePort();
+    const ac = new AbortController();
+    const server = Deno.serve(
+      { port, signal: ac.signal, onListen: () => {} },
+      () =>
+        new Response(
+          'data: {"choices":[{"delta":{"content":"a stale answer"}}]}\n\n' +
+            "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    try {
+      await chat.stop();
+      await chat.clear();
+      await chat.setInput("hi");
+      await ui_.waitFor(
+        () => chat.input === "hi" && !chat.streaming,
+        "chat is idle with the message typed",
+      );
+      await chat.send(`http://127.0.0.1:${port}`);
+      await ui_.waitFor(
+        () => ui_.html().includes("a stale answer"),
+        "the reply is on the page",
+      );
+      ui_.find("OnePage")["one-chat-clear"].click();
+      await ui_.expectCell(chat, (s) => s.messages.length === 0);
+      await ui_.settle();
+      assert(
+        !ui_.html().includes("a stale answer"),
+        "and the transcript is gone from the page",
+      );
+    } finally {
+      ac.abort();
+      await server.finished;
+    }
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: a code block is a block, with its own copy button, and tok/s follows the answer",
+  async (ui_) => {
+    // Three complaints in one reply, and all three are about the same thing —
+    // a reply is not one undifferentiated string. The fences were visible, the
+    // only way to take a file was a drag-select that caught them, and the speed
+    // of the answer was printed above the answer, where it cannot be known yet.
+    await ui_.settle();
+    const port = freePort();
+    const ac = new AbortController();
+    const reply =
+      "Here is the fix:\n\n```ts src/lib/plan.ts\nconst a = 1;\n```\n";
+    const server = Deno.serve(
+      { port, signal: ac.signal, onListen: () => {} },
+      () =>
+        new Response(
+          `data: ${
+            JSON.stringify({ choices: [{ delta: { content: reply } }] })
+          }\n\n` +
+            `data: ${
+              JSON.stringify({
+                choices: [{ delta: {} }],
+                timings: { predicted_per_second: 8.94 },
+              })
+            }\n\n` +
+            "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    try {
+      await chat.stop();
+      await chat.clear();
+      await chat.setInput("fix it");
+      await ui_.waitFor(
+        () => chat.input === "fix it" && !chat.streaming,
+        "chat is idle with the message typed",
+      );
+      await chat.send(`http://127.0.0.1:${port}`);
+      await ui_.waitFor(
+        () => ui_.html().includes("const a = 1;"),
+        "the reply renders",
+      );
+      const html = ui_.html();
+      // The fence is gone, and what it said is the block's header.
+      assert(!html.includes("```"), `no raw fences on screen: ${html}`);
+      assertStringIncludes(html, "src/lib/plan.ts");
+      assertStringIncludes(html, "codeblock");
+      // Its own copy button, because the file is the unit people want — not
+      // the message, and certainly not the message plus the prose around it.
+      assertExists(
+        ui_.find("OnePage")["codeblock-copy"],
+        "the block carries a copy button",
+      );
+      // And the whole conversation has one, beside Clear.
+      assertExists(ui_.find("OnePage")["one-chat-copy"]);
+      // tok/s AFTER the answer: a measurement of the reply belongs under it.
+      const answer = html.indexOf("const a = 1;");
+      const speed = html.indexOf("tok/s", answer);
+      assert(speed > answer, "tok/s must follow the answer, not head it");
+      assert(
+        html.slice(0, answer).indexOf("tok/s") === -1 ||
+          html.slice(0, answer).lastIndexOf("tok/s") <
+            html.lastIndexOf("msg-role", answer),
+        "nothing prints the speed above the message body",
+      );
+    } finally {
+      ac.abort();
+      await server.finished;
+      await chat.clear();
+    }
+  },
+);
+
+testUI(
+  OnePage as never,
   "OnePage: a model whose header cannot be read says so",
   async (ui_) => {
     await ui_.settle();
@@ -1543,7 +1714,7 @@ testUI(
 
 testUI(
   OnePage as never,
-  "OnePage: both memory states are shown at once, and told apart",
+  "OnePage: both memory states are in one section, and told apart",
   async (ui_) => {
     await ui_.settle();
     const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
@@ -1557,10 +1728,11 @@ testUI(
 
         // Both, simultaneously — they answer different questions, and showing
         // one with a mode switch meant whichever you were not asking about was
-        // simply unavailable.
+        // simply unavailable. One panel holds them, because they are two
+        // answers about one machine rather than two subjects.
         const html = ui_.html();
-        assertStringIncludes(html, "Current Memory State");
-        assertStringIncludes(html, "Projected Memory State");
+        assertStringIncludes(html, "As it is now");
+        assertStringIncludes(html, "After starting");
 
         // And llama.cpp's own share is distinguishable from everyone else's and
         // from free space, in words as well as colour.
@@ -1568,19 +1740,32 @@ testUI(
         assertStringIncludes(html, "KV cache");
         assertStringIncludes(html, "Weights");
 
-        // Each table says which question it answers. The current state of an
-        // idle machine is not a projection, and calling it one was wrong.
-        assertStringIncludes(html, "as it is now");
-        assertStringIncludes(html, "What these settings would use.");
+        // Each state says which question it answers, once — the section titles
+        // above the maps. The current state of an idle machine is not a
+        // projection, and calling it one was wrong; saying it twice, in the
+        // title and again in a pill under the map, was merely wasteful in the
+        // one column that has no room to waste.
+        assertEquals(
+          (html.match(/As it is now/g) ?? []).length,
+          1,
+          "said once",
+        );
+        assertEquals((html.match(/After starting/g) ?? []).length, 1);
+        // And one legend for the two maps that share it.
+        assertEquals(
+          (html.match(/legend-dot seg-reserved/g) ?? []).length,
+          1,
+          "one key, not one per map",
+        );
 
         // Three columns, one question each. The machine column stacks the two
         // memory states — same width, same scale, so the difference between
         // "as it is" and "as it would be" is readable at a glance — and the
         // decision column follows with the run strip. Current before
         // projected, and the whole machine column before the decision one.
-        const iCur = html.indexOf("Current Memory State");
+        const iCur = html.indexOf("As it is now");
         const iRun = html.indexOf("Run a model");
-        const iProj = html.indexOf("Projected Memory State");
+        const iProj = html.indexOf("After starting");
         assert(
           iCur < iProj,
           `current state reads before the projection, got ${iCur}/${iProj}`,
@@ -2198,5 +2383,601 @@ testUI(
         `${handle} must show the value that is set, not whichever option is first`,
       );
     }
+  },
+);
+
+// ── the memory the user keeps for themselves ───────────────────────────────
+
+testUI(
+  OnePage as never,
+  "OnePage: reserved VRAM and RAM are held back from the plan that runs",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The complaint this exists for: the tuner fills the card, the card is also
+    // the one drawing the desktop, and the desktop is what pays. So the test is
+    // not that a control exists — it is that a number typed into it comes out
+    // the other end as memory NOTHING is allowed to place a model in.
+    await ui_.settle();
+    const bin = await installStubBuild("stub-cuda", { backend: "cuda" });
+    try {
+      await builds.scan();
+      await builds.setActive("stub-cuda");
+      await withModel(async (dir) => {
+        await models.addDir(dir);
+        await models.scan();
+        const m = models.items.find((x) => x.meta);
+        assertExists(m, "the fixture model must parse");
+        models.select(m.path);
+        await cfg.setCtxOverride(0);
+        await cfg.setPlacement("vram");
+        await cfg.setReserve("gpu", 0);
+        await cfg.setReserve("connected", 0);
+        await cfg.setReserve("ram", 0);
+        await ui_.settle();
+
+        const GiB = 1024 ** 3;
+        const open = projectedStatePlan();
+        assertExists(open, "a model with a header must project");
+        assertEquals(open.vram.reservedB, 0, "nothing held back to begin with");
+        const openFreeVramB = open.vram.freeB;
+        const openFreeRamB = open.ram.freeB;
+
+        // Typed into the real controls, on the all-in-one page.
+        const page = ui_.find("OnePage");
+        assertExists(page["one-reserve-gpu"], "per-GPU VRAM is on this page");
+        assertExists(
+          page["one-reserve-connected"],
+          "and the display-card figure beside it",
+        );
+        assertExists(page["one-reserve-ram"], "and RAM with them");
+        await page["one-reserve-connected"].setValue("4");
+        await page["one-reserve-ram"].setValue("16");
+        await ui_.expectCell(
+          cfg,
+          (s) =>
+            s.reserveConnectedVramB === 4 * GiB &&
+            s.reserveRamB === 16 * GiB,
+          "the boxes speak GB and the cell holds bytes",
+        );
+        await ui_.settle();
+
+        const held = projectedStatePlan();
+        assertExists(held);
+        assertEquals(held.vram.reservedB, 4 * GiB);
+        assertEquals(held.ram.reservedB, 16 * GiB);
+        assertEquals(
+          openFreeVramB - held.vram.freeB,
+          4 * GiB,
+          "and it is gone from what the plan may spend, byte for byte",
+        );
+        assertEquals(openFreeRamB - held.ram.freeB, 16 * GiB);
+        // Two cards, one screen: the connected figure lands on the card that
+        // drives it and costs the headless card nothing. Charging both would
+        // refuse 4 GB nobody asked to keep.
+        assertEquals(held.devices.cards[0]?.reservedB, 4 * GiB);
+        assertEquals(held.devices.cards[1]?.reservedB, 0);
+        // The per-GPU figure is the other claim, and it IS charged to both.
+        await page["one-reserve-gpu"].setValue("2");
+        await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 2 * GiB);
+        await ui_.settle();
+        const both = projectedStatePlan();
+        assertExists(both);
+        assertEquals(both.devices.cards[0]?.reservedB, 6 * GiB, "2 + 4 here");
+        assertEquals(both.devices.cards[1]?.reservedB, 2 * GiB, "2 there");
+        assertEquals(both.vram.reservedB, 8 * GiB, "8 GB of machine in total");
+        await page["one-reserve-gpu"].setValue("0");
+        await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 0);
+        await ui_.settle();
+        // The machine itself has not changed size, and the page still says so.
+        assertEquals(held.vram.capacityB, open.vram.capacityB);
+        assertStringIncludes(ui_.html(), "reserved");
+        // And the page NAMES the card it landed on. "8 GB reserved" on a
+        // two-card machine is ambiguous in exactly the way that sends someone
+        // hunting the wrong GPU for the memory.
+        assertStringIncludes(ui_.html(), "Display card: GPU 0");
+        // And the map DRAWS it. It was drawn all along in a grey that read as
+        // empty track and named in no legend, so the one band the user put
+        // there themselves was the one band they could not identify.
+        assertStringIncludes(
+          ui_.html(),
+          "map-band seg-reserved",
+          "reserved memory is a band of the map, not a gap in it",
+        );
+        assertStringIncludes(
+          ui_.html(),
+          '<i class="legend-dot seg-reserved"></i>Reserved',
+          "and the legend names it",
+        );
+        assertStringIncludes(
+          ui_.html(),
+          "<span>4.00 GB reserved</span>",
+          "the map foot counts it apart from used and from free",
+        );
+        // And the summary is ONE sentence: adjacent conditional strings in a
+        // fragment left the previous one on screen beside the new one.
+        assertEquals(
+          (ui_.html().match(/every plan below is made from what is left/g) ??
+            [])
+            .length,
+          1,
+          "the summary is written once, not once per edit",
+        );
+
+        // And what actually STARTS is planned the same way: the tuner re-runs
+        // on a reserve change (it is in the auto-tune key), so the settings on
+        // file are the ones the reserve allows.
+        await ui_.waitFor(
+          () => (placements()?.vram.ctx ?? 0) > 0,
+          "the tuner still finds a plan with the reserve held back",
+        );
+        const tuned = tuneAll(
+          m.meta!,
+          planningHw(),
+          cfg.settings,
+        );
+        assertEquals(
+          computePlan(m.meta!, planningHw(), tuned.vram.settings).vram
+            .reservedB,
+          4 * 1024 ** 3,
+          "the plan behind Start carries the reserve too",
+        );
+      });
+    } finally {
+      await removeStubBuild("stub-cuda");
+      assert(bin.length > 0);
+    }
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "Tune: the same reserve controls, above the plan they change",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // Two surfaces, one component — the same rule as the context control. A
+    // reserve set on one page and invisible on the other would be a setting the
+    // user cannot find again.
+    await ui_.settle();
+    await cfg.setReserve("gpu", 2);
+    await cfg.setReserve("connected", 8);
+    await cfg.setReserve("ram", 16);
+    await ui_.settle();
+    const panel = ui_.find("TunePanel");
+    assertExists(panel["tune-reserve-gpu"]);
+    assertExists(panel["tune-reserve-connected"]);
+    assertExists(panel["tune-reserve-ram"]);
+    assertEquals(panel["tune-reserve-gpu"].value, "2");
+    // And the LAN switch, which is the same control as the all-in-one page's:
+    // a setting that appears twice must be the same control twice.
+    assertExists(panel["tune-lan-toggle"], "Available on LAN is here too");
+    assertEquals(panel["tune-reserve-connected"].value, "8");
+    assertEquals(panel["tune-reserve-ram"].value, "16");
+
+    // A reserve larger than the card it applies to is clamped and SAID, not
+    // swallowed: every placement is about to report that it does not fit, and a
+    // refusal with no visible cause is the worst message this app can produce.
+    await panel["tune-reserve-connected"].setValue("999");
+    await ui_.expectCell(
+      cfg,
+      (s) => s.reserveConnectedVramB === 999 * 1024 ** 3,
+    );
+    await ui_.settle();
+    assertExists(
+      ui_.find("TunePanel")["tune-reserve-connected-over"],
+      "more than the card has must say so",
+    );
+    await cfg.setReserve("gpu", 0);
+    await cfg.setReserve("connected", 4);
+  },
+);
+
+testUI(
+  OnePage as never,
+  "a model that is running is described, not accused",
+  {
+    seed: {
+      // Two cards that are HOLDING our run: what they report as used is our
+      // model plus a residue our own accounting does not capture (llama.cpp's
+      // real overhead is larger than the estimate). That residue is what made
+      // the fitter re-pack the run and come up short.
+      hw: {
+        lastRefresh: 1,
+        mem: {
+          totalB: 64 * 1024 ** 3,
+          availableB: 48 * 1024 ** 3,
+          usedB: 16 * 1024 ** 3,
+          swapTotalB: 0,
+          swapUsedB: 0,
+        },
+        gpus: [0, 1].map((i) => ({
+          vendor: "nvidia",
+          name: `Test card ${i}`,
+          tempC: 50,
+          utilPct: 40,
+          vramTotalB: 1024 ** 3,
+          vramUsedB: 540 * 1024 ** 2,
+          powerW: 60,
+          powerLimitW: 150,
+          computeCap: 8.9,
+        })),
+      },
+    },
+  },
+  async (ui_) => {
+    // THE reported message: "1010 MB of layers have nowhere to go — no card has
+    // room for them, however the cut is made", on the machine panel, about a
+    // server that was answering prompts, with the VRAM total reading 0 over
+    // capacity right beside it. The fitter's budgets hold back a safety reserve
+    // and re-derive our footprint by proportion, so re-packing a LOADED model
+    // came up short — a prediction contradicted by the thing it predicted.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await ui_.settle();
+
+      const runSettings = {
+        ...cfg.settings,
+        ngl: 999,
+        nCpuMoe: 0,
+        ctxSize: 2048,
+      };
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: m.path,
+          runSettings,
+          rssB: 200 * 1024 ** 2,
+          healthy: true,
+          url: "http://127.0.0.1:8080",
+        },
+      });
+      await ui_.settle();
+
+      const live = currentStatePlan();
+      // The scenario has to be the real one, or this test proves nothing: as a
+      // PROPOSAL, on the very same machine, these settings cannot be cut across
+      // the cards — while the machine is not over VRAM at all.
+      const attributed = withoutOurUsage(
+        hwSnapshot(),
+        live.vram.usedB,
+        srv.rssB,
+      );
+      const asProposal = computePlan(m.meta!, attributed, runSettings);
+      assertEquals(
+        asProposal.vram.overB,
+        0,
+        "the VRAM total is not the problem",
+      );
+      assertEquals(
+        asProposal.devices.fits,
+        false,
+        "and the packer would refuse it — this is the reported situation",
+      );
+      assert(asProposal.devices.unplacedB > 0);
+
+      // What the app must say about the same thing, now that it is running.
+      assertEquals(live.devices.fits, true, "llama.cpp placed these layers");
+      assertEquals(live.devices.unplacedB, 0);
+      assert(
+        !live.notes.some((n) => n.includes("no card that can hold them")),
+        `no note may contradict the running server: ${live.notes.join(" | ")}`,
+      );
+      assert(
+        !ui_.html().includes("nowhere to go"),
+        "and the page must not print it either",
+      );
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: Available on LAN is off, and turning it on changes what runs",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The switch exists because llama.cpp binds to 127.0.0.1 and is therefore
+    // invisible from every other machine — the commonest reason the client
+    // (client/) finds nothing on the network. It is one flag, `--host`, and it
+    // is OFF by default: binding to the world is not a default.
+    await ui_.settle();
+    await cfg.set("host", "127.0.0.1");
+    await ui_.settle();
+
+    const page = ui_.find("OnePage");
+    assertExists(page["one-lan-toggle"], "the switch is on this page");
+    // Off is read from what is on screen and what would run, not from the
+    // checkbox's own attribute: `checked` is only serialised when true, so its
+    // absence is the state rather than a value to compare against.
+    assertEquals(cfg.settings.host, "127.0.0.1", "off by default");
+    assert(
+      !ui_.html().includes("--host"),
+      "and the command says nothing about a host it is not changing",
+    );
+    assert(
+      !ui_.html().includes("Anyone on your network"),
+      "nor warns about an exposure that has not happened",
+    );
+
+    page["one-lan-toggle"].click();
+    await ui_.expectCell(cfg, (s) => s.settings.host === "0.0.0.0");
+    await ui_.settle();
+
+    // What you see is what runs: the same catalog, the same command builder.
+    assertStringIncludes(ui_.html(), "--host 0.0.0.0");
+    // The address another machine actually dials — 0.0.0.0 is a bind address,
+    // and typing it into the client reaches nothing. Said ONCE: a fragment of
+    // adjacent conditional strings rendered "Reachable at Reachable at —" with
+    // the address missing, which is the trap `ReserveControls` fell into.
+    assertStringIncludes(ui_.html(), "http://192.168.1.24:");
+    assertEquals(
+      (ui_.html().match(/Reachable at/g) ?? []).length,
+      1,
+      "written once, not once per re-render",
+    );
+    // The RISK is not repeated here: an open bind with no API key already
+    // raises a red banner on this page (src/lib/stability.ts), and saying it
+    // twice makes both quieter.
+    assertStringIncludes(
+      ui_.html(),
+      "anyone on the network can use this model",
+    );
+
+    page["one-lan-toggle"].click();
+    await ui_.expectCell(cfg, (s) => s.settings.host === "127.0.0.1");
+    await ui_.settle();
+    assert(!ui_.html().includes("Reachable at"), "and it goes quiet");
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: low priority is on by default, and the run carries it",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // llama.cpp takes every core and every spare IOPS; on the machine it runs
+    // on that reads as "the computer is broken". ON by default, because a model
+    // that makes the desktop stutter is a model the user turns off.
+    await ui_.settle();
+    const page = ui_.find("OnePage");
+    assertExists(page["one-prio-toggle"], "the switch is on this page");
+    assertEquals(cfg.lowPriority, true, "on by default — the PC can breathe");
+
+    page["one-prio-toggle"].click();
+    await ui_.expectCell(cfg, (s) => s.lowPriority === false);
+    page["one-prio-toggle"].click();
+    await ui_.expectCell(cfg, (s) => s.lowPriority === true);
+
+    // It is NOT a llama.cpp flag: nothing about it may reach the command line,
+    // because it is applied to the process after the spawn.
+    await ui_.settle();
+    assert(
+      !ui_.html().includes("nice") || !ui_.html().includes("--nice"),
+      "the argv stays the argv",
+    );
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: the machine dials are coloured by how full they are",
+  {
+    seed: {
+      hw: (() => {
+        const GB = 1024 ** 3;
+        const m = roomyMachine();
+        // A machine under real load: 90% of the CPU, and a card with 22 of its
+        // 24 GB spoken for.
+        m.cpu.utilPct = 90;
+        m.gpus = m.gpus.map((g, i) => ({
+          ...g,
+          utilPct: i === 0 ? 60 : 30,
+          vramUsedB: 22 * GB,
+        }));
+        m.mem = { ...m.mem, usedB: 40 * GB, availableB: 88 * GB };
+        return m;
+      })(),
+    },
+  },
+  async (ui_) => {
+    // Four dials asked the same question — how full, how busy — answer on one
+    // scale: cyan under a quarter, green to half, amber to three quarters, red
+    // past that. They used to be fixed colours, so a card at 96% and a card at
+    // 4% were the same shade of blue.
+    await ui_.settle();
+    const html = ui_.html();
+    // CPU 90% → red. VRAM 44 of 48 GB → red. RAM 40 of 128 → green.
+    // GPU 60% → amber.
+    const dials = [...html.matchAll(/ring-wrap tone-(\w+)/g)].map((m) => m[1]);
+    assertEquals(
+      dials.slice(0, 4),
+      ["bad", "warn", "ok", "bad"],
+      `CPU, GPU, RAM, VRAM by quarter: ${dials.join(",")}`,
+    );
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: one memory section — both states while choosing, only the measured one while a model runs",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // Two panels, "Current" and "Projected", asked the reader to hold two
+    // pictures of the same machine side by side. While nothing is running that
+    // is the point — now and next is the whole decision. Once a model is up it
+    // is not: the projection's question has been answered by the machine
+    // itself, and an estimate beside the measurement of the same thing invites
+    // the reader to wonder which one is wrong.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await ui_.settle();
+
+      const idle = ui_.html();
+      assertStringIncludes(idle, "As it is now", "now");
+      assertStringIncludes(
+        idle,
+        "After starting",
+        "and next, while nothing is running",
+      );
+      assert(
+        !idle.includes("Projected Memory State"),
+        "one section, not two panels",
+      );
+
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: m.path,
+          runSettings: { ...cfg.settings, ngl: 999, ctxSize: 2048 },
+          rssB: 200 * 1024 ** 2,
+          healthy: true,
+          url: "http://127.0.0.1:8080",
+        },
+      });
+      await ui_.settle();
+
+      const live = ui_.html();
+      assertStringIncludes(live, "As it is now", "the measurement stays");
+      assert(
+        !live.includes("After starting"),
+        "and the forecast of the same thing goes",
+      );
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "OnePage: while a model runs, the locked context controls give their space to the log",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The complaint: with a server up, the server log took the whole page and
+    // the panels ran past the bottom of the window. Half of it was a stray
+    // element from a malformed favicon (see tests/guards.test.ts); the other
+    // half is here — 180 pixels of context buttons that CANNOT BE PRESSED
+    // while a model is loaded, sitting above the output everyone reads during
+    // a load. One model runs at a time, so the context is fixed until it stops.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await ui_.settle();
+
+      const idle = ui_.find("OnePage");
+      assertExists(
+        idle["one-ctx-bands"],
+        "every control is there to choose with",
+      );
+      assertExists(idle["one-ctx-presets"]);
+
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: m.path,
+          runSettings: { ...cfg.settings, ngl: 999, ctxSize: 2048 },
+          healthy: true,
+          url: "http://127.0.0.1:8080",
+          log: Array.from(
+            { length: 300 },
+            (_, i) => `llama_model_loader: ${i}`,
+          ),
+        },
+      });
+      await ui_.settle();
+
+      const html = ui_.html();
+      assert(
+        !html.includes("ctx-bands") && !html.includes("ctx-presets") &&
+          !html.includes("ctx-range"),
+        "the controls that cannot be used are not rendered",
+      );
+      assertStringIncludes(
+        html,
+        'class="one-ctx"',
+        "the number itself stays — what the running server uses is worth reading",
+      );
+      // And the log is on the page, in the panel that fills what is left.
+      assertStringIncludes(html, "log log-fill");
+      assertStringIncludes(html, "llama_model_loader: 299");
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "the projection is of the command Start would issue, not a stale one",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The panel says "after starting". With auto-optimal on, what starts is the
+    // TUNER's answer for the machine as it is now — and the tuner is suspended
+    // while a server is up, because a loaded model cannot be re-placed. So the
+    // settings on file drift away from what a restart would use, and projecting
+    // them showed a plan for a command nobody would ever issue: on the reported
+    // machine it drew gigabytes of unplaceable layers while the tuner, asked the
+    // same second, had a plan that fitted.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await cfg.setCtxOverride(0);
+      await cfg.setPlacement("vram");
+      await ui_.settle();
+
+      // Settings that no longer describe what the tuner would choose — the state
+      // a suspended auto-tune leaves behind.
+      await cfg.apply({ ngl: 1, nCpuMoe: 0, ctxSize: 4096 });
+      await ui_.settle();
+
+      const all = placements();
+      assertExists(all, "the tuner has an answer");
+      const projected = projectedStatePlan();
+      assertExists(projected);
+      assertEquals(
+        projected.ctx,
+        all[cfg.placement].ctx,
+        "the projection must be of the tuner's plan, not the stale settings",
+      );
+      assertEquals(
+        projected.layersOnGpu,
+        all[cfg.placement].possible
+          ? computePlan(m.meta!, planningHw(), all[cfg.placement].settings)
+            .layersOnGpu
+          : projected.layersOnGpu,
+      );
+
+      // With auto-optimal OFF the user's own settings are what Start runs, so
+      // those are what gets projected — including a stale-looking one they
+      // typed on purpose.
+      await cfg.toggleAutoOptimal();
+      await ui_.settle();
+      const own = projectedStatePlan();
+      assertExists(own);
+      assertEquals(own.ctx, 4096, "hand-tuned settings are projected as typed");
+      // `-ngl 1` offloads one SLOT, and the output head is the last of them —
+      // so no transformer layer moves. llama.cpp's arithmetic, projected as it
+      // will run rather than as it reads (`src/lib/devsplit.ts:offloadRange`).
+      assertEquals(own.layersOnGpu, 0);
+      await cfg.toggleAutoOptimal();
+    });
   },
 );

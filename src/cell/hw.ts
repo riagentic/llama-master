@@ -32,6 +32,9 @@ export type HwState = {
   gpuHistory: number[];
   vramUsedHistory: number[];
   ramUsedHistory: number[];
+  /** This machine's own IPv4 addresses, for the "Available on LAN" switch:
+   *  0.0.0.0 is what llama-server binds, not what anyone dials. */
+  lanIps: string[];
   lastRefresh: number;
   refreshing: boolean;
   /** Pauses the scheduled poll; a manual refresh still works. */
@@ -52,6 +55,7 @@ export const hw = cell("hw", {
     mem: null as Mem | null,
     gpus: [] as Gpu[],
     disks: [] as Disk[],
+    lanIps: [] as string[],
     appPaths: null as HwState["appPaths"],
     os: "",
     arch: "",
@@ -116,6 +120,11 @@ export const hw = cell("hw", {
       try {
         const io = await import("./hw.server.ts");
         const snap = await io.snapshot();
+        // Cheap enough for the 1 s tick (no subprocess, no file read), and it
+        // changes exactly when a cable or a VPN does — which is precisely when
+        // a stale "reachable at" line would be wrong.
+        const ips = io.lanAddresses();
+        if (ips.join() !== s.lanIps.join()) s.lanIps = ips; // aiol-ok
 
         if (snap.cpu) {
           // aiol-ok: deliberate post-await read. /proc/stat counters are

@@ -67,7 +67,16 @@ Data flow worth knowing:
 - **What you see is what runs.** The UI composes argv with `command.ts` and
   hands that exact array to `srv.start`. There is no second code path.
   `srv.server.ts` refuses any binary outside
-  `~/.llama-master/data/files/builds/`.
+  `~/.llama-master/data/files/builds/`. It is SHOWN by one component
+  (`src/ui/CommandView.tsx`) on the three pages that can change it — all-in-one
+  (under Memory), Tune, Server — rather than by a footer strip pinned under
+  every tab: that strip was the one part of the app that was not a panel and it
+  read as one, taking a band of height from every page for two lines that
+  wrapped anyway. It draws in the chat's `.codeblock` shape because it is the
+  same kind of object (a named block of text with a button that takes it), it
+  composes from `shownSettings()` so a RUNNING server shows the argv it was
+  started with, and the copy button copies ONE line while the page shows the
+  `\`-broken form — what lands in a shell has to be a command.
 - **The process lives in `srv.server.ts`; the cell is its shadow.** `srv.poll`
   (1 s schedule) is the only writer of liveness, so "running" always means the
   pid is alive and `/health` answered.
@@ -138,19 +147,61 @@ Data flow worth knowing:
   `src/lib/adapt.ts` drives three things. (1) `headroomKey` — eighths of each
   pool — is part of the auto-tune key in `OnePage`, so a real change re-tunes
   and 200 MB of jitter does not; keying on `availableB` itself would rewrite the
-  user's settings on every 1 s poll and fight their typing. (2) The reserve is
-  FIXED (`tune.ts:marginB`/`ramMarginB`) — it was briefly widened by observed
-  memory "churn", and that was removed on purpose: the only churn signal
-  available is the device-wide usage series, our own llama-server is inside it,
-  so loading a 39 GB model registered as 39 GB of volatility and the app refused
-  models that fit. A reserve driven by a signal that cannot separate our
-  allocation from everyone else's produces false refusals. (3) `drift` — a
+  user's settings on every 1 s poll and fight their typing. (2) The SAFETY
+  reserve is FIXED (`tune.ts:marginB`/`ramMarginB`) — it was briefly widened by
+  observed memory "churn", and that was removed on purpose: the only churn
+  signal available is the device-wide usage series, our own llama-server is
+  inside it, so loading a 39 GB model registered as 39 GB of volatility and the
+  app refused models that fit. A reserve driven by a signal that cannot separate
+  our allocation from everyone else's produces false refusals. (3) `drift` — a
   loaded model cannot be re-placed, so while a server runs the app does not
   re-tune, it TELLS you: squeezed (someone took memory this run depends on) or
   roomier (enough came back that a restart would get more), each with the
   restart button. Roomier is measured against the free memory recorded at the
   moment the run was spawned (`srv.startFreeVramB/RamB`) — without that baseline
   it fired forever on any machine that simply had headroom.
+- **The user's reserve is a second reserve, and a different kind of thing.**
+  `marginB` above exists so the ALLOCATOR does not fail and the user never sees
+  it; the reserve (`src/lib/reserve.ts`, `src/ui/ReserveControls.tsx`, on both
+  the all-in-one and Tune pages) is the user saying "that card also draws my
+  desktop", because the tuner filling a display card to the last byte is a
+  driver reset mid-generation, and a host pool run to the edge is the OOM killer
+  picking llama-server's neighbour. It is honoured by planning as if the memory
+  were ABSENT, so it enters through `Hw` (`types.ts:Reserve`, attached only in
+  `derive.ts:planningHw`) and every consumer of `plan` — the tuner, the picker,
+  stability, the bars, the per-card packing budgets — inherits it without knowing
+  it exists.
+  - **Three numbers, because the display is on ONE card.** Reserved per GPU
+    (default 0) is charged to every card; reserved on the connected GPU (default
+    8 GB) only to the card(s) with a monitor attached; reserved RAM (16 GB) is
+    the host pool. A single machine-wide VRAM figure divided across the cards
+    was the first design and it is wrong in both directions: it took memory from
+    a headless compute card to defend a desktop that is not on it, and it left
+    the display card with a fraction of what a compositor + browser + game
+    actually need. Applying one figure to every card is the other error — a
+    two-card machine paying twice for one desktop.
+  - **Which card has the display is MEASURED, and "unknown" is a third answer.**
+    `Gpu.display` comes from `nvidia-smi --query-gpu=display_mode,display_active`
+    (cached 30 s — it changes when a monitor is plugged in, not on the 1 s poll;
+    `display_mode` is deprecated on current drivers and returns a sentence, hence
+    reading both) and, for sysfs cards, `/sys/class/drm/<card>-*/status`.
+    Verified against this machine: nvidia-smi index 0 = PCI 01:00.0 = `card2`,
+    which is the one with two connected DisplayPort outputs. `undefined` (a
+    vendor that does not report, no DRM connectors) falls back to card 0 and the
+    UI says it is an assumption; every card answering `false` is taken at its
+    word and reserves nothing (`reserve.ts:displayGpus`).
+  - It is labelled apart from "in use elsewhere" everywhere it is shown
+    (`Pool.reservedB`), because a refusal caused by the user's own setting has to
+    name the control that gives the memory back. In the memory MAP that means a
+    band with a colour of its own (teal, `--seg-reserved`, still hatched because
+    a decision must not look like a measurement) and an entry in the legend: it
+    was drawn all along in the machine's greys and named nowhere, so the one
+    band the user put there themselves read as empty track — which is the one
+    thing it is not. The region foot counts it as a third figure, because
+    reserved bytes are neither used (nothing is in them) nor free (nothing may
+    go in them). `hwSnapshot` never carries it —
+    the current-state view reports real free memory; reserved bytes are free until
+    something takes them, they are merely not SPENDABLE.
 - **Of the four context bands, only Max is a fact.** `.katana/context.md` asks
   for Min / Opt / Big / Max buttons and a picture of the usable range
   (`src/lib/tune.ts:ctxBands`, `src/ui/CtxControls.tsx`, on both the all-in-one
@@ -180,6 +231,32 @@ Data flow worth knowing:
   (`src/ui/sticky.ts`) over one pure policy (`src/lib/scroll.ts`): an arrival
   forces the scroll, a streamed token only follows when the reader is already at
   the bottom. `tests/guards.test.ts` fails if a new surface forgets.
+- **A reply is blocks, not a string — and both chats draw it the same way.**
+  What a local model answers with most is code and file contents, and one
+  pre-wrapped string made the fences visible, the indentation fight the prose,
+  and taking a file a drag-select that caught the ``` at both ends.
+  `src/lib/richtext.ts` splits a reply into text and fenced blocks (pure: the
+  fence rules have edge cases — a longer fence containing a shorter one, an
+  indented fence, and above all an UNCLOSED one, which is every block while it
+  is still streaming and must render as a block rather than reflowing into one
+  the second the model finishes). Every common spelling of the info string is
+  read, because there is no standard and a model trained on all of them emits
+  all of them: `ts`, `src/lib/plan.ts`, `ts src/lib/plan.ts`, `ts:src/…`,
+  `title="…"`. The block header names the FILE over the language, and carries
+  its own copy button — the file is the unit people want, not the message.
+  `src/ui/ChatMessage.tsx` is the one renderer for both surfaces: they had
+  drifted (tok/s above the answer on one, below on the other; the
+  "ended while still thinking" fallback on only one), which is what two copies
+  of a message renderer always do. tok/s belongs AFTER the answer — it is a
+  measurement of the thing above it, and printing it in the role line put a
+  number the user cannot have yet over the text they are waiting for.
+- **One Memory section, and what is in it depends on whether the answer is
+  already known.** Nothing running: both maps, now and next, because that IS
+  the decision. A model running: only the measurement — the projection's
+  question has been answered by the machine itself, and an estimate beside the
+  measurement of the same thing asks the reader which one to believe. What a
+  restart would cost is still on screen, in the placement picker and the fit
+  line (`src/ui/OnePage.tsx`, keyed on `memoryIsLive()`).
 - **Memory numbers are exact, not estimated.** `rust/src/gguf.rs` walks the
   tensor table and reports per-layer bytes with routed experts separated; only
   the compute buffer is an estimate, and it is labelled as one everywhere.
@@ -212,6 +289,31 @@ Data flow worth knowing:
   slot, packs them into the cards in order, and emits the `-ts` that pins the
   result; `plan.devices.fits` is a separate constraint from `vram.overB === 0`,
   and `tune` requires both.
+- **A placement that has already happened is not a prediction.** That packer is
+  the most valuable thing in a PROPOSAL and a liability in a description of a
+  live run: its per-card budgets hold back the safety reserve, the user's
+  reserve and the device's scratch, and the live path re-derives our own
+  footprint by proportion (`withoutOurUsage`) — which under-counts, because
+  llama.cpp's real VRAM overhead is larger than the estimate (measured 1.6 GB
+  more on DeepSeek-V4 across two cards). Re-packing a LOADED model therefore
+  came up ~1 GB short and the machine panel announced "1010 MB of layers have
+  nowhere to go — no card has room for them, however the cut is made" about a
+  server that was answering prompts, with `vram.overB` reading 0 on the same
+  screen. So `plan()` takes a `PlanQuestion`: `"proposed"` (the packer decides)
+  or `"running"` (the MEASUREMENT decides — `vram.overB`, which is also what
+  `drift` reads, so genuine pressure is still reported). `currentStatePlan()` is
+  the only caller that passes `"running"`, and it is the only one describing
+  something that already exists.
+- **The projection is of the command Start would issue.** The panel says "after
+  starting", and with auto-optimal on what starts is the tuner's answer for the
+  machine as it is NOW — while the tuner is deliberately suspended during a run,
+  so `cfg.settings` drifts away from it. Projecting those stale settings drew a
+  plan for a command nobody would ever issue (gigabytes of unplaceable layers,
+  beside a tuner that had a fitting plan the same second).
+  `derive.ts:projectedSettings` closes that: the tuner's settings when it is on,
+  the user's own — pin included — when it is off. `placements()`/`measuredCtx()`
+  live in `derive.ts` for this reason (re-exported from `actions.ts`): they are
+  derived values, and the projection needs them without an import cycle.
 - **`-ngl` counts the output head, and never moves the embeddings.** There are
   `nLayer + 1` slots, so `-ngl 43` on a 43-layer model offloads layers 1..42 AND
   the output, leaving layer 0 on the host; only `-ngl > nLayer` takes every
@@ -304,6 +406,15 @@ cannot act on is a bug.
   fixed. `am` against the running app is still the fastest way to confirm
   anything involving a real process, but it is no longer compensating for the
   harness.
+- **Renaming a persisted field is a migration, written or not.** `cfg` is
+  `version: 2` with an `onMigrate` that drops `reserveVramB` — without it aio
+  deep-merges the stored blob over the defaults, keeps the orphaned key forever
+  and says so on every boot ("shape drift: 1 stored field(s) no longer match the
+  declared shape"). Verified by seeding a store with the old world: the boot
+  reported `{cell: "cfg", from: 0, to: 2, outcome: "migrated"}` and the key was
+  gone. The old value is deliberately NOT carried forward — it meant "hold this
+  much across the whole machine, divided between the cards", which is neither of
+  the fields that replaced it. Pinned in `tests/cells.test.ts`.
 - **An `own` effect must name the resource it owns.** `own.set(key, …)` with a
   key already in use **disposes the previous effect** — so a teardown written as
   "stop the server" stops whatever is running _now_, not the process that effect
@@ -314,7 +425,37 @@ cannot act on is a bug.
   run that **crashed** rather than being stopped (`stop` disposes the effect
   cleanly). Pinned by `tests/runtime.test.ts`. (aio ≤ alpha37 also ignored `own`
   effects in the in-process harnesses, which hid it entirely; alpha38 acquires
-  and disposes them for real and warns once per replaced key.)
+  and disposes them for real and warns once per replaced key.) The slot is keyed
+  BY PID now — `srv:process:<pid>`, which is aio's own advice for this case
+  (`docs/state/methods.md`: "give each resource its own id") and what stops the
+  framework warning that a live resource was displaced; the dead process's slot
+  is released in the same effect, so a session of starts does not accumulate
+  no-op disposers. `stop()` also ends with `if (slot === s) slot = null`: it
+  awaits the child's exit, and a start landing in that window had its slot
+  erased, leaving every later stop, rss reading and liveness poll working from
+  "nothing is running" while llama-server held its VRAM.
+- **The all-in-one page is a budget, and the machine column is where it runs
+  out.** Three columns, each scrolling alone, and the left one carries the
+  vitals, both memory states and the command — so anything added there has to
+  be paid for. It was paid for once already: the vitals lost their sparklines
+  and two sub-lines apiece (the history graphs are one click away on the pages
+  built for them), the current-state table is drawn only when something IS
+  running (idle, every row of it is a zero the map above already shows), the two
+  maps share one legend and drop the "Memory map — 234 GB total" caption they
+  both repeated, and the command shows the server line wrapped rather than one
+  flag per line. Verified the way layout has to be verified — by looking:
+  `chromium --headless --window-size=1600,1000 --screenshot` against the running
+  dev server (`am instances` for the port). For what a picture cannot settle,
+  the same chromium with `--remote-debugging-port` and a five-line CDP client
+  reports `getBoundingClientRect`/`scrollHeight` for any selector — which is how
+  the favicon above was found, and how "the log is below the fold" stopped being
+  a matter of opinion.
+- **A run of adjacent conditional strings in a fragment is not one text node.**
+  `ReserveControls` built its summary as `{a}{cond ? " x" : ""}{cond2 ? …}`
+  inside a `<>…</>`; re-rendered on a keystroke, the reconciler left the
+  previous sentence beside the new one and the line explaining a refusal
+  appeared TWICE, with two different numbers. Build the sentence in the
+  component body and interpolate it once. Pinned in `tests/ui.test.ts`.
 - **"The log below" must actually be below.** Every diagnosis this app writes
   points at the log; a page that shows a diagnosis therefore renders
   `ServerLog`/`LogView` itself rather than pointing at another tab.
@@ -348,6 +489,22 @@ cannot act on is a bug.
   Cancellation now lives in `srv.server.ts` as `stopGeneration`, which the spawn
   checks after creating the process: it is the module that owns the process, and
   it is not subject to cell-state timing. Pinned in `tests/server.test.ts`.
+- **A streaming reply must survive the app closing under it.** Shutting down
+  aborts every in-flight method (aio `abortAllInflight`, Phase 1) before it
+  persists, so `chat.send` reaches its abort branch mid-reply — and what it
+  writes there is what the user gets back. It records `acc`/`think`, never
+  `s.partial`, which is only as fresh as the last flush. Before this, a window
+  closed during a reply printed an `EFFECT_ASYNC_ERROR` block over
+  `chat:__setSend` and lost the whole answer, because aio closed dispatch before
+  draining the effect that was still writing (fixed in aio;
+  `tests/cells.test.ts` pins our half against a real SSE stream).
+- **Publishing a partial reply is a full re-send, so the cadence is a byte
+  rate.** A state write of a string sends the whole string to every client;
+  flushing every 60 ms therefore costs `length × 16.7/s` — quadratic in the
+  reply, doubled per open window, and measured at a sustained
+  `PRESSURE — 33 broadcasts/sec` against aio's threshold of 30.
+  `sse.ts:flushDelayMs` holds the byte rate flat instead (64 KiB/s, clamped to
+  60–500 ms), which makes a long answer cost the same per second as a short one.
 - **Clamp everything that comes out of a GGUF header.** A truncated or hostile
   file can yield NaN or a negative, `nHead: 0` makes the head-dim fallback
   `0 / 0`, and one such value poisons every total it reaches — silently, because
@@ -362,6 +519,76 @@ cannot act on is a bug.
   `lastError` and render it. Never swallow.
 - **`.slice()`, not spread**, on live async state arrays.
 - Tests live in `tests/`, never beside their source.
+
+- **The desktop goes first, by default.** llama.cpp will take every core and
+  every spare IOPS, and on the machine it runs on that reads as "the computer is
+  broken". "Low priority" (ON by default, `cfg.lowPriority`) puts the process at
+  nice 19 in the idle I/O class — it gets everything nothing else wants, which
+  on an idle machine is everything. Two queues, because CPU is not the half that
+  hurts: reading 145 GB of weights off an NVMe stutters a desktop whatever the
+  nice value is (`src/lib/priority.ts`).
+  - **Applied to the PID after the spawn, never by wrapping the command.**
+    `nice <bin> …` would put `/usr/bin/nice` at the front of the argv, which
+    breaks two promises at once: the command on screen would stop being the
+    command that runs, and `srv.server.ts` refuses any binary outside the builds
+    root — a sandbox rule, not a formality. `renice`/`ionice` by pid keep both,
+    for the price of a few milliseconds at normal priority during a load that
+    takes a minute. Every fit-ladder rung is a fresh process and is reniced too,
+    from `srv.runLowPriority` (the RUN's choice, not the toggle's current
+    position two minutes later).
+  - **It degrades rather than fails.** The idle I/O class is refused on some
+    kernels and in containers, so the fallback is the lowest best-effort band;
+    a machine with no `ionice` at all still gets the renice. Whatever happened
+    is one line in the server log, including "could not lower the priority" —
+    a run left at normal priority while the switch says otherwise is the kind of
+    silent disagreement this app refuses everywhere else. `tests/server.test.ts`
+    reads `/proc/<pid>/stat` back and asserts the KERNEL agrees, both ways.
+  - Turning it off while a server runs says "takes effect on the next start",
+    because lowering a priority needs no privileges but raising one back does.
+- **"Available on LAN" is one flag, one switch, two pages.** llama-server binds
+  to 127.0.0.1 unless told otherwise, so it is invisible from every other
+  machine — the commonest reason the client (`client/`) finds nothing. The
+  switch writes `--host` through the catalog like any other setting
+  (`src/ui/LanSwitch.tsx` → `cfg.set("host", …)`), so the command strip, the
+  argv that is spawned and the switch cannot disagree. OFF by default: binding
+  to the world is not a default. What it adds beside itself is the ADDRESS —
+  `0.0.0.0` is what llama-server binds, not what anyone dials, and typing it
+  into the client reaches nothing (`src/lib/lan.ts:pickLanIp` over
+  `hw.lanIps`, a real LAN address ahead of a link-local one). What it does NOT
+  repeat is the risk: an open bind with no API key already raises a red banner
+  on the same page (`stability.ts:189`), and saying it twice makes both
+  quieter. It lives in its own `run-row`, not in the actions row — there its
+  address line wrapped into a narrow column and squeezed Start against it.
+
+## The client (`client/`)
+
+A second, standalone aio app in this repository: a LAN chat client for a
+llama.master somebody else is running (`.katana/client.md`). `deno task dev`,
+`deno task verify` and `deno task am` all work from inside `client/`.
+
+- **It watches; it never operates.** Everything it shows comes from the far
+  end's own endpoints — `/props` (what is loaded), `/health` (is it up),
+  `/metrics` or `/slots` (how busy), `/v1/chat/completions` (the conversation).
+  There is no start, no stop, no settings, and a UI test asserts that no other
+  path is ever requested.
+- **Discovery is a sweep, because llama-server does not announce itself.** One
+  /24 (this machine's own subnets, private ranges only), the four ports llama.cpp
+  is served on, 64 probes in flight, localhost first — and the identifying answer
+  is `/props`, not a 200, or every router admin page on the subnet would be
+  reported as a server (`client/src/lib/discover.ts`).
+- **The commonest LAN failure has a sentence, not a shrug.** llama.cpp binds to
+  127.0.0.1 unless told otherwise, so it is invisible from every other machine;
+  both "unreachable" and "nothing found" name `--host 0.0.0.0`.
+- **An absent reading is not a zero.** `--metrics` is off by default, so
+  occupancy is three-valued: a number, or "not reported (server does not publish
+  it)". A client that renders 0% because it could not ask is lying.
+- **The shared libraries are COPIED, and a test polices the copy.** aio serves
+  the browser bundle only from inside the app's own root and refuses a symlink
+  out of it (`server-static.ts`), so `client/src/shared/` is a mechanical copy of
+  `src/lib` made by `deno task sync`; `client/tests/shared.test.ts` fails the
+  moment the two differ, naming the command that fixes it. Same arrangement as
+  `src/llama-sys.wasm`: committed so nothing has to be built, guarded so it
+  cannot fall behind.
 
 ## Katas
 

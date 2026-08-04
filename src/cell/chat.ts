@@ -10,7 +10,13 @@
 
 import { cell } from "aio";
 import type { MethodDraftMeta } from "aio";
-import { deltaReasoning, deltaText, parseSse, timingsTps } from "../lib/sse.ts";
+import {
+  deltaReasoning,
+  deltaText,
+  flushDelayMs,
+  parseSse,
+  timingsTps,
+} from "../lib/sse.ts";
 import type { ChatMessage } from "../lib/types.ts";
 
 export type ChatState = {
@@ -28,10 +34,6 @@ export type ChatState = {
   lastTps: number;
   lastError: string;
 };
-
-/** Flush the partial reply to state at most this often. One dispatch per token
- *  would put a network round trip per token on every connected client. */
-const FLUSH_MS = 60;
 
 export const chat = cell("chat", {
   // A conversation is worth keeping across restarts; the in-flight fields are
@@ -97,6 +99,15 @@ export const chat = cell("chat", {
       s.partialThink = "";
       s.lastError = "";
 
+      // Outside the try: what arrived so far is the only thing worth keeping
+      // when the stream is cut, and a cut can come from the user (Stop) or
+      // from shutdown (the app aborts every in-flight method before it
+      // persists). `s.partial` is only as fresh as the last flush — up to half
+      // a second stale — so the reply that gets written down is this one.
+      let acc = "";
+      let think = "";
+      let tps = 0;
+
       try {
         const res = await fetch(`${url}/v1/chat/completions`, {
           method: "POST",
@@ -121,9 +132,6 @@ export const chat = cell("chat", {
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = "";
-        let acc = "";
-        let think = "";
-        let tps = 0;
         let lastFlush = 0;
 
         for (;;) {
@@ -143,8 +151,13 @@ export const chat = cell("chat", {
             think += deltaReasoning(e.data);
             tps = timingsTps(e.data) ?? tps;
           }
+          // One dispatch per token would put a network round trip per token on
+          // every connected client; a fixed cadence would instead re-send the
+          // whole (growing) reply 16 times a second. `flushDelayMs` holds the
+          // BYTE rate flat, so a long answer costs no more per second than a
+          // short one — and the two writes below are one commit, one push.
           const now = Date.now();
-          if (now - lastFlush >= FLUSH_MS) {
+          if (now - lastFlush >= flushDelayMs(acc.length + think.length)) {
             lastFlush = now;
             s.partial = acc;
             s.partialThink = think;
@@ -165,12 +178,15 @@ export const chat = cell("chat", {
         s.lastTps = tps;
       } catch (e) {
         if (s.$signal?.aborted) {
-          // A user-cancelled stream is not an error; keep whatever arrived.
-          if (s.partial || s.partialThink) {
+          // A cancelled stream is not an error — neither the user's Stop nor
+          // the app closing under it. Keep whatever arrived, and keep it from
+          // `acc`/`think`, which are always ahead of the last flush.
+          if (acc || think) {
             s.messages.push({
               role: "assistant",
-              content: s.partial,
-              ...(s.partialThink ? { thinking: s.partialThink } : {}),
+              content: acc,
+              ...(think ? { thinking: think } : {}),
+              ...(tps ? { tps } : {}),
             });
           }
         } else {

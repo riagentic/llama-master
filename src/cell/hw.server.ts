@@ -147,10 +147,79 @@ const NVIDIA_QUERY = [
   "--format=csv,noheader,nounits",
 ];
 
+/**
+ * Which NVIDIA cards have a display attached, in `nvidia-smi` index order.
+ *
+ * A SECOND query rather than two more columns on `NVIDIA_QUERY`: that CSV's
+ * shape is `sys::gpu`'s contract (rust/src/sys.rs), and widening it there would
+ * mean a wasm rebuild to read a field the planner wants and the parser does not.
+ *
+ * Both fields are asked because they answer slightly different questions and
+ * either one being `Enabled` means there is a screen to defend: `display_mode`
+ * is "a display is connected", `display_active` is "one is initialised on this
+ * GPU". `[N/A]` — an older driver, a non-display card — is `undefined`, which
+ * `src/lib/reserve.ts:displayGpus` treats as "not known", not as "no".
+ */
+async function nvidiaDisplays(): Promise<(boolean | undefined)[]> {
+  // Cached, because `snapshot()` runs every second and this one does not
+  // change on that cadence — a monitor gets plugged in about as often as a
+  // machine is rebooted. A second spawn of `nvidia-smi` per second to re-read a
+  // constant is a cost the poll should not carry.
+  const now = Date.now();
+  if (nvDisplayCache && now - nvDisplayCache.at < DISPLAY_TTL_MS) {
+    return nvDisplayCache.v;
+  }
+  const r = await exec("nvidia-smi", [
+    "--query-gpu=display_mode,display_active",
+    "--format=csv,noheader",
+  ]);
+  const v = r.code !== 0
+    ? []
+    : r.stdout.split("\n").filter((l) => l.trim() !== "").map((line) => {
+      const f = line.split(",").map((s) => s.trim().toLowerCase());
+      if (f.some((s) => s === "enabled")) return true;
+      if (f.some((s) => s === "disabled")) return false;
+      return undefined;
+    });
+  nvDisplayCache = { at: now, v };
+  return v;
+}
+
+let nvDisplayCache: { at: number; v: (boolean | undefined)[] } | null = null;
+const DISPLAY_TTL_MS = 30_000;
+
+/**
+ * Does this DRM card have a connected connector?
+ *
+ * The kernel exposes one `cardN-<connector>` directory per output with a
+ * `status` file that reads `connected` or `disconnected`. That is the same
+ * reading a display manager uses, and it needs no root and no vendor tool.
+ * No connectors at all (a compute-only card, a headless enumeration) is
+ * `undefined` rather than `false`: nothing was measured.
+ */
+async function drmDisplay(card: string): Promise<boolean | undefined> {
+  let seen = false;
+  try {
+    for await (const e of Deno.readDir("/sys/class/drm")) {
+      if (!e.name.startsWith(`${card}-`)) continue;
+      seen = true;
+      const st = (await read(`/sys/class/drm/${e.name}/status`)).trim();
+      if (st === "connected") return true;
+    }
+  } catch {
+    // No /sys/class/drm — nothing known either way.
+  }
+  return seen ? false : undefined;
+}
+
 /** AMD cards through sysfs: one tab-separated line per card, exactly the shape
- *  `sys::gpu` expects. */
-async function amdSysfs(): Promise<string> {
+ *  `sys::gpu` expects, plus the display reading for each in the same order. */
+async function amdSysfs(): Promise<{
+  text: string;
+  displays: (boolean | undefined)[];
+}> {
   const lines: string[] = [];
+  const displays: (boolean | undefined)[] = [];
   try {
     for await (const e of Deno.readDir("/sys/class/drm")) {
       if (!/^card\d+$/.test(e.name)) continue;
@@ -175,32 +244,69 @@ async function amdSysfs(): Promise<string> {
       const name = (await read(`${dev}/product_name`)).trim() ||
         `AMD GPU (${e.name})`;
       lines.push([name, temp, busy, used, total, power].join("\t"));
+      displays.push(await drmDisplay(e.name));
     }
   } catch {
     // No /sys/class/drm — not Linux, or no DRM devices.
   }
-  return lines.join("\n");
+  return { text: lines.join("\n"), displays };
+}
+
+/**
+ * Every IPv4 address this machine has, as the OS reports them.
+ *
+ * For the "Available on LAN" switch: binding llama-server to 0.0.0.0 is only
+ * half an answer — the other half is which address another machine should
+ * dial, and `0.0.0.0` is not one (`src/lib/lan.ts`). Ordering is the OS's, and
+ * the choosing is `pickLanIp`'s; this only reads.
+ */
+export function lanAddresses(): string[] {
+  try {
+    return Deno.networkInterfaces()
+      .filter((n) => n.family === "IPv4")
+      .map((n) => n.address);
+  } catch {
+    // No permission, or a platform that does not report them. The switch still
+    // works; only the "reachable at …" line goes quiet, which is honest.
+    return [];
+  }
 }
 
 export async function gpus(): Promise<Gpu[]> {
-  const [nv, amd] = await Promise.all([
+  const [nv, nvDisplays, amd] = await Promise.all([
     exec("nvidia-smi", NVIDIA_QUERY),
-    PLATFORM === "linux" ? amdSysfs() : Promise.resolve(""),
+    nvidiaDisplays(),
+    PLATFORM === "linux"
+      ? amdSysfs()
+      : Promise.resolve({ text: "", displays: [] }),
   ]);
   const nvCsv = nv.code === 0 ? nv.stdout : "";
-  if (!nvCsv && !amd) return [];
-  const list = await gpuJson(nvCsv, amd);
-  return list.map((g) => ({
-    vendor: (g.vendor as Gpu["vendor"]) ?? "nvidia",
-    name: String(g.name ?? "GPU"),
-    tempC: Number(g.tempC ?? 0),
-    utilPct: Number(g.utilPct ?? 0),
-    vramTotalB: Number(g.vramTotalB ?? 0),
-    vramUsedB: Number(g.vramUsedB ?? 0),
-    powerW: Number(g.powerW ?? 0),
-    powerLimitW: Number(g.powerLimitW ?? 0),
-    computeCap: Number(g.computeCap ?? 0),
-  }));
+  if (!nvCsv && !amd.text) return [];
+  const list = await gpuJson(nvCsv, amd.text);
+  // `sys::gpu` emits the NVIDIA cards first, in CSV order, then the sysfs cards
+  // in the order they were assembled above — so the display readings zip back on
+  // by vendor, in order. Keeping that here rather than in the Rust core is what
+  // lets a new reading ship without a wasm rebuild.
+  let nvIdx = 0;
+  let amdIdx = 0;
+  return list.map((g) => {
+    const vendor = (g.vendor as Gpu["vendor"]) ?? "nvidia";
+    const display = vendor === "nvidia"
+      ? nvDisplays[nvIdx++]
+      : amd.displays[amdIdx++];
+    return {
+      vendor,
+      name: String(g.name ?? "GPU"),
+      tempC: Number(g.tempC ?? 0),
+      utilPct: Number(g.utilPct ?? 0),
+      vramTotalB: Number(g.vramTotalB ?? 0),
+      vramUsedB: Number(g.vramUsedB ?? 0),
+      powerW: Number(g.powerW ?? 0),
+      powerLimitW: Number(g.powerLimitW ?? 0),
+      computeCap: Number(g.computeCap ?? 0),
+      display,
+    };
+  });
 }
 
 /** One shot of everything, read in parallel. */

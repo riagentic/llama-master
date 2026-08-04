@@ -5,11 +5,8 @@
 // status light and a decoration.
 
 import { srv } from "../cell/srv.ts";
-import { cfg } from "../cell/cfg.ts";
 import { duration, stamp } from "../lib/format.ts";
-import { commandBlock } from "../lib/command.ts";
 import {
-  cliBin,
   endpoint,
   serverBin,
   startBlocker,
@@ -18,6 +15,7 @@ import {
 } from "./actions.ts";
 import { Empty, ErrorNote, KV, LogView, Panel, Pill } from "./kit.tsx";
 import { Guidance } from "./Guidance.tsx";
+import { CommandPanel } from "./CommandView.tsx";
 import { activeBuild, currentModel, serverRunning } from "./derive.ts";
 
 /**
@@ -232,44 +230,12 @@ export function ServerPanel() {
           <Props />
         </Panel>
 
-        <Panel
-          title="Command"
-          icon="›"
-          right={
-            <button
-              type="button"
-              class="btn tiny"
-              title="Copy the server command"
-              onClick={() => {
-                void navigator.clipboard?.writeText(
-                  commandBlock("server", {
-                    bin: serverBin() || "llama-server",
-                    model: model?.path ?? "",
-                    settings: cfg.settings,
-                  }).join(" ").replace(/\s+/g, " "),
-                );
-              }}
-            >
-              Copy
-            </button>
-          }
-        >
-          <pre class="cmd" t="server-command">
-            {commandBlock("server", {
-              bin: serverBin() || "llama-server",
-              model: model?.path ?? "",
-              settings: cfg.settings,
-            }).join(" \\\n")}
-          </pre>
-          <div class="sub-label">llama-cli equivalent</div>
-          <pre class="cmd dim" t="cli-command">
-            {commandBlock("cli", {
-              bin: cliBin() || "llama-cli",
-              model: model?.path ?? "",
-              settings: cfg.settings,
-            }).join(" \\\n")}
-          </pre>
-        </Panel>
+        {
+          /* The same section the all-in-one and Tune pages show — one
+             implementation, so the command on this page cannot disagree with
+             the command on that one. */
+        }
+        <CommandPanel t="server-cmd" />
 
         <ServerLog rows={18} />
       </div>

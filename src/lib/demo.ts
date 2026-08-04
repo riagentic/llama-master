@@ -58,6 +58,10 @@ export function demoGpus(): Gpu[] {
       vramUsedB: 1.4 * GB,
       powerW: 62,
       powerLimitW: 320,
+      // The demo machine has a screen on its only card — the ordinary
+      // workstation this app is for, and the case the connected-GPU reserve
+      // exists to defend.
+      display: true,
     },
   ];
 }

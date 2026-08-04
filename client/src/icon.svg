@@ -1,0 +1,16 @@
+<!-- client/src/icon.svg — the client's mark.
+     The same diamond and the same tile as llama.master's own icon (src/icon.svg
+     one directory up), in the client's colour: cyan (#4cc9f0, the `busy` custom property
+     in client/src/style.css) rather than the server app's amber. One family, two
+     apps — on a dock with both open, which is which has to be readable at 16px.
+     This file is the source; src/icon.png is generated from it and the packager
+     (dep/aio/src/build/build-electron.ts) picks that up. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64"
+  height="64" role="img" aria-label="llama.master client">
+  <title>llama.master client</title>
+  <rect width="64" height="64" rx="14" fill="#0c0f14" />
+  <rect x="0.5" y="0.5" width="63" height="63" rx="13.5" fill="none"
+    stroke="#222936" />
+  <rect x="20" y="20" width="24" height="24" rx="4" transform="rotate(45 32 32)"
+    fill="#4cc9f0" />
+</svg>

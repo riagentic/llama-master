@@ -24,7 +24,14 @@ import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
 import { drift, headroomKey } from "../lib/adapt.ts";
-import { optimalCtx, pinnedCtx, trainedCtx } from "../lib/tune.ts";
+import {
+  bestPlacement,
+  optimalCtx,
+  pinnedCtx,
+  trainedCtx,
+  tuneAll,
+} from "../lib/tune.ts";
+import type { Placement, Tuning } from "../lib/tune.ts";
 import { loadProgress } from "../lib/loadprogress.ts";
 import type { LoadProgress } from "../lib/loadprogress.ts";
 import {
@@ -37,10 +44,18 @@ import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
 import { str } from "../lib/params.ts";
+import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
 import type { UpdateCheck } from "../lib/update.ts";
 import type { FixPlan } from "../lib/fixplan.ts";
-import type { Build, Hw, Model, Prereq, Settings } from "../lib/types.ts";
+import type {
+  Build,
+  Hw,
+  Model,
+  Prereq,
+  Reserve,
+  Settings,
+} from "../lib/types.ts";
 
 // ── models ─────────────────────────────────────────────────────────────────
 
@@ -296,13 +311,19 @@ export function currentStatePlan(): Plan {
     // paint the over-capacity hatch on a machine that comfortably fits, so take
     // our share out of "everyone else" first. Our buckets do not depend on what
     // anyone else holds, so the first pass is only there to size us.
-    const raw = computePlan(m, hwSnapshot(), srv.runSettings);
+    const raw = computePlan(m, hwSnapshot(), srv.runSettings, "running");
     const base = withoutOurUsage(
       hwSnapshot(),
       raw.vram.usedB,
       srv.rssB || raw.ram.usedB,
     );
-    return computePlan(m, base, srv.runSettings);
+    // "running", so the fitter does not re-litigate a placement llama.cpp has
+    // already made. It used to: the per-card budgets hold back a safety
+    // reserve and our own footprint is re-derived by proportion, so re-packing
+    // a loaded model came up short and this panel announced "1010 MB of layers
+    // have nowhere to go" while `vram.overB` read 0 beside it and the model
+    // answered prompts (`src/lib/plan.ts:PlanQuestion`).
+    return computePlan(m, base, srv.runSettings, "running");
   }
   return computePlan(NO_MODEL, hwSnapshot(), { ...cfg.settings, ngl: 0 });
 }
@@ -339,32 +360,111 @@ export function ourUsageB(): { vramB: number; ramB: number } {
  */
 export function planningHw(): Hw {
   const ours = ourUsageB();
-  if (ours.vramB === 0 && ours.ramB === 0) return hwSnapshot();
-  return withoutOurUsage(hwSnapshot(), ours.vramB, ours.ramB);
+  const base = ours.vramB === 0 && ours.ramB === 0
+    ? hwSnapshot()
+    : withoutOurUsage(hwSnapshot(), ours.vramB, ours.ramB);
+  // The user's own claim on the machine, attached HERE and nowhere else: this
+  // is the one function every "what would happen if we started this" question
+  // goes through, and the reserve has to bind all of them — the tuner, the
+  // placement picker, the stability check, the projected bars — or it would be
+  // a number that changes one screen and not the run.
+  //
+  // Deliberately NOT on `hwSnapshot()`: that is the machine as it is, and the
+  // current-state view must keep reporting real free memory. Reserved bytes are
+  // free until something takes them; what they must never be is SPENDABLE.
+  return { ...base, reserve: reserveNow() };
+}
+
+/** What the user has told the app to keep for themselves. */
+export function reserveNow(): Reserve {
+  return {
+    perGpuB: cfg.reservePerGpuVramB,
+    connectedB: cfg.reserveConnectedVramB,
+    ramB: cfg.reserveRamB,
+  };
+}
+
+/**
+ * Every placement for the current model, so the UI can compare them without
+ * three separate calls. Null when no model with a readable header is selected.
+ */
+export function placements(): Record<Placement, Tuning> | null {
+  const m = currentModel();
+  if (!m?.meta) return null;
+  return tuneAll(
+    m.meta,
+    // NOT raw telemetry: while our own server is up its VRAM is inside the
+    // driver's device-wide figure, and planning against that reported "VRAM only:
+    // does not fit" for the model that was running in VRAM only at the time.
+    planningHw(),
+    cfg.settings,
+    // Two different things, and passing them as one number conflated an
+    // instruction with a hint: a context the user typed is EXACT (the tuner
+    // holds it and reports the shortfall when it cannot), while the measured
+    // fit is only a search ceiling for the automatic path — aiming past it
+    // would just walk the retry ladder back down (`src/lib/fitladder.ts`).
+    ctxOverride() || undefined,
+    measuredCtx(m.path) || undefined,
+  );
+}
+
+/** The largest context this model has been observed to actually start at on
+ *  this machine, or 0 if it has never run. */
+export function measuredCtx(path: string): number {
+  return cfg.fitCtx[path] ?? 0;
+}
+
+/**
+ * The settings a Start pressed NOW would actually run.
+ *
+ * Not always `cfg.settings`. With auto-optimal on, Start re-tunes first
+ * (`actions.ts:applyOptimal`), and the tuner is suspended while a server is up —
+ * a loaded model cannot be re-placed, so the app deliberately stops rewriting
+ * settings under it. The consequence was that the panel titled "after starting"
+ * projected a settings map tuned at some earlier moment, and on a machine whose
+ * memory had moved since, that stale map does not fit: the projection reported
+ * gigabytes of layers with nowhere to go for a command nobody was ever going to
+ * issue. What a restart would get is the TUNER's answer for the machine as it is
+ * now, which is what this returns.
+ *
+ * With auto-optimal off the user's own settings are what Start runs, so those
+ * are what gets projected — including a pinned context, which the tuner would
+ * otherwise be the only thing writing in.
+ */
+export function projectedSettings(): Settings {
+  const m = currentModel()?.meta;
+  const pin = m ? ctxOverride() : 0;
+  // The clamp is the pin's own (`pinnedCtx`), so the number projected is the
+  // number that would run. A user pinned 1M, the map did not move, and "so what
+  // memory is missing?" had no answer anywhere on the page.
+  const own: Settings = pin > 0 && m
+    ? { ...cfg.settings, ctxSize: pinnedCtx(pin, trainedCtx(m)) }
+    : cfg.settings;
+  if (!cfg.autoOptimal) return own;
+  const all = placements();
+  if (!all) return own;
+  // Start's own fallback rule: the chosen placement, or the best one that can
+  // run this model when the chosen one cannot (`actions.ts:tunedForStart`). A
+  // refusal keeps the user's settings so the projection still SHOWS what is
+  // missing rather than drawing a fitting plan of something else.
+  const chosen = all[cfg.placement].possible
+    ? cfg.placement
+    : bestPlacement(all);
+  return all[chosen].possible ? all[chosen].settings : own;
 }
 
 /**
  * The machine as it WILL look once the selected model runs.
  *
  * Current state, minus whatever llama.master is holding now, plus the selected
- * model under the selected settings — which is the definition that stops a
- * running model being counted twice. Null when no model with a readable header
- * is selected.
+ * model under the settings a Start would use — which is the definition that
+ * stops a running model being counted twice. Null when no model with a readable
+ * header is selected.
  */
 export function projectedStatePlan(): Plan | null {
   const m = currentModel()?.meta;
   if (!m) return null;
-  // A pinned context is IN the projection, always. With auto-optimal on the
-  // tuner writes it into the settings anyway; with it off, projecting from
-  // `cfg.settings` alone showed the previous tune's context — a user pinned
-  // 1M, the map did not move, and "so what memory is missing?" had no answer
-  // anywhere on the page. The clamp is the pin's own (`pinnedCtx`), so the
-  // number projected is the number that would run.
-  const pin = ctxOverride();
-  const settings = pin > 0
-    ? { ...cfg.settings, ctxSize: pinnedCtx(pin, trainedCtx(m)) }
-    : cfg.settings;
-  return computePlan(m, planningHw(), settings);
+  return computePlan(m, planningHw(), projectedSettings());
 }
 
 /**
@@ -447,4 +547,28 @@ export function serverRunning(): boolean {
 
 export function canSend(): boolean {
   return chat.input.trim().length > 0 && !chat.streaming;
+}
+
+/**
+ * The whole conversation as markdown, for the copy-chat button.
+ *
+ * Here rather than in the two chat surfaces because it is a value derived from
+ * cell state, and both must copy the same thing — including the reply still
+ * arriving, which is on screen and therefore part of what "copy the chat"
+ * means (`src/lib/richtext.ts:transcript`).
+ */
+export function chatTranscript(): string {
+  return transcript({
+    system: chat.system,
+    messages: chat.messages,
+    partial: chat.partial,
+    partialThink: chat.partialThink,
+  });
+}
+
+/** Is there anything to copy or clear? A button that copies an empty string
+ *  should be disabled rather than silently emptying the clipboard. */
+export function chatHasContent(): boolean {
+  return chat.messages.length > 0 || chat.partial.length > 0 ||
+    chat.partialThink.length > 0;
 }

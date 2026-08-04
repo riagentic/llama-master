@@ -3,6 +3,12 @@ node_modules/
 dist/
 .aio/
 
+# Packaged builds. `deno task compile:electron` drops its AppImage beside the
+# app rather than in dist/, and a 143 MB artifact in a git repo is a mistake
+# GitHub refuses on your behalf.
+*.AppImage
+*.app.zip
+
 # Rust build tree (the committed artifact is src/llama-sys.wasm)
 rust/target/
 

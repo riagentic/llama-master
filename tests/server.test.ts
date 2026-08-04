@@ -447,3 +447,86 @@ Deno.test({
     await srv.stop();
   },
 });
+
+/**
+ * The priority switch, verified on the PROCESS rather than on the intent.
+ *
+ * The interesting failure mode is a switch that reports success and changes
+ * nothing — so this reads `/proc/<pid>/stat` back and asserts the kernel agrees.
+ * Skipped off Linux, where /proc is not the place to ask.
+ */
+Deno.test({
+  name: "srv: low priority is applied to the real process, not just requested",
+  ignore: Deno.build.os !== "linux",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { niceFromProcStat } = await import("../src/lib/priority.ts");
+    const bin = await installStub();
+    const port = freePort();
+    using _boot = await bootCells([srv]);
+    try {
+      await srv.start(
+        [bin, "--port", String(port)],
+        `http://127.0.0.1:${port}`,
+      );
+      await waitFor(async () => {
+        await srv.poll();
+        return srv.status === "ready";
+      }, "the server to report ready");
+
+      // The renice is fire-and-forget so the UI learns the pid immediately —
+      // so wait for the kernel to agree rather than for a promise.
+      await waitFor(async () => {
+        const stat = await Deno.readTextFile(`/proc/${srv.pid}/stat`);
+        return niceFromProcStat(stat) === 19;
+      }, "the process to be reniced");
+
+      const stat = await Deno.readTextFile(`/proc/${srv.pid}/stat`);
+      assertEquals(
+        niceFromProcStat(stat),
+        19,
+        "nice 19 — the politest there is",
+      );
+      // And it said so, in the log the app points at for everything else.
+      await srv.poll();
+      assert(
+        srv.log.some((l) => l.includes("desktop keeps priority")),
+        `the log says what happened: ${srv.log.slice(-3).join(" | ")}`,
+      );
+    } finally {
+      await srv.stop();
+    }
+  },
+});
+
+/** Off means off: a run started with the switch down stays at the priority the
+ *  OS gave it, and nothing in the log claims otherwise. */
+Deno.test({
+  name: "srv: with the switch off the process keeps the default priority",
+  ignore: Deno.build.os !== "linux",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { niceFromProcStat } = await import("../src/lib/priority.ts");
+    const bin = await installStub();
+    const port = freePort();
+    using _boot = await bootCells([srv]);
+    try {
+      await srv.start(
+        [bin, "--port", String(port)],
+        `http://127.0.0.1:${port}`,
+        { model: "", settings: {} as Settings, lowPriority: false },
+      );
+      await waitFor(async () => {
+        await srv.poll();
+        return srv.status === "ready";
+      }, "the server to report ready");
+      const stat = await Deno.readTextFile(`/proc/${srv.pid}/stat`);
+      assertEquals(niceFromProcStat(stat), 0, "left where the OS put it");
+      assert(!srv.log.some((l) => l.includes("desktop keeps priority")));
+    } finally {
+      await srv.stop();
+    }
+  },
+});

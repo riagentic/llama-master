@@ -19,6 +19,7 @@ import {
   slotOnGpu,
   tensorSplitValue,
 } from "./devsplit.ts";
+import { reserveLabel, reserveOf, vramReserveShares } from "./reserve.ts";
 
 /** Bytes per cached element, by `-ctk`/`-ctv` value. Block quants carry their
  *  scales, hence the fractional sizes (q8_0 = 34 bytes per 32 elements). */
@@ -65,6 +66,11 @@ export type Pool = {
   usedB: number;
   /** Already spoken for by other processes (idle VRAM use, other apps' RAM). */
   otherB: number;
+  /** Held back by the user for their own work (`src/lib/reserve.ts`). Kept
+   *  apart from `otherB` because it is a CHOICE, not a measurement: when a plan
+   *  does not fit, "you reserved 4 GB" is actionable and "something else holds
+   *  4 GB" sends the user hunting for a process that does not exist. */
+  reservedB: number;
   freeB: number;
   /** Bytes past capacity — the amount the user has to claw back. 0 when it fits. */
   overB: number;
@@ -115,6 +121,10 @@ export type DevicePlan = {
     capacityB: number;
     /** Already in use by everything else, measured now. */
     otherB: number;
+    /** This card's share of the user's VRAM reserve — the per-GPU figure, plus
+     *  the connected figure when a display hangs off this card
+     *  (`src/lib/reserve.ts:vramReserveShares`). */
+    reservedB: number;
     weightsB: number;
     kvB: number;
     computeB: number;
@@ -228,16 +238,21 @@ function pool(
   label: string,
   capacityB: number,
   otherB: number,
+  reservedB: number,
   buckets: Bucket[],
 ): Pool {
   const usedB = sum(buckets.map((b) => b.bytes));
-  const total = usedB + otherB;
+  // The reserve is spent memory as far as every fit test is concerned — that is
+  // the whole point of it — so it counts towards the total exactly like another
+  // process's allocation, and only its LABEL differs.
+  const total = usedB + otherB + reservedB;
   return {
     label,
     capacityB,
     buckets: buckets.filter((b) => b.bytes > 0),
     usedB,
     otherB,
+    reservedB,
     freeB: Math.max(0, capacityB - total),
     overB: Math.max(0, total - capacityB),
   };
@@ -326,6 +341,31 @@ function vramInUse(gpus: Gpu[]): number {
 }
 
 /**
+ * Is this plan a PROPOSAL or a description of a run that is already up?
+ *
+ * Every number below is the same either way. What differs is the one output
+ * that is a PREDICTION rather than an accounting: whether llama.cpp can cut the
+ * offloaded layers so that each card holds its share (`devices.fits`,
+ * `unplacedB`, and the two notes about them).
+ *
+ * For a proposal that prediction is the most valuable thing here — it is what
+ * stops a plan dying with `cudaMalloc failed` on device 1. For a run that is
+ * ALREADY LOADED it is a contradiction waiting to happen, and it happened: the
+ * fitter's per-card budgets subtract the planning safety reserve (5% of each
+ * card) and re-derive our own footprint by proportion, so re-packing a live run
+ * came up ~1 GB short and the machine panel announced "1010 MB of layers have
+ * nowhere to go — no card has room for them, however the cut is made" about a
+ * model that was answering prompts at the time, with `vram.overB` reading 0 on
+ * the same screen. The layers ARE placed; llama.cpp placed them. A prediction
+ * the evidence has already settled is not a warning, it is a false statement.
+ *
+ * Real pressure on a live run is still reported, by the measurements rather
+ * than the fitter: `vram.overB`/`ram.overB` come from what the machine says is
+ * in use, and `src/lib/adapt.ts:drift` reads those.
+ */
+export type PlanQuestion = "proposed" | "running";
+
+/**
  * Place a model under one settings map on one machine.
  *
  * Placement rules mirror llama.cpp:
@@ -341,8 +381,26 @@ function vramInUse(gpus: Gpu[]): number {
  * - `--n-cpu-moe N` keeps the routed experts of the **first** N layers in RAM,
  *   even when those layers are otherwise on the GPU.
  * - `-nkvo` moves the whole KV cache to RAM regardless of layer placement.
+ *
+ * `asked` is which QUESTION this plan answers, and it changes one thing: whether
+ * the placement is still open to doubt. See `PlanQuestion`.
  */
-export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
+export function plan(
+  meta: ModelMeta,
+  hw: Hw,
+  s: Settings,
+  asked: PlanQuestion = "proposed",
+): Plan {
+  // What the user has kept for themselves. Clamped to the machine here, once,
+  // so every figure below — the pools, the per-card picture and the packing
+  // budgets — is working from the same number (`src/lib/reserve.ts`).
+  const reserve = reserveOf(hw);
+  // Per card, and the machine-wide total is whatever those add up to — the VRAM
+  // reserve is stated per card now (every card, plus extra on the ones with a
+  // display), so the pool figure is derived from the shares and cannot disagree
+  // with the per-card picture.
+  const reserveShares = vramReserveShares(hw.gpus, reserve);
+  const reservedVramB = reserveShares.reduce((a, b) => a + b, 0);
   const nLayer = meta.nLayer;
   const off = offloadRange(nLayer, s);
   const moeOnCpu = Math.max(0, Math.min(num(s, "nCpuMoe"), nLayer));
@@ -430,7 +488,16 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
   const perDeviceOverheadB = usingGpu
     ? BACKEND_CONTEXT_B + activation * 4 + computeScratch(meta, ubatch, ctx)
     : 0;
-  const budgetsB = deviceBudgets(hw.gpus, perDeviceOverheadB);
+  // A proposal is budgeted defensively — the fixed per-card safety reserve, the
+  // user's reserve and this device's scratch all come off before a slot may be
+  // placed. A run that is ALREADY UP gets the physical budget instead: whatever
+  // the card holds beside everybody else's bytes. Those margins exist to keep a
+  // future allocation from failing, and re-imposing them on an allocation that
+  // has already succeeded is how the picture came to strand layers that the
+  // driver was plainly holding.
+  const budgetsB = asked === "running"
+    ? hw.gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB))
+    : deviceBudgets(hw.gpus, perDeviceOverheadB, reserveShares);
   const counts = usingGpu ? packSlots(slotCostsB, budgetsB) : [];
 
   // The per-card picture — including when the packing FAILS. That is the
@@ -472,14 +539,16 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
         : 0;
       const computeB = n > 0 || i === 0 ? perDeviceOverheadB : 0;
       const otherB = g.vramUsedB;
+      const reservedB = reserveShares[i] ?? 0;
       const overB = Math.max(
         0,
-        otherB + weightsB + kvB + computeB - g.vramTotalB,
+        otherB + reservedB + weightsB + kvB + computeB - g.vramTotalB,
       );
       return {
         name: g.name || `GPU ${i}`,
         capacityB: g.vramTotalB,
         otherB,
+        reservedB,
         weightsB,
         kvB,
         computeB,
@@ -488,30 +557,35 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
     })
     : [];
 
-  const devices: DevicePlan = {
-    bytesB: counts ? loadPerDevice(slotCostsB, counts) : [],
-    budgetsB,
-    tensorSplit: counts ? tensorSplitValue(counts) : "",
-    fits: counts !== null,
-    cards,
-    unplacedB,
-  };
-
   const vramCapacity = sum(hw.gpus.map((g) => g.vramTotalB));
   const ramCapacity = hw.mem?.totalB ?? 0;
   const ramOther = hw.mem ? hw.mem.totalB - hw.mem.availableB : 0;
 
-  const vram = pool("VRAM", vramCapacity, vramInUse(hw.gpus), [
+  const vram = pool("VRAM", vramCapacity, vramInUse(hw.gpus), reservedVramB, [
     { key: "weights", label: "Weights", bytes: gpuDense },
     { key: "experts", label: "Experts", bytes: gpuExperts },
     { key: "kv", label: "KV cache", bytes: kvOnGpu },
     { key: "compute", label: "Compute (est.)", bytes: gpuCompute },
   ]);
-  const ram = pool("RAM", ramCapacity, ramOther, [
+  const ram = pool("RAM", ramCapacity, ramOther, reserve.ramB, [
     { key: "weights", label: "Weights", bytes: cpuWeights },
     { key: "kv", label: "KV cache", bytes: kvOnRam },
     { key: "compute", label: "Compute (est.)", bytes: cpuCompute },
   ]);
+
+  // For a live run the question "can these layers be divided across the cards"
+  // has already been answered — by llama.cpp, when it loaded them. So the
+  // MEASUREMENT decides: the machine is over VRAM, or it is not. Only a
+  // proposal is subject to the packer's verdict.
+  const placementSettled = asked === "running" && vram.overB === 0;
+  const devices: DevicePlan = {
+    bytesB: counts ? loadPerDevice(slotCostsB, counts) : [],
+    budgetsB,
+    tensorSplit: counts ? tensorSplitValue(counts) : "",
+    fits: counts !== null || placementSettled,
+    cards,
+    unplacedB: placementSettled ? 0 : unplacedB,
+  };
 
   const notes: string[] = [];
   if (meta.unknownTypes > 0) {
@@ -533,6 +607,20 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
       } — the OS will swap or the load will be killed.`,
     );
   }
+  // Never let the reserve be the invisible reason. It is memory the user chose
+  // to hold back, so when it is what turns a fit into an overflow the way out
+  // has to be on screen next to the shortfall — otherwise the app reports a
+  // machine that is too small for a model that would in fact load.
+  const blockedByReserve =
+    (vram.overB > 0 && reservedVramB > 0 && vram.overB <= reservedVramB) ||
+    (ram.overB > 0 && reserve.ramB > 0 && ram.overB <= reserve.ramB);
+  if (blockedByReserve) {
+    notes.push(
+      `You are reserving ${
+        reserveLabel(reserve, hw.gpus)
+      } for your own work, and this plan needs it. Lower the reserved memory to spend it, or leave it and take the smaller plan.`,
+    );
+  }
   // The failure the totals cannot see: enough VRAM across the machine, and no
   // way to cut the layers so that each card holds its share. llama.cpp divides
   // the offloaded run by COUNT, and `--n-cpu-moe` makes the last layers many
@@ -542,10 +630,10 @@ export function plan(meta: ModelMeta, hw: Hw, s: Settings): Plan {
       `This fits across the cards but not on them: llama.cpp splits the layers by count, and with the experts held back the last layers are far heavier than the first. Lower GPU layers or move more experts to RAM.`,
     );
   }
-  if (unplacedB > 0) {
+  if (devices.unplacedB > 0) {
     notes.push(
       `${
-        fmtGb(unplacedB)
+        fmtGb(devices.unplacedB)
       } of layers have no card that can hold them — the map shows each card filled as far as it goes, and this remainder is what does not fit anywhere.`,
     );
   }

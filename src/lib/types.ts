@@ -101,6 +101,13 @@ export type Gpu = {
   vramUsedB: number;
   powerW: number;
   powerLimitW: number;
+  /** Is a display attached to this card? `undefined` when the machine could not
+   *  be asked (no `nvidia-smi` field, no DRM connectors, a vendor with no such
+   *  reading) — which is a third answer, not a `false`: the connected-GPU
+   *  reserve falls back to card 0 when nothing is known, and holds back nothing
+   *  when the machine has answered and every card is headless
+   *  (`src/lib/reserve.ts:displayGpus`). */
+  display?: boolean;
 };
 
 export type Cpu = {
@@ -129,10 +136,33 @@ export type Mem = {
 /** Everything the tuner is allowed to reason about. */
 export type { Disk };
 
+/**
+ * Memory the user has told the app to keep for themselves.
+ *
+ * Not a measurement and not a safety margin — those are `tune.ts:marginB` and
+ * `devsplit.ts`, and they exist to stop the allocator failing. This is the
+ * user's own claim on their machine: the desktop, the browser, the compile they
+ * are going to start. It is subtracted from what any plan may spend, so a card
+ * that drives the display is not filled to the last byte
+ * (`src/lib/reserve.ts`).
+ *
+ * VRAM is two figures because the two claims are different claims. `perGpuB` is
+ * "leave this much on every card" — a compute card shared with another tool.
+ * `connectedB` is "leave this much on the card that draws my screen", which is
+ * where the cost actually is (a compositor, a browser, a game) and is typically
+ * ONE card of several, so charging it to all of them would refuse memory nobody
+ * wants back.
+ */
+export type Reserve = { perGpuB: number; connectedB: number; ramB: number };
+
 export type Hw = {
   cpu: Cpu | null;
   mem: Mem | null;
   gpus: Gpu[];
+  /** What the user has set aside for their own work. Absent on raw telemetry —
+   *  it is attached where a plan is made (`src/ui/derive.ts:planningHw`), never
+   *  by the hardware reader, because it is a preference, not a reading. */
+  reserve?: Reserve;
   /** Filesystems this app writes to. The third memory pool: builds and models
    *  are gigabytes, and "no space left on device" is a real build failure. */
   disks?: Disk[];

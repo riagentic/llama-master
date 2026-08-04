@@ -21,3 +21,23 @@ export function tempTone(
   const pct = (c / max) * 100;
   return pct >= 95 ? "bad" : pct >= 82 ? "warn" : "ok";
 }
+
+/**
+ * Tone for a "how full / how busy" reading, in quarters.
+ *
+ * 0-25 cyan, 25-50 green, 50-75 amber, 75-100 red — the same four steps for
+ * CPU, GPU, VRAM and RAM, because on this page they are asked the same
+ * question and an eye scanning four dials should not have to learn four
+ * scales. Cyan rather than green at the bottom so "idle" and "comfortable"
+ * are not the same colour: on a machine that is about to load a model, the
+ * difference between 5% and 40% of a card is the whole decision.
+ *
+ * Here, beside `tempTone`, because these are the two thresholds that decide
+ * what colour a dial turns, and two copies of that rule would drift.
+ */
+export function loadTone(pct: number): "busy" | "ok" | "warn" | "bad" {
+  if (!Number.isFinite(pct) || pct < 25) return "busy";
+  if (pct < 50) return "ok";
+  if (pct < 75) return "warn";
+  return "bad";
+}

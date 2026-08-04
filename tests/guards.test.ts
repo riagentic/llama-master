@@ -281,6 +281,30 @@ Deno.test("guard: every chat surface shows that it is waiting", async () => {
   );
 });
 
+Deno.test("guard: the inline favicon is encoded, so none of it lands in the body", async () => {
+  // Written with the SVG's own attributes in double quotes, the `href` value
+  // ends at the first inner quote: the rest of the mark is parsed as attributes,
+  // `<rect>` becomes an element, and — not being valid head content — the parser
+  // MOVES IT INTO THE BODY, where it wrapped #root and pushed the whole app down
+  // by its own height. The document was then taller than the window and the
+  // bottom of every page was clipped; on the all-in-one page that is the chat's
+  // input row. Measured in a real browser: `#root` at y=23 with a stray
+  // `<rect>` above it, `documentElement.scrollHeight` 880 in an 857 viewport.
+  const src = await read(join(ROOT, "src", "app.ts"));
+  const head = /head:\s*`([^`]*)`/.exec(src)?.[1] ?? "";
+  assert(head.includes('rel="icon"'), "the head still carries a favicon");
+  // No raw markup inside an attribute value: angle brackets encoded, and no
+  // double quote between the opening one and the closing one.
+  const hrefs = [...head.matchAll(/href="([^"]*)"/g)].map((m) => m[1] ?? "");
+  assert(hrefs.length > 0, "the favicon href must be a single quoted value");
+  for (const href of hrefs) {
+    assert(
+      !href.includes("<") && !href.includes(">"),
+      `raw markup in a href — encode it: ${href.slice(0, 60)}`,
+    );
+  }
+});
+
 Deno.test("guard: the icon PNG is present and current with the SVG", async () => {
   // src/icon.svg is the source of the app mark; src/icon.png is what the
   // Electron and Android packagers actually read
@@ -298,11 +322,14 @@ Deno.test("guard: the icon PNG is present and current with the SVG", async () =>
   );
 
   // The three places the mark appears must carry the same geometry, or the tab
-  // icon, the title bar and the dock icon drift apart.
-  const shape = 'transform="rotate(45 32 32)"';
+  // icon, the title bar and the dock icon drift apart. Either quote style: the
+  // favicon in `app.ts` is a data URI inside an HTML attribute, so its own
+  // attributes are single-quoted — written with double quotes the `href` ended
+  // at the first inner quote and the parser moved half the mark into the body.
+  const shape = /transform=['"]rotate\(45 32 32\)['"]/;
   for (const f of ["src/icon.svg", "src/App.tsx", "src/app.ts"]) {
     const src = await read(join(ROOT, f));
-    assert(src.includes(shape), `${f} must use the same diamond geometry`);
+    assert(shape.test(src), `${f} must use the same diamond geometry`);
   }
 });
 

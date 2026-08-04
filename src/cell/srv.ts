@@ -62,6 +62,11 @@ export type SrvState = {
    *  `cfg.rememberFit` waits for: recording a context at /health once wrote
    *  down 17,408 as a working size for a model that could not answer "Hi". */
   proven: boolean;
+  /** Was this run asked to yield to the desktop? Kept on the RUN rather than
+   *  read from the toggle: a fit-ladder rung is the same run one number
+   *  smaller, and it must be started the way the run was — not the way the
+   *  switch happens to be set two minutes later. */
+  runLowPriority: boolean;
   /** `/props` — what the server reports it actually loaded. */
   props: Record<string, unknown> | null;
   log: string[];
@@ -91,6 +96,31 @@ export type SrvState = {
   fitNote: string;
 };
 
+/** The `own` slot a server process lives in. One per pid, never shared — see
+ *  the note at `start`. */
+function slotId(pid: number): string {
+  return `srv:process:${pid}`;
+}
+
+/**
+ * Take the slot for `pid`, and release the one the process it replaces held.
+ *
+ * Two effects rather than one `own.set` over a shared key, because `set` on a
+ * held key disposes what is there as a side effect — which is how the first
+ * start's teardown came to SIGTERM the second start's process. Here the release
+ * names a process that has already exited, so it can only ever be a no-op.
+ */
+function ownProcess(
+  prevPid: number,
+  pid: number,
+  close: () => void,
+): CellEffect {
+  const take = own.set(slotId(pid), () => ({ close }));
+  return prevPid && prevPid !== pid
+    ? [own.dispose(slotId(prevPid)), take]
+    : take;
+}
+
 export const srv = cell("srv", {
   // A process cannot survive a restart of this app, so persisting its state
   // would only ever restore a lie.
@@ -112,6 +142,7 @@ export const srv = cell("srv", {
     healthDetail: "",
     probing: false,
     proven: false,
+    runLowPriority: true,
     props: null as Record<string, unknown> | null,
     log: [] as string[],
     seq: 0,
@@ -147,9 +178,16 @@ export const srv = cell("srv", {
         /** Set only by the retry itself, so the ladder is not reset by its own
          *  next rung. */
         retry?: boolean;
+        /** Run it at the lowest OS priority, so the desktop keeps its own.
+         *  Applied to the process after the spawn — the argv on screen stays
+         *  the argv that ran (`src/lib/priority.ts`). */
+        lowPriority?: boolean;
       },
     ): Promise<CellEffect | void> {
       if (s.status === "starting" || s.status === "ready") return;
+      // The pid this start REPLACES, captured before anything overwrites it —
+      // its `own` slot is released below, by name (see the note at `own.set`).
+      const prevPid = s.pid;
       s.status = "starting";
       if (!run?.retry) {
         s.fitTries = 0;
@@ -168,6 +206,7 @@ export const srv = cell("srv", {
       s.url = url;
       s.runSettings = run?.settings ?? null;
       s.runModel = run?.model ?? "";
+      s.runLowPriority = run?.lowPriority !== false;
       s.startFreeVramB = run?.freeAtStart?.vramB ?? 0;
       s.startFreeRamB = run?.freeAtStart?.ramB ?? 0;
       s.rssB = 0;
@@ -177,14 +216,27 @@ export const srv = cell("srv", {
         const { pid } = io.start(argv);
         s.pid = pid;
         s.startedAt = Date.now();
-        // The effect owns THIS process, by pid. Replacing the effect on the
-        // next start disposes this one, and an unqualified stop() would then
-        // kill the process that just replaced it.
-        return own.set("srv:process", () => ({
-          close: () => {
-            void io.stopOwned(pid);
-          },
-        }));
+        // Not awaited: two tiny subprocesses must not stand between the spawn
+        // and the UI learning there is a pid. The note lands in the log through
+        // `push`, which the next poll copies out like any other line.
+        if (s.runLowPriority) void io.lowerPriority(pid);
+        // ONE SLOT PER PROCESS, named by pid — aio's own advice for exactly
+        // this bug (`docs/state/methods.md`: "if the disposer tears down
+        // something the new resource needs … give each resource its own id").
+        //
+        // Under one shared id, `own.set` DISPOSES the resource already there as
+        // a side effect of registering the new one, so the first start's
+        // teardown ran against the second start's process and SIGTERMed it a
+        // moment after it came up — every start after a crash died with code
+        // 143. `stopOwned(pid)` was the guard that made that harmless; naming
+        // the slot after the process means there is nothing to guard against,
+        // and the framework stops warning that a live resource was displaced.
+        //
+        // The dead process's slot is released in the same breath, so a session
+        // of starts and stops does not accumulate one no-op disposer per run.
+        return ownProcess(prevPid, pid, () => {
+          void io.stopOwned(pid);
+        });
       } catch (e) {
         // A refused duplicate start is not a crash — an impatient double-click
         // used to leave the cell "crashed" with pid 0 while the first server ran
@@ -208,6 +260,8 @@ export const srv = cell("srv", {
     },
 
     async stop(s): Promise<CellEffect | void> {
+      // Whose slot this releases, read before the fields are cleared.
+      const stopping = s.pid;
       // No early return on `status === "stopped"`, however tempting: a Start
       // that has been dispatched but whose body has not run yet leaves the
       // status at "stopped", so short-circuiting here meant Stop did nothing
@@ -230,7 +284,7 @@ export const srv = cell("srv", {
         s.startFreeRamB = 0;
         s.rssB = 0;
         s.rssFileB = 0;
-        return own.dispose("srv:process");
+        return own.dispose(slotId(stopping));
       } catch (e) {
         s.lastError = String(e);
       }
@@ -296,14 +350,17 @@ export const srv = cell("srv", {
             s.rssB = 0;
             s.rssFileB = 0;
             try {
+              const dead = s.pid;
               const { pid } = io.start(next);
               s.pid = pid;
               s.startedAt = Date.now();
-              return own.set("srv:process", () => ({
-                close: () => {
-                  void io.stopOwned(pid);
-                },
-              }));
+              // Every rung is a fresh process, so every rung is reniced.
+              if (s.runLowPriority) void io.lowerPriority(pid); // aiol-ok
+
+              // Same as `start`: the rung that just died hands its slot over.
+              return ownProcess(dead, pid, () => {
+                void io.stopOwned(pid);
+              });
             } catch (e) {
               s.status = "crashed";
               s.lastError = String(e);

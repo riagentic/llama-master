@@ -1,0 +1,620 @@
+/* client/src/style.css — one screen, dark, dense, quiet.
+ *
+ * The palette is llama.master's, so the two apps are recognisably one product;
+ * the layout is not, because this app has one column and no tabs. The chat and
+ * code-block rules are deliberately the same shape as the server app's
+ * (src/style.css) — a reply should read identically wherever it is shown.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+/* The palette lives on :root, not on .app — the page BEHIND the app has to be
+   the app's own colour too. Declared there, `body { background: var(--bg) }`
+   was white, which is what shows through anywhere the app is not. */
+:root {
+  --bg: #06070a;
+  --bg-2: #0c0f14;
+  --panel: #11151c;
+  --panel-2: #161b24;
+  --line: #222936;
+  --line-soft: #1a202a;
+  --text: #dfe5ee;
+  --text-dim: #8b95a6;
+  --text-faint: #5b6577;
+  --accent: #f0a92e;
+  --ok: #35d07f;
+  --warn: #f4b942;
+  --bad: #ff5f57;
+  --busy: #4cc9f0;
+  --radius: 7px;
+  --mono: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace;
+
+  --fs: 14px;
+  --fs-xs: calc(var(--fs) * 0.8);
+  --fs-sm: calc(var(--fs) * 0.88);
+}
+
+/* Light, for a lit room. The same hues as llama.master's own light theme, so
+   the two apps are one product in either mode — and on `:root`, because the
+   page behind the app has to change with it, not only the app. */
+:root[data-theme="light"],
+.app[data-theme="light"] {
+  --bg: #f2f4f8;
+  --bg-2: #e9edf3;
+  --panel: #ffffff;
+  --panel-2: #f6f8fb;
+  --line: #d8dee8;
+  --line-soft: #e6eaf1;
+  --text: #1b2231;
+  --text-dim: #5b6577;
+  --text-faint: #8b95a6;
+  --accent: #b9761a;
+  --ok: #12905a;
+  --warn: #a4720a;
+  --bad: #c62d24;
+  --busy: #0d7fa8;
+}
+
+/* The height chain, all four links. `.app` is inside aio's `#root`, and a
+   percentage height against an auto-height parent is auto — the app was
+   content-tall in a 900px window, with the page showing through underneath. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  font-size: var(--fs);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ── the connect bar ────────────────────────────────────────────────────── */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  background: linear-gradient(180deg, var(--bg-2), var(--panel));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.brand-mark {
+  color: var(--busy);
+}
+
+.brand b {
+  letter-spacing: 0.2px;
+}
+
+.host {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+/* Wide enough for five digits AND the spinner the browser puts inside the
+   field: at 9ch "18080" was clipped to "1808", which is a different server. */
+.port {
+  width: 11ch;
+  min-width: 11ch;
+}
+
+input,
+select {
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 5px 8px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+input:focus {
+  outline: 1px solid var(--busy);
+  outline-offset: -1px;
+}
+
+input:disabled {
+  color: var(--text-faint);
+}
+
+.btn {
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 5px 11px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--busy);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn.tiny {
+  font-size: var(--fs-xs);
+  padding: 3px 7px;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1b1405;
+  font-weight: 600;
+}
+
+.btn.danger {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.btn.on {
+  border-color: var(--busy);
+  color: var(--busy);
+}
+
+.pill {
+  font-size: var(--fs-xs);
+  letter-spacing: 0.4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.pill.tone-ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+}
+
+.pill.tone-warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+}
+
+.pill.tone-bad {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 50%, transparent);
+}
+
+.pill.tone-busy {
+  color: var(--busy);
+  border-color: color-mix(in srgb, var(--busy) 50%, transparent);
+}
+
+.found {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+}
+
+.dim {
+  color: var(--text-faint);
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* ── what the far end is doing ──────────────────────────────────────────── */
+
+.strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 6px 18px;
+  padding: 9px 11px;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+
+.kv {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.kv-k {
+  font-size: var(--fs-xs);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.kv-v {
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meter {
+  height: 4px;
+  border-radius: 3px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--busy);
+}
+
+.meter-fill.tone-warn {
+  background: var(--warn);
+}
+
+.error-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: var(--fs-sm);
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent);
+  border-radius: var(--radius);
+}
+
+.error-note .x {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* ── the conversation ───────────────────────────────────────────────────── */
+
+.chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* A system prompt is a sentence or two — it gets the room the header has,
+   which is all of it that the buttons do not need. */
+.chat-head .system {
+  flex: 1 1 420px;
+  min-width: 220px;
+}
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+
+.chat-input {
+  display: flex;
+  gap: 6px;
+}
+
+.chat-input input {
+  flex: 1;
+}
+
+.msg {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  border-left: 2px solid var(--line);
+}
+
+.msg-user {
+  border-left-color: var(--accent);
+}
+
+.msg-assistant {
+  border-left-color: var(--busy);
+}
+
+.msg-role {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* The message's own copy button: present, but not competing with the answer.
+   It comes up to full strength when the eye is already on that message. */
+.msg-role .copy-btn {
+  opacity: 0.35;
+  padding: 1px 5px;
+  transition: opacity 0.12s;
+}
+
+.msg:hover .msg-role .copy-btn,
+.msg-role .copy-btn:focus-visible,
+.msg-role .copy-btn.is-copied {
+  opacity: 1;
+}
+
+.msg-body {
+  display: grid;
+  gap: 7px;
+  word-break: break-word;
+  line-height: 1.55;
+  min-width: 0;
+}
+
+.msg-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg-meta {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  justify-self: end;
+}
+
+.msg-think {
+  border-left: 2px solid var(--line-soft);
+  padding-left: 8px;
+  margin: 2px 0;
+}
+
+.msg-think > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.msg-think > summary::before {
+  content: "▸ ";
+}
+
+.msg-think[open] > summary::before {
+  content: "▾ ";
+}
+
+.msg-think-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-dim);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+/* A fenced block: what it is, a way to take it, and the code. */
+
+.inline-code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  padding: 0.5px 4px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  word-break: break-all;
+}
+
+.codeblock {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.codeblock-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px 3px 9px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: var(--fs-xs);
+}
+
+.codeblock-name {
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.codeblock-lang,
+.codeblock-live {
+  color: var(--text-faint);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  flex: 0 0 auto;
+}
+
+.codeblock-live {
+  color: var(--busy);
+}
+
+/* Horizontal scroll INSIDE the block: a long line must never widen the page. */
+.codeblock-body {
+  margin: 0;
+  padding: 8px 9px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  white-space: pre;
+  max-height: 460px;
+}
+
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.copy-btn.is-copied {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+/* ── waiting, and nothing yet ───────────────────────────────────────────── */
+
+.waiting {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  padding: 4px 8px;
+}
+
+.waiting .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--busy);
+  animation: pulse 1.1s infinite ease-in-out;
+}
+
+.waiting .dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.waiting .dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.empty {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 28px 12px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.empty-icon {
+  font-size: 22px;
+}
+
+.empty-title {
+  color: var(--text-dim);
+}
+
+.empty-hint {
+  font-size: var(--fs-sm);
+}
+
+/* ── syntax colour ──────────────────────────────────────────────────────── */
+
+/* Four distinctions, from one scan (src/lib/highlight.ts). Muted on purpose:
+   this is a chat window, and code that glows harder than the sentence around
+   it makes the answer harder to read, not easier. */
+.tok-comment {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.tok-string {
+  color: #a5d6a7;
+}
+
+.tok-number {
+  color: #f0a92e;
+}
+
+.tok-keyword {
+  color: #c792ea;
+}
+
+/* The same four distinctions, at contrast that survives a white background. */
+[data-theme="light"] .tok-string {
+  color: #2e7d32;
+}
+
+[data-theme="light"] .tok-number {
+  color: #a4720a;
+}
+
+[data-theme="light"] .tok-keyword {
+  color: #6d28d9;
+}
+
+/* The reader's own two settings, grouped so they read as one control. */
+.looks {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 2px;
+}

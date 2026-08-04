@@ -78,8 +78,17 @@ await aio.run({
     // The browser client's tab icon: the same mark as src/icon.svg, inline
     // because nothing serves the .svg itself. The Electron and Android
     // packagers read src/icon.png, which is generated from that same file.
+    //
+    // ENCODED, and it has to be. Written with the SVG's own attributes in
+    // double quotes, the `href` value ended at the first inner quote: the rest
+    // of the mark was parsed as more attributes, `<rect>` became an element,
+    // and — not being head content — the parser MOVED IT INTO THE BODY, where
+    // it wrapped `#root` and pushed the whole app down by its own 23px. The
+    // document was then taller than the window and the bottom of the app was
+    // clipped: on the all-in-one page that is the chat's input row, cut in
+    // half. A favicon took a bite out of every page in the app.
     head:
-      `<link rel="icon" href="data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%230c0f14"/><rect x="20" y="20" width="24" height="24" rx="4" transform="rotate(45 32 32)" fill="%23f0a92e"/></svg>">`,
+      `<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230c0f14'/%3E%3Crect x='20' y='20' width='24' height='24' rx='4' transform='rotate(45 32 32)' fill='%23f0a92e'/%3E%3C/svg%3E">`,
   },
   schedules: [
     // `skipIfRunning` on all of them: each shells out, and a tick landing while

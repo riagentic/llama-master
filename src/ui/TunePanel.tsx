@@ -19,6 +19,9 @@ import { applyOptimal, currentStability, runLocked } from "./actions.ts";
 import { Empty, ErrorNote, Panel, Pill, Segmented, Toggle } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
 import { CtxControls } from "./CtxControls.tsx";
+import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
+import { ReserveControls } from "./ReserveControls.tsx";
+import { CommandPanel } from "./CommandView.tsx";
 import {
   changedCount,
   ctxOverride,
@@ -275,6 +278,21 @@ export function TunePanel() {
               t="tune-ctx"
             />
           </Panel>
+          {
+            /* Above the memory plan, because it changes every bar in it: the
+              reserve is subtracted before anything is placed. */
+          }
+          <Panel title="Reserved memory" icon="▦">
+            <ReserveControls t="tune-reserve" />
+          </Panel>
+          {
+            /* The same switch as the all-in-one page — one control, two
+               surfaces, so a setting cannot mean two things. */
+          }
+          <Panel title="How it runs" icon="⇄">
+            <LanSwitch t="tune-lan" />
+            <PrioritySwitch t="tune-prio" />
+          </Panel>
           <Panel
             title="Memory plan"
             icon="▤"
@@ -294,6 +312,12 @@ export function TunePanel() {
                 />
               )}
           </Panel>
+          {
+            /* Under the plan, on the page where the flags are edited: the
+               command IS the settings, and a preview a tab away from the
+               control it reflects is a preview nobody reads. */
+          }
+          <CommandPanel t="tune-cmd" />
           {cfg.reasons.length > 0
             ? (
               <Panel

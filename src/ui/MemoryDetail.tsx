@@ -54,6 +54,14 @@ function poolRows(
     });
   }
   rows.push({ label: "llama.cpp total", value: bytes(p.usedB), strong: true });
+  if (p.reservedB > 0) {
+    rows.push({
+      label: "Reserved",
+      value: bytes(p.reservedB),
+      hint:
+        "Held back for your own work by the reserve settings. No plan may spend it.",
+    });
+  }
   if (p.otherB > 0) {
     rows.push({
       label: "In use elsewhere",
@@ -107,22 +115,31 @@ export function MemoryDetail(props: {
 
   return (
     <div class="memdetail-wrap" t="memory-detail">
-      <div class="memdetail-head">
-        <span class={props.live ? "pill tone-ok" : "pill tone-idle"}>
-          {props.live
-            ? "running now"
-            : props.mode === "current"
-            ? "as it is now"
-            : "projected"}
-        </span>
-        <span class="dim">
-          {props.live
-            ? "What the running server is using."
-            : props.mode === "current"
-            ? "What the machine is using, with nothing of ours loaded."
-            : "What these settings would use."}
-        </span>
-      </div>
+      {
+        /* Compact means the surface above already said which state this is —
+           the all-in-one page titles its two sections — and repeating it here
+           cost three lines of the one column that has none to spare. The
+           Memory tab, which shows one plan with no title above it, still gets
+           the label and the sentence. */
+      }
+      {props.compact ? null : (
+        <div class="memdetail-head">
+          <span class={props.live ? "pill tone-ok" : "pill tone-idle"}>
+            {props.live
+              ? "running now"
+              : props.mode === "current"
+              ? "as it is now"
+              : "projected"}
+          </span>
+          <span class="dim">
+            {props.live
+              ? "What the running server is using."
+              : props.mode === "current"
+              ? "What the machine is using, with nothing of ours loaded."
+              : "What these settings would use."}
+          </span>
+        </div>
+      )}
 
       {props.speed
         ? (
@@ -145,7 +162,7 @@ export function MemoryDetail(props: {
               VRAM {bytes(p.vram.usedB)} · RAM {bytes(p.ram.usedB)}
             </span>
             <span class="dim">
-              {p.layersOnGpu} of {p.nLayer} layers on GPU
+              {p.layersOnGpu}/{p.nLayer} layers on GPU
             </span>
           </div>
         )

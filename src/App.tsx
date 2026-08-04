@@ -1,14 +1,12 @@
-// src/App.tsx — the shell: header, rail, panel, command strip.
+// src/App.tsx — the shell: header, rail, panel.
 //
 // Reads cell state directly; AIR subscribes per component, so the header's
 // live numbers re-render every second without the panel below it doing any
 // work. No routing library — six panels, one `ui.tab`.
 
-import { cfg } from "./cell/cfg.ts";
 import { hw } from "./cell/hw.ts";
 import { TABS, ui } from "./cell/ui.ts";
 import { bytes } from "./lib/format.ts";
-import { commandLine } from "./lib/command.ts";
 import { Pill } from "./ui/kit.tsx";
 import { MemoryMini } from "./ui/Memory.tsx";
 import { Dashboard } from "./ui/Dashboard.tsx";
@@ -24,7 +22,7 @@ import { ServerPanel, StatusPill } from "./ui/ServerPanel.tsx";
 import { ChatPanel } from "./ui/ChatPanel.tsx";
 import { OnePage } from "./ui/OnePage.tsx";
 import { About } from "./ui/About.tsx";
-import { cliBin, serverBin, updateNow } from "./ui/actions.ts";
+import { updateNow } from "./ui/actions.ts";
 import {
   activeBuild,
   buildBusy,
@@ -196,62 +194,6 @@ function Rail() {
   );
 }
 
-/** The command strip: always visible, always read-only, always the exact thing
- *  that will be spawned. */
-function CommandStrip() {
-  const model = currentModel();
-  const server = commandLine("server", {
-    bin: serverBin() || "llama-server",
-    model: model?.path ?? "",
-    settings: cfg.settings,
-  });
-  const cli = commandLine("cli", {
-    bin: cliBin() || "llama-cli",
-    model: model?.path ?? "",
-    settings: cfg.settings,
-  });
-  return (
-    <footer class={ui.showCommand ? "cmdstrip open" : "cmdstrip"}>
-      <button
-        type="button"
-        class="cmdstrip-toggle"
-        title="Show or hide the generated commands"
-        onClick={() => ui.toggleCommand()}
-      >
-        {ui.showCommand ? "▾" : "▸"} command
-      </button>
-      {ui.showCommand
-        ? (
-          <div class="cmdstrip-body">
-            <div class="cmdline">
-              <span class="cmdline-tag">server</span>
-              <code t="strip-server">{server}</code>
-              <button
-                type="button"
-                class="btn tiny"
-                onClick={() => void navigator.clipboard?.writeText(server)}
-              >
-                Copy
-              </button>
-            </div>
-            <div class="cmdline">
-              <span class="cmdline-tag">cli</span>
-              <code t="strip-cli">{cli}</code>
-              <button
-                type="button"
-                class="btn tiny"
-                onClick={() => void navigator.clipboard?.writeText(cli)}
-              >
-                Copy
-              </button>
-            </div>
-          </div>
-        )
-        : null}
-    </footer>
-  );
-}
-
 function Panel() {
   switch (ui.tab) {
     case "build":
@@ -297,7 +239,6 @@ export default function App() {
           <Panel />
         </main>
       </div>
-      <CommandStrip />
     </div>
   );
 }

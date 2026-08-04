@@ -325,6 +325,59 @@ testCell(
   },
 );
 
+testCell(
+  chat,
+  "a stream cut mid-reply keeps every token that arrived",
+  async (t) => {
+    // Two cuts take this path and they are the same code: the user's Stop, and
+    // the app closing under a live reply — shutdown aborts every in-flight
+    // method before it persists (aio, `abortAllInflight`). What was on screen
+    // must survive both, and it must survive from the accumulator rather than
+    // from `partial`, which is only as fresh as the last flush.
+    const enc = new TextEncoder();
+    const ac = new AbortController();
+    const srv = Deno.serve(
+      { port: 0, signal: ac.signal, onListen: () => {} },
+      () =>
+        new Response(
+          new ReadableStream({
+            async start(c) {
+              for (const word of ["Hello", " there", " friend"]) {
+                c.enqueue(enc.encode(
+                  `data: ${
+                    JSON.stringify({ choices: [{ delta: { content: word } }] })
+                  }\n\n`,
+                ));
+                await new Promise((r) => setTimeout(r, 30));
+              }
+              // Then hold the stream open — a real reply the user gives up on.
+              await new Promise((r) => setTimeout(r, 5_000));
+              c.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    const url = `http://127.0.0.1:${(srv.addr as Deno.NetAddr).port}`;
+
+    t.init();
+    t.send.setInput("hi");
+    const sent = t.send.send(url);
+    await new Promise((r) => setTimeout(r, 200));
+    t.send.stop(); // ← cancelOn aborts the in-flight send
+    await sent;
+
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.lastError === "");
+    t.expect.state((s) => s.messages.length === 2);
+    t.expect.state((s) => s.messages[1]?.content === "Hello there friend");
+    t.expect.state((s) => s.partial === "");
+
+    ac.abort();
+    await srv.finished;
+  },
+);
+
 testCell(chat, "clear wipes the conversation and the last error", (t) => {
   t.init();
   t.send.setInput("x");
@@ -440,3 +493,50 @@ testCell(
     t.expect.state((s) => s.backend === "vulkan");
   },
 );
+
+/**
+ * A rename of a PERSISTED field is a migration whether or not one is written.
+ *
+ * `cfg.reserveVramB` — one machine-wide VRAM figure — became `reservePerGpuVramB`
+ * and `reserveConnectedVramB`. Without a version bump and a hook, aio deep-merges
+ * the stored blob over the defaults, keeps the orphaned key forever and says so
+ * on every boot ("shape drift: 1 stored field(s) no longer match the declared
+ * shape"). Verified end to end against a store seeded with the old world: the
+ * boot reported `{cell: "cfg", from: 0, to: 2, outcome: "migrated"}` and the key
+ * was gone. This pins the half that lives in this repo.
+ */
+Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
+  const def = (cfg as unknown as {
+    __aio?: {
+      version?: number;
+      onMigrate?: (
+        s: Record<string, unknown>,
+        from: number,
+      ) => Record<string, unknown>;
+    };
+  }).__aio;
+  assertEquals(def?.version, 2, "the shape changed, so the version must have");
+  const migrate = def?.onMigrate;
+  assert(migrate, "and a version bump with no hook only silences the warning");
+  const old = {
+    reserveVramB: 4 * 1024 ** 3,
+    reservePerGpuVramB: 0,
+    reserveConnectedVramB: 8 * 1024 ** 3,
+    reserveRamB: 16 * 1024 ** 3,
+  };
+  const next = migrate({ ...old }, 0);
+  assert(
+    !("reserveVramB" in next),
+    "the orphaned key is removed, not merged forward",
+  );
+  // The old value meant "hold this much across the whole machine, divided
+  // between the cards". Neither new field means that, so it is not carried:
+  // into `connectedB` it would move memory onto one card the user never chose,
+  // into `perGpuB` it would be multiplied by the number of cards.
+  assertEquals(next.reserveConnectedVramB, 8 * 1024 ** 3);
+  assertEquals(next.reservePerGpuVramB, 0);
+  assertEquals(next.reserveRamB, 16 * 1024 ** 3, "RAM kept its name and value");
+  // A store already at the current version is left alone.
+  const current = migrate({ ...old }, 2);
+  assertEquals(current.reserveVramB, 4 * 1024 ** 3);
+});

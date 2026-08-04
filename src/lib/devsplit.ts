@@ -64,11 +64,22 @@ export function slotOnGpu(slot: number, o: Offload): boolean {
  *
  * Per card, not per machine: a reserve pooled across devices would let a plan
  * spend card 1's headroom on card 0, which is the same mistake one step down.
+ *
+ * `userReservesB` is the second reserve and a different thing: the fixed one
+ * below exists so the allocator does not fail, this one is what the user asked
+ * to keep for their desktop and their own work, already divided per card
+ * (`src/lib/reserve.ts:vramReserveShares`). They add, because they defend
+ * against different things.
  */
-export function deviceBudgets(gpus: readonly Gpu[], overheadB = 0): number[] {
-  return gpus.map((g) => {
+export function deviceBudgets(
+  gpus: readonly Gpu[],
+  overheadB = 0,
+  userReservesB: readonly number[] = [],
+): number[] {
+  return gpus.map((g, i) => {
     const reserve = Math.max(512 * 1024 * 1024, g.vramTotalB * 0.05);
-    return Math.max(0, g.vramTotalB - g.vramUsedB - reserve - overheadB);
+    const mine = Math.max(0, userReservesB[i] ?? 0);
+    return Math.max(0, g.vramTotalB - g.vramUsedB - reserve - mine - overheadB);
   });
 }
 

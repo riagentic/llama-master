@@ -23,6 +23,7 @@
 // costs before choosing.
 
 import { plan } from "./plan.ts";
+import { reserveLabel, reserveOf } from "./reserve.ts";
 import { defaults, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
 
@@ -567,6 +568,18 @@ export function tune(
   s.tensorSplit = str(d, "tensorSplit");
   s.noMmap = false;
 
+  // Say it first, because it changes every number that follows. A user who has
+  // set a reserve and then reads "context 32,768 — the most this placement can
+  // hold" is owed the reason the ceiling is where it is, and it is the one
+  // constraint here they can lift with a single control.
+  const held = reserveOf(hw);
+  const heldLabel = reserveLabel(held, hw.gpus);
+  if (heldLabel) {
+    reasons.push(
+      `${heldLabel} reserved for your own work, and planned around — nothing below is allowed to spend it.`,
+    );
+  }
+
   const cores = hw.cpu?.cores ?? 0;
   if (cores > 0) {
     const b = cpuBudget(cores);
@@ -825,14 +838,19 @@ function blockerFor(
   const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
   const need = (pool: "vram" | "ram") =>
     `${gb(at[pool].usedB)} at a ${floor}-token context`;
-  // Room available to US: capacity minus what everything else holds. NOT
-  // `freeB + usedB`, which is incoherent once the plan overflows.
+  // Room available to US: capacity minus what everything else holds AND what
+  // the user has kept for themselves. NOT `freeB + usedB`, which is incoherent
+  // once the plan overflows. The reserve is named separately from other
+  // processes because it is the one of the two the user can take back.
   const have = (pool: "vram" | "ram") => {
-    const room = Math.max(0, at[pool].capacityB - at[pool].otherB);
-    return at[pool].otherB > 0
-      ? `${gb(room)} available of ${
-        gb(at[pool].capacityB)
-      } (other processes hold ${gb(at[pool].otherB)})`
+    const p = at[pool];
+    const room = Math.max(0, p.capacityB - p.otherB - p.reservedB);
+    const held = [
+      p.otherB > 0 ? `other processes hold ${gb(p.otherB)}` : "",
+      p.reservedB > 0 ? `you reserve ${gb(p.reservedB)}` : "",
+    ].filter(Boolean).join(", ");
+    return held
+      ? `${gb(room)} available of ${gb(p.capacityB)} (${held})`
       : `${gb(room)}`;
   };
 

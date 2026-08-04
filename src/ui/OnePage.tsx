@@ -17,7 +17,7 @@ import { builds } from "../cell/builds.ts";
 import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
-import { CPU_TJMAX, GPU_TJMAX, tempTone } from "../lib/thermal.ts";
+import { CPU_TJMAX, GPU_TJMAX, loadTone, tempTone } from "../lib/thermal.ts";
 import { bytes, tps } from "../lib/format.ts";
 import { GROUPS, num, PARAMS } from "../lib/params.ts";
 import { ParamControl } from "./TunePanel.tsx";
@@ -39,27 +39,32 @@ import { pinnedCtx, PLACEMENTS, trainedCtx } from "../lib/tune.ts";
 import { elapsedLabel } from "../lib/loadprogress.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { CtxControls } from "./CtxControls.tsx";
+import { ChatMessage } from "./ChatMessage.tsx";
+import { CommandPanel } from "./CommandView.tsx";
+import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
+import { ReserveControls } from "./ReserveControls.tsx";
 import { MemoryDetail } from "./MemoryDetail.tsx";
 import {
   Bar,
+  CopyButton,
   Empty,
   ErrorNote,
   MappedBar,
   Panel,
   Pill,
   Ring,
-  Spark,
-  Thinking,
   Toggle,
   Waiting,
 } from "./kit.tsx";
-import { MemoryMap } from "./Memory.tsx";
+import { MapLegend, MemoryMap } from "./Memory.tsx";
 import { Guidance } from "./Guidance.tsx";
 import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
   canSend,
   changedCount,
+  chatHasContent,
+  chatTranscript,
   ctxOverride,
   currentModel,
   currentStatePlan,
@@ -78,11 +83,21 @@ import {
   vramUsedB,
 } from "./derive.ts";
 
-function tone(pct: number) {
-  return pct > 90 ? "bad" : pct > 75 ? "warn" : "ok";
-}
-
-/** Four vitals, each a number and a bar, in one row. */
+/**
+ * The four vitals, 2×2: CPU and GPU on top, their memory under each.
+ *
+ * The grid says something the old row of four did not: the left column is the
+ * host (CPU, RAM), the right column is the device (GPU, VRAM), and the pair a
+ * placement decision is actually about is one above the other.
+ *
+ * Each tile is a ring, a line and a bar, and no more. It used to carry the
+ * processor's marketing name, two sub-lines and a sparkline apiece — a quarter
+ * of a screen to say four numbers, in the one column that also holds the memory
+ * picture and the command. "AMD Ryzen 9 9950X 16-Core Processor" truncated to
+ * "AMD Ryzen 9 9950X 16-…" is not information anyway; the full name is the
+ * tile's tooltip, and the history graphs and per-core detail are one click away
+ * on the pages built for them (Details → Machine, CPU, GPU, Memory).
+ */
 function Vitals() {
   const c = hw.cpu;
   const g = hw.gpus[0];
@@ -93,112 +108,132 @@ function Vitals() {
   // cache, so "used" hides 100+ GB of resident weights and the model read as
   // missing from its own machine.
   const mapped = mappedModelB();
+  // One reading per dial, computed once: the ring's angle, its colour and the
+  // bar under it must be the same number or the tile contradicts itself.
+  const vramPct = vramTotal ? (vramUsed / vramTotal) * 100 : 0;
+  const ramPct = m ? ((m.usedB + mapped) / m.totalB) * 100 : 0;
+  const cpuTemp = c && c.tempC > 0 ? `${c.tempC.toFixed(0)}°` : "";
+  const gpuTemp = g && g.tempC > 0 ? `${g.tempC.toFixed(0)}°` : "";
   return (
     <div class="one-vitals" t="vitals">
-      <div class="vital">
-        <Ring value={c?.utilPct ?? 0} label="CPU" tone="accent" size={56} />
-        <div class="vital-body">
-          <div class="vital-name" title={c?.model}>{c?.model || "CPU"}</div>
-          <div class="vital-sub">
-            {c ? `${c.cores} cores · ${c.threads} threads` : "—"}
-          </div>
-          <Bar
-            value={c?.tempC ?? 0}
-            max={CPU_TJMAX}
-            tone={tempTone(c?.tempC ?? 0, CPU_TJMAX)}
-            height={5}
+      <div class="vital" title={c?.model}>
+        <div class="vital-title">CPU</div>
+        <div class="vital-row">
+          <Ring
+            value={c?.utilPct ?? 0}
+            label="CPU"
+            tone={loadTone(c?.utilPct ?? 0)}
+            size={44}
+            hideLabel
           />
-          <div class="vital-sub">
-            {c && c.tempC > 0
-              ? `${c.tempC.toFixed(0)} / ${CPU_TJMAX} °C`
-              : "no sensor"}
+          <div class="vital-body">
+            {
+              /* One line, not three: cores, threads and temperature are three
+                 facts of the same size and they belong on the same row. */
+            }
+            <div class="vital-sub">
+              {c ? `${c.cores}c · ${c.threads}t` : "—"}
+              {cpuTemp ? ` · ${cpuTemp}` : ""}
+            </div>
+            <Bar
+              value={c?.tempC ?? 0}
+              max={CPU_TJMAX}
+              tone={tempTone(c?.tempC ?? 0, CPU_TJMAX)}
+              height={4}
+            />
           </div>
-          <Spark data={hw.cpuHistory} tone="accent" height={22} />
+        </div>
+      </div>
+
+      <div class="vital" title={g?.name}>
+        <div class="vital-title">GPU</div>
+        <div class="vital-row">
+          <Ring
+            value={g?.utilPct ?? 0}
+            label="GPU"
+            tone={loadTone(g?.utilPct ?? 0)}
+            size={44}
+            hideLabel
+          />
+          <div class="vital-body">
+            <div class="vital-sub">
+              {hw.gpus.length > 1
+                ? `${hw.gpus.length} devices`
+                : g?.name
+                ? g.vendor
+                : "none"}
+              {gpuTemp ? ` · ${gpuTemp}` : ""}
+            </div>
+            <Bar
+              value={g?.tempC ?? 0}
+              max={GPU_TJMAX}
+              tone={tempTone(g?.tempC ?? 0, GPU_TJMAX)}
+              height={4}
+            />
+          </div>
         </div>
       </div>
 
       <div class="vital">
-        <Ring value={g?.utilPct ?? 0} label="GPU" tone="busy" size={56} />
-        <div class="vital-body">
-          <div class="vital-name" title={g?.name}>{g?.name || "No GPU"}</div>
-          <div class="vital-sub">
-            {hw.gpus.length > 1
-              ? `${hw.gpus.length} devices`
-              : g
-              ? g.vendor
-              : "—"}
-          </div>
-          <Bar
-            value={g?.tempC ?? 0}
-            max={GPU_TJMAX}
-            tone={tempTone(g?.tempC ?? 0, GPU_TJMAX)}
-            height={5}
+        <div class="vital-title">RAM</div>
+        <div class="vital-row">
+          <Ring
+            value={ramPct}
+            label="RAM"
+            tone={loadTone(ramPct)}
+            size={44}
+            hideLabel
           />
-          <div class="vital-sub">
-            {g && g.tempC > 0
-              ? `${g.tempC.toFixed(0)} / ${GPU_TJMAX} °C`
-              : "no sensor"}
+          <div class="vital-body">
+            {
+              /* The mapped model keeps its place on this line whenever there is
+                 one: the kernel files 100+ GB of resident weights as
+                 reclaimable cache, and without it the model reads as missing
+                 from its own machine. */
+            }
+            <div class="vital-sub">
+              {m ? `${bytes(m.usedB + mapped)} / ${bytes(m.totalB)}` : "—"}
+              {m && mapped > 0 ? ` · ${bytes(mapped)} mapped` : ""}
+            </div>
+            {mapped > 0
+              ? (
+                <MappedBar
+                  usedB={m?.usedB ?? 0}
+                  mappedB={mapped}
+                  totalB={m?.totalB ?? 0}
+                  height={4}
+                />
+              )
+              : (
+                <Bar
+                  value={m?.usedB ?? 0}
+                  max={m?.totalB ?? 0}
+                  tone={loadTone(ramPct)}
+                  height={4}
+                />
+              )}
           </div>
-          <Spark data={hw.gpuHistory} tone="busy" height={22} />
         </div>
       </div>
 
       <div class="vital">
-        <Ring
-          value={vramTotal ? (vramUsed / vramTotal) * 100 : 0}
-          label="VRAM"
-          tone="busy"
-          size={56}
-        />
-        <div class="vital-body">
-          <div class="vital-name">VRAM</div>
-          <div class="vital-sub">{bytes(vramUsed)} / {bytes(vramTotal)}</div>
-          <Bar
-            value={vramUsed}
-            max={vramTotal}
-            tone={tone(vramTotal ? (vramUsed / vramTotal) * 100 : 0)}
-            height={7}
+        <div class="vital-title">VRAM</div>
+        <div class="vital-row">
+          <Ring
+            value={vramPct}
+            label="VRAM"
+            tone={loadTone(vramPct)}
+            size={44}
+            hideLabel
           />
-        </div>
-      </div>
-
-      <div class="vital">
-        <Ring
-          value={m ? ((m.usedB + mapped) / m.totalB) * 100 : 0}
-          label="RAM"
-          tone="ok"
-          size={56}
-        />
-        <div class="vital-body">
-          <div class="vital-name">RAM</div>
-          <div class="vital-sub">
-            {m ? `${bytes(m.usedB + mapped)} / ${bytes(m.totalB)}` : "—"}
-          </div>
-          {mapped > 0
-            ? (
-              <MappedBar
-                usedB={m?.usedB ?? 0}
-                mappedB={mapped}
-                totalB={m?.totalB ?? 0}
-                height={7}
-              />
-            )
-            : (
-              <Bar
-                value={m?.usedB ?? 0}
-                max={m?.totalB ?? 0}
-                tone={tone(m ? (m.usedB / m.totalB) * 100 : 0)}
-                height={7}
-              />
-            )}
-          <div class="vital-sub">
-            {m
-              ? mapped > 0
-                ? `${bytes(mapped)} mapped model · ${
-                  bytes(Math.max(0, m.availableB - mapped))
-                } truly free`
-                : `${bytes(m.availableB)} free`
-              : ""}
+          <div class="vital-body">
+            <div class="vital-sub">{bytes(vramUsed)} / {bytes(vramTotal)}</div>
+            <Bar
+              value={vramUsed}
+              max={vramTotal}
+              tone={loadTone(vramPct)}
+              height={4}
+            />
           </div>
         </div>
       </div>
@@ -241,8 +276,12 @@ function RunStrip() {
   // raw numbers never hold still: keying on `availableB` itself would rewrite the
   // user's settings on every 1 s poll and fight their typing.
   const hwReady = hw.lastRefresh > 0 && hw.mem !== null;
+  // The reserve is in the key for the same reason the headroom bucket is: it
+  // changes how much memory a plan may spend, so a settings map tuned before it
+  // moved describes a run the user no longer wants. Exact bytes, not a bucket —
+  // this one only changes when someone types into the box.
   const key =
-    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}|${hwReady}|${hw.gpus.length}|${headroomNow()}`;
+    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}|${hwReady}|${hw.gpus.length}|${headroomNow()}|${cfg.reservePerGpuVramB}:${cfg.reserveConnectedVramB}:${cfg.reserveRamB}`;
   afterRender(() => {
     if (tunedFor.current === key) return;
     if (!hwReady) return; // nothing measured yet — a tune now would be a guess
@@ -417,6 +456,30 @@ function RunStrip() {
             meta={m?.meta ?? null}
             t="one-ctx"
           />
+        </div>
+
+        {
+          /* Not locked while a server runs, unlike every control above it: this
+            one changes nothing about the loaded model — it changes what the
+            NEXT plan may spend, and someone whose desktop is being squeezed
+            right now is exactly the person reaching for it. */
+        }
+        <div class="run-row">
+          <span class="run-label">Reserved</span>
+          <ReserveControls t="one-reserve" />
+        </div>
+        {
+          /* Its own row, beside the other decisions about the run. It was in
+             the actions row, where its address line wrapped into a narrow
+             column and squeezed Start against it — a control that makes the
+             page worse when it is ON is a control nobody turns on. */
+        }
+        <div class="run-row">
+          <span class="run-label">How it runs</span>
+          <div class="run-prefs">
+            <LanSwitch t="one-lan" />
+            <PrioritySwitch t="one-prio" />
+          </div>
         </div>
       </div>
 
@@ -785,27 +848,22 @@ function MiniChat() {
           : (
             <>
               {chat.messages.map((msg, i) => (
-                <div class={`msg msg-${msg.role}`} key={String(i)}>
-                  <div class="msg-role">
-                    {msg.role}
-                    {msg.tps ? ` · ${tps(msg.tps)} tok/s` : ""}
-                  </div>
-                  <Thinking text={msg.thinking} />
-                  <div class="msg-body">
-                    {msg.content ||
-                      (msg.thinking
-                        ? "(the reply ended while still thinking — its reasoning is above)"
-                        : msg.content)}
-                  </div>
-                </div>
+                <ChatMessage
+                  key={String(i)}
+                  role={msg.role}
+                  content={msg.content}
+                  thinking={msg.thinking}
+                  tps={msg.tps}
+                />
               ))}
               {chat.partial || chat.partialThink
                 ? (
-                  <div class="msg msg-assistant">
-                    <div class="msg-role">assistant</div>
-                    <Thinking text={chat.partialThink} live={!chat.partial} />
-                    <div class="msg-body">{chat.partial}</div>
-                  </div>
+                  <ChatMessage
+                    role="assistant"
+                    content={chat.partial}
+                    thinking={chat.partialThink}
+                    live
+                  />
                 )
                 : null}
               {chat.streaming && !chat.partial && !chat.partialThink
@@ -898,13 +956,23 @@ export function OnePage() {
         </Panel>
 
         {
-          /* Both memory states are on screen at once because they answer
-           different questions and the user needs both while choosing — one
-           visualisation with a mode switch made whichever question you were
-           not currently asking unavailable. */
+          /* One memory section, and how many maps are in it is decided by
+             whether there is anything to decide.
+
+             Nothing running: two maps, now and next, because the whole point of
+             the page is choosing — and a mode switch made whichever question you
+             were not currently asking unavailable.
+
+             A model running: ONE map. The projection's question ("what would
+             this look like after starting") has been answered by the machine
+             itself; showing an estimate of the thing measured beside it invites
+             the reader to compare a fact with a forecast and wonder which is
+             wrong. What replacing the run would cost is still a real question —
+             it is asked by the placement picker and the fit line, both a column
+             to the right, and it comes back the moment the server stops. */
         }
         <Panel
-          title="Current Memory State"
+          title="Memory"
           icon="▤"
           right={
             <Pill tone={live ? "ok" : "idle"}>
@@ -912,63 +980,78 @@ export function OnePage() {
             </Pill>
           }
         >
-          <MemoryMap plan={currentPlan} />
-          <MemoryDetail
-            plan={currentPlan}
-            live={live}
-            mode="current"
-            compact
-            rssB={srv.rssB}
-            speed={live && chat.lastTps > 0
-              ? { tps: chat.lastTps, measured: true }
+          <div class="mem-section" t="mem-current">
+            <div class="mem-section-head">
+              <span class="mem-section-title">As it is now</span>
+            </div>
+            <MemoryMap plan={currentPlan} compact />
+            {
+              /* The table only when there is something in it. With nothing
+                 running every row of it is a zero — "llama.cpp 0 B · VRAM 0 B ·
+                 RAM 0 B · 0 of 0 layers" — and the map above already says what
+                 the machine holds and what is free. */
+            }
+            {live
+              ? (
+                <MemoryDetail
+                  plan={currentPlan}
+                  live
+                  mode="current"
+                  compact
+                  rssB={srv.rssB}
+                  speed={chat.lastTps > 0
+                    ? { tps: chat.lastTps, measured: true }
+                    : null}
+                />
+              )
               : null}
-          />
+          </div>
+
+          {live ? null : (
+            <div class="mem-section" t="mem-projected">
+              <div class="mem-section-head">
+                <span class="mem-section-title">After starting</span>
+              </div>
+              {projected
+                ? (
+                  <>
+                    <MemoryMap plan={projected} compact />
+                    <MemoryDetail
+                      plan={projected}
+                      mode="projected"
+                      compact
+                      speed={projectedSpeed()}
+                    />
+                  </>
+                )
+                : (
+                  <Empty
+                    icon="▢"
+                    title={currentModel()
+                      ? "This model's header could not be read"
+                      : "Select a model to see how it would fit"}
+                    hint={currentModel()
+                      ? "Nothing can be projected without it — the Models tab shows why."
+                      : "Press Detect if the list is empty."}
+                  />
+                )}
+            </div>
+          )}
+          {
+            /* One key for both maps, at the foot of the panel they share: it is
+               the same key twice otherwise, and printed twice it reads as two. */
+          }
+          <MapLegend />
         </Panel>
 
-        <Panel
-          title="Projected Memory State"
-          icon="▦"
-          right={
-            <Pill tone="idle">
-              {live ? "after replacing what runs" : "after starting"}
-            </Pill>
-          }
-        >
-          {projected
-            ? (
-              <>
-                {live
-                  ? (
-                    <p class="dim projected-note">
-                      Current state with the running model taken back out, plus
-                      {" "}
-                      <b>{currentModel()?.file}</b>{" "}
-                      under these settings — one model runs at a time, so this
-                      is what a swap would look like.
-                    </p>
-                  )
-                  : null}
-                <MemoryMap plan={projected} />
-                <MemoryDetail
-                  plan={projected}
-                  mode="projected"
-                  compact
-                  speed={projectedSpeed()}
-                />
-              </>
-            )
-            : (
-              <Empty
-                icon="▢"
-                title={currentModel()
-                  ? "This model's header could not be read"
-                  : "Select a model to see how it would fit"}
-                hint={currentModel()
-                  ? "Nothing can be projected without it — the Models tab shows why."
-                  : "Press Detect if the list is empty."}
-              />
-            )}
-        </Panel>
+        {
+          /* The command, under the memory it explains. It was a footer strip
+             across the bottom of every tab — the one part of the app that was
+             not a panel, and it read as one: full width for two lines that
+             wrapped anyway, stealing a band of height from every page. Here it
+             is a section like the rest, beside the settings that compose it. */
+        }
+        <CommandPanel t="one-cmd" targets={["server"]} />
       </div>
 
       {
@@ -1013,7 +1096,28 @@ export function OnePage() {
           holds a real conversation instead of six lines. */
       }
       <aside class="one-side">
-        <Panel title="Chat" icon="✉">
+        <Panel
+          title="Chat"
+          icon="✉"
+          right={
+            <>
+              <CopyButton
+                text={chatTranscript()}
+                title="Copy the whole conversation as markdown"
+                t="one-chat-copy"
+              />
+              <button
+                type="button"
+                class="btn tiny"
+                t="one-chat-clear"
+                disabled={!chatHasContent()}
+                onClick={() => chat.clear()}
+              >
+                Clear
+              </button>
+            </>
+          }
+        >
           <MiniChat />
         </Panel>
       </aside>

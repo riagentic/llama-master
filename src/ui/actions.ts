@@ -20,7 +20,7 @@ import { str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
-import { bestPlacement, PLACEMENTS, tune, tuneAll } from "../lib/tune.ts";
+import { bestPlacement, PLACEMENTS, tune } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
 import type { Stability } from "../lib/stability.ts";
@@ -29,7 +29,9 @@ import {
   ctxOverride,
   currentModel,
   foundPrereqs,
+  measuredCtx,
   paramBlocker,
+  placements,
   planningHw,
   serverRunning,
 } from "./derive.ts";
@@ -162,35 +164,10 @@ export function startBlocker(): string {
   return "";
 }
 
-/**
- * Every placement for the current model, so the UI can compare them without
- * three separate calls. Null when no model with a readable header is selected.
- */
-export function placements(): Record<Placement, Tuning> | null {
-  const m = currentModel();
-  if (!m?.meta) return null;
-  return tuneAll(
-    m.meta,
-    // NOT raw telemetry: while our own server is up its VRAM is inside the
-    // driver's device-wide figure, and planning against that reported "VRAM only:
-    // does not fit" for the model that was running in VRAM only at the time.
-    planningHw(),
-    cfg.settings,
-    // Two different things, and passing them as one number conflated an
-    // instruction with a hint: a context the user typed is EXACT (the tuner
-    // holds it and reports the shortfall when it cannot), while the measured
-    // fit is only a search ceiling for the automatic path — aiming past it
-    // would just walk the retry ladder back down (`src/lib/fitladder.ts`).
-    ctxOverride() || undefined,
-    measuredCtx(m.path) || undefined,
-  );
-}
-
-/** The largest context this model has been observed to actually start at on
- *  this machine, or 0 if it has never run. */
-export function measuredCtx(path: string): number {
-  return cfg.fitCtx[path] ?? 0;
-}
+// `placements` and `measuredCtx` moved to `derive.ts` — they are derived
+// values, not gestures, and the projection needs them without this module
+// importing itself in a circle. Re-exported so callers keep one import.
+export { measuredCtx, placements };
 
 /**
  * A placement that would clearly beat the one currently selected, if there is
@@ -344,6 +321,7 @@ export function startServer(): Promise<void> {
     // is an instruction, and halving it because it did not fit would be the app
     // overruling them silently (`src/lib/fitladder.ts`).
     autoFit: cfg.autoOptimal && !ctxOverride(),
+    lowPriority: cfg.lowPriority,
   }).then(() => {});
 }
 
@@ -391,6 +369,7 @@ export async function restartTuned(): Promise<void> {
     model: model.path,
     settings,
     freeAtStart: freeNowB(),
+    lowPriority: cfg.lowPriority,
   });
 }
 

@@ -73,3 +73,30 @@ export function timingsTps(json: string): number | null {
     return null;
   }
 }
+
+/** The wire budget one streaming reply may spend, per connected client. */
+const FLUSH_BUDGET_B_PER_S = 65_536;
+/** Never faster than this — 16 Hz already reads as continuous text. */
+const FLUSH_MIN_MS = 60;
+/** Never slower than this — past ~½ s the reply stops feeling live. */
+const FLUSH_MAX_MS = 500;
+
+/**
+ * How long to wait before publishing an in-flight reply of `bytes` again.
+ *
+ * Publishing is a state write, and a state write of a string sends the WHOLE
+ * string to every connected client — there is no append patch. So a fixed 60 ms
+ * cadence costs `length × 16.7/s`, i.e. quadratic in the reply: a 40 KB answer
+ * that takes a minute pushes ~20 MB per client, and a second window doubles it.
+ * That is the `PRESSURE — 33 broadcasts/sec` a long chat logged, against a
+ * threshold of 30.
+ *
+ * Holding the RATE of bytes flat instead keeps a long reply as cheap as a short
+ * one: flush every `bytes / budget` seconds, clamped so short replies stay
+ * smooth and long ones stay live.
+ */
+export function flushDelayMs(bytes: number): number {
+  const b = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  const want = Math.ceil((b * 1000) / FLUSH_BUDGET_B_PER_S);
+  return Math.min(FLUSH_MAX_MS, Math.max(FLUSH_MIN_MS, want));
+}

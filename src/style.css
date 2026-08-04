@@ -59,6 +59,14 @@ body {
   --seg-kv: #4cc9f0;
   --seg-compute: #a78bfa;
   --seg-other: #414b5c;
+  /* Reserved is the user's own claim, so it is a COLOUR, not a shade of grey:
+     drawn in the machine's greys it read as empty track, which is the one thing
+     it is not — those bytes are spoken for, they are simply spoken for by the
+     person looking at the screen. Teal because nothing else in the map is
+     (weights amber, experts terracotta, KV cyan, compute violet, everyone
+     else's slate), and the hatch stays, because a decision must not look like
+     a measurement. */
+  --seg-reserved: #20c9b0;
   --seg-over: #ff5f57;
 
   --radius: 7px;
@@ -79,7 +87,9 @@ body {
   font-size: var(--fs);
 
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  /* Two rows: header, then everything else. The third was the command strip,
+     which is a panel on the pages that own it now. */
+  grid-template-rows: auto 1fr;
   height: 100%;
   background: var(--bg);
   color: var(--text);
@@ -107,6 +117,7 @@ body {
   --seg-kv: #1391bd;
   --seg-compute: #7c5cf0;
   --seg-other: #b4bdcb;
+  --seg-reserved: #0f8f7d;
   --shadow: 0 1px 2px rgba(20, 30, 50, 0.08);
 }
 
@@ -886,6 +897,18 @@ input[type="checkbox"] {
   background: var(--seg-other);
 }
 
+/* Hatched, not solid: "in use elsewhere" is a measurement and "reserved" is a
+   decision, and the two must not read as the same fact on the same bar. */
+.seg-reserved {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--seg-reserved),
+    var(--seg-reserved) 3px,
+    color-mix(in srgb, var(--seg-reserved) 45%, transparent) 3px,
+    color-mix(in srgb, var(--seg-reserved) 45%, transparent) 6px
+  );
+}
+
 .seg-over {
   background: repeating-linear-gradient(
     45deg,
@@ -943,12 +966,33 @@ input[type="checkbox"] {
   transition: stroke-dasharray 0.3s ease-out;
 }
 
+/* The dial wears the reading. `loadTone` decides which quarter it is in
+   (src/lib/thermal.ts) — cyan, green, amber, red — so four dials asked the same
+   question answer on one scale. */
 .tone-busy .ring-fill {
   stroke: var(--busy);
 }
 
 .tone-ok .ring-fill {
   stroke: var(--ok);
+}
+
+.tone-warn .ring-fill {
+  stroke: var(--warn);
+}
+
+.tone-bad .ring-fill {
+  stroke: var(--bad);
+}
+
+/* The number inside follows the ring, so the colour is readable even at a
+   glance too quick to take in the arc. */
+.tone-warn .ring-text b {
+  color: var(--warn);
+}
+
+.tone-bad .ring-text b {
+  color: var(--bad);
 }
 
 .ring-text {
@@ -958,8 +1002,13 @@ input[type="checkbox"] {
   right: 0;
   display: grid;
   place-content: center;
+  /* Above the caption, when there is one. */
   height: calc(100% - 14px);
   pointer-events: none;
+}
+
+.ring-wrap.no-label .ring-text {
+  height: 100%;
 }
 
 .ring-text b {
@@ -1699,58 +1748,31 @@ input[type="checkbox"] {
   color: var(--text-dim);
 }
 
-/* ── command strip ─────────────────────────────────────────────────────── */
+/* ── command ───────────────────────────────────────────────────────────── */
 
-.cmdstrip {
-  border-top: 1px solid var(--line);
-  background: var(--bg-2);
-  font-size: var(--fs-sm);
-}
+/* The command is a section now, not a footer strip, and it borrows the chat's
+   code-block shape on purpose: it is the same kind of object — a named block of
+   text with a button that takes it — and the app should have one way of drawing
+   that, not two. */
 
-.cmdstrip-toggle {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 3px 12px;
-  border: 0;
-  background: transparent;
-  color: var(--text-faint);
-  font: inherit;
-  font-size: var(--fs-xs);
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-
-.cmdstrip-body {
+.cmd-blocks {
   display: grid;
-  gap: 4px;
-  padding: 0 12px 8px;
+  gap: 7px;
+}
+
+/* Wrapped, and shorter than a chat block: this one is always on screen, and a
+   30-flag command must not become the page. `break-word`, not `break-all`, so
+   a path breaks between its parts and not mid-word. */
+pre.cmd-body {
   max-height: 132px;
-  overflow: auto;
-}
-
-.cmdline {
-  display: grid;
-  grid-template-columns: 46px 1fr auto;
-  gap: 8px;
-  align-items: start;
-}
-
-.cmdline-tag {
-  font-size: var(--fs-xs);
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  color: var(--accent);
-  padding-top: 2px;
-}
-
-.cmdline code {
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
   color: var(--text-dim);
-  word-break: break-all;
+}
+
+.cmd-hidden {
+  font-size: var(--fs-sm);
+  margin: 0;
 }
 
 /* ── chat ──────────────────────────────────────────────────────────────── */
@@ -1811,17 +1833,121 @@ input[type="checkbox"] {
   color: var(--text-faint);
 }
 
+/* The body is a stack of blocks now (src/lib/richtext.ts), so the pre-wrap
+   belongs to the prose runs rather than to the container — a code block sets
+   its own whitespace rules and must not inherit the paragraph's. */
 .msg-body {
-  white-space: pre-wrap;
+  display: grid;
+  gap: 7px;
   word-break: break-word;
   font-size: var(--fs-md);
   line-height: 1.55;
+  min-width: 0;
+}
+
+.msg-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A code span inside a sentence: enough contrast to be a token, not enough to
+   be a block. */
+.inline-code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  padding: 0.5px 4px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* ── a fenced block: what it is, a way to take it, and the code ─────────── */
+
+.codeblock {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.codeblock-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px 3px 9px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: var(--fs-xs);
+}
+
+/* The file name is the identity of the block, so it gets the room and the
+   truncation — everything beside it is fixed width. */
+.codeblock-name {
+  font-family: var(--mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.codeblock-lang,
+.codeblock-live {
+  color: var(--text-faint);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  flex: 0 0 auto;
+}
+
+.codeblock-live {
+  color: var(--busy);
+}
+
+/* Horizontal scroll INSIDE the block. A long line must never widen the chat
+   column and push the whole conversation sideways. */
+.codeblock-body {
+  margin: 0;
+  padding: 8px 9px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--text);
+  max-height: 460px;
+  overflow-y: auto;
 }
 
 .msg-meta {
   font-family: var(--mono);
   font-size: var(--fs-xs);
   color: var(--text-faint);
+  justify-self: end;
+}
+
+/* ── copy ──────────────────────────────────────────────────────────────── */
+
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.copy-icon {
+  font-size: 1.05em;
+  line-height: 1;
+}
+
+/* Acknowledged: the tick is the whole point of the state, so it is coloured
+   rather than merely swapped in. */
+.copy-btn.is-copied {
+  color: var(--ok);
+  border-color: var(--ok);
 }
 
 /* A reasoning model's think-first act: visible so "thinking" is never a
@@ -1928,7 +2054,10 @@ input[type="checkbox"] {
   position: relative;
   display: grid;
   gap: 3px;
-  min-width: 64px;
+  /* To scale, but never so narrow that its own figures wrap four ways: at 64px
+     a 24 GB card beside 186 GB of RAM spent three lines saying "91% used ·
+     2.07 GB free" and the map was mostly text. 108px is one line per figure. */
+  min-width: 108px;
   flex-basis: 0;
   padding: 5px 6px;
   border-radius: var(--radius);
@@ -2007,16 +2136,21 @@ input[type="checkbox"] {
   filter: brightness(1.2);
 }
 
+/* One figure per line, deterministic: wrapped as a sentence, a 92px card spent
+   three lines and a ragged edge saying "4% used · 46.0 GB free". */
 .map-region-foot {
+  display: grid;
+  gap: 1px;
   font-size: var(--fs-xs);
   color: var(--text-faint);
   font-family: var(--mono);
+  line-height: 1.3;
 }
 
 .map-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 12px;
+  gap: 3px 10px;
   font-size: var(--fs-xs);
   color: var(--text-dim);
 }
@@ -2094,18 +2228,38 @@ input[type="checkbox"] {
   gap: 12px;
 }
 
-/* Sized so the four vitals tile 2×2 inside a one-third column; 230px left the
-   column one pixel short and the grid collapsed to a tall single file. */
+/* 2×2, always: the left column is the host (CPU, RAM), the right is the device
+   (GPU, VRAM), and the pair a placement decision is about is one above the
+   other. Auto-fitting broke that at both ends — four across in a wide window,
+   a tall single file in a narrow one. */
 .one-vitals {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
 }
 
+/* The name on top, in type you can read across the room, then the meters. It
+   used to be the caption UNDER the dial, in the smallest type on the page —
+   the label of the thing you look at first should not be the last thing you
+   can read. */
 .vital {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.vital-title {
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  line-height: 1.1;
+  color: var(--text);
+}
+
+.vital-row {
   display: flex;
   gap: 10px;
-  align-items: flex-start;
+  align-items: center;
   min-width: 0;
 }
 
@@ -2113,7 +2267,8 @@ input[type="checkbox"] {
   flex: 1;
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 2px;
+  align-content: center;
 }
 
 .vital-name {
@@ -2221,6 +2376,30 @@ input[type="checkbox"] {
 .projected-note {
   font-size: var(--fs-sm);
   margin-bottom: 8px;
+}
+
+/* One Memory panel, one or two states inside it. The second is separated by a
+   rule rather than by a panel border, because "now" and "after starting" are
+   two answers to one question and used to read as two unrelated sections. */
+.mem-section + .mem-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* The section label, and the only thing that tells the two maps apart now
+   that they share a panel — each state still explains itself in words in the
+   MemoryDetail directly below its map, so a second sentence here would be the
+   same sentence twice. */
+.mem-section-head {
+  margin-bottom: 6px;
+}
+
+.mem-section-title {
+  font-size: var(--fs-sm);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
 }
 
 /* ── the CPU / GPU / Memory detail pages ────────────────────────────────── */
@@ -2858,12 +3037,18 @@ input[type="checkbox"] {
 
 /* …except the one panel asked to FILL: the server log takes every remaining
    pixel of its column — during a long load it is the page — and scrolls
-   inside itself. */
+   inside itself.
+
+   `flex: 1 1 0` with a small floor, not `1 1 240px` with a 240px floor: a basis
+   of 240 is a DEMAND, and the column granted it by growing past the window, so
+   the log ended up below the fold — the one panel that is supposed to fill the
+   space was the one pushed out of it. Sharing what is left, and shrinking when
+   there is little, is what "fill" was meant to mean. */
 .one-col > .panel-fill {
-  flex: 1 1 240px;
+  flex: 1 1 0;
   display: flex;
   flex-direction: column;
-  min-height: 240px;
+  min-height: 132px;
 }
 
 .one-col > .panel-fill > .panel-body {
@@ -3044,4 +3229,73 @@ input[type="checkbox"] {
   .one-side {
     grid-column: auto;
   }
+}
+
+/* ── reserved memory ───────────────────────────────────────────────────── */
+
+.reserve-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.reserve-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reserve-label {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+.reserve-num {
+  width: 6ch;
+}
+
+.reserve-summary {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  flex: 1 1 100%;
+}
+
+.reserve-over {
+  font-size: var(--fs-sm);
+  color: var(--bad);
+}
+
+/* ── available on LAN ───────────────────────────────────────────────────── */
+
+.lan-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+/* The sentence that says what the switch just did. Warm rather than red: this
+   is a choice the user made on purpose, not a failure — but it is a choice
+   with a consequence, and the consequence is legible. */
+.lan-note {
+  font-size: var(--fs-xs);
+  color: var(--warn);
+  min-width: 0;
+}
+
+.lan-note .mono {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+/* Two switches on one row: who may reach the server, and whether it yields to
+   the desktop. They wrap to two lines before they crowd each other. */
+.run-prefs {
+  display: flex;
+  align-items: center;
+  gap: 8px 20px;
+  flex-wrap: wrap;
+  min-width: 0;
 }

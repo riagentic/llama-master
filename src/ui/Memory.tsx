@@ -25,15 +25,29 @@ function segments(pool: Plan["vram"]): Segment[] {
 function PoolBar(props: { pool: Plan["vram"]; hint?: string }) {
   const p = props.pool;
   const segs = segments(p);
-  const withOther: Segment[] = p.otherB > 0
-    ? [...segs, {
-      key: "other",
-      label: "In use elsewhere",
-      bytes: p.otherB,
-      tone: "other",
-    }]
-    : segs;
-  const claimed = p.usedB + p.otherB;
+  // Reserved before "in use elsewhere", and labelled apart from it: both are
+  // memory this plan may not spend, but one of them is the user's own decision
+  // and can be taken back with one control.
+  const withOther: Segment[] = [
+    ...segs,
+    ...(p.reservedB > 0
+      ? [{
+        key: "reserved",
+        label: "Reserved",
+        bytes: p.reservedB,
+        tone: "reserved" as const,
+      }]
+      : []),
+    ...(p.otherB > 0
+      ? [{
+        key: "other",
+        label: "In use elsewhere",
+        bytes: p.otherB,
+        tone: "other" as const,
+      }]
+      : []),
+  ];
+  const claimed = p.usedB + p.otherB + p.reservedB;
   return (
     <div class="pool">
       <div class="pool-head">
@@ -116,6 +130,16 @@ function bands(pool: Pool, kind: "vram" | "ram"): Band[] {
     bytes: b.bytes,
     detail: `${b.label} — ${bytes(b.bytes)} of ${kind.toUpperCase()}`,
   }));
+  if (pool.reservedB > 0) {
+    out.push({
+      key: "reserved",
+      label: "Reserved",
+      bytes: pool.reservedB,
+      detail: `${
+        bytes(pool.reservedB)
+      } you reserved for your own work — no model may use it`,
+    });
+  }
   if (pool.otherB > 0) {
     out.push({
       key: "other",
@@ -136,7 +160,7 @@ function Region(props: {
   onHover: (detail: string) => void;
 }) {
   const p = props.pool;
-  const claimed = p.usedB + p.otherB;
+  const claimed = p.usedB + p.otherB + p.reservedB;
   return (
     <div
       class={`map-region region-${props.kind}`}
@@ -184,7 +208,26 @@ function Region(props: {
         </div>
       </div>
       <div class="map-region-foot">
-        {pctLabel(claimed, p.capacityB)} used · {bytes(p.freeB)} free
+        {
+          /* Three figures that add up, and only when there are three: reserved
+             bytes are not "used" (nothing is in them) and not "free" (nothing
+             may go in them), so folding them into either one made the foot
+             disagree with the picture above it. */
+        }
+        {p.reservedB > 0
+          ? (
+            <>
+              <span>{pctLabel(p.usedB + p.otherB, p.capacityB)} used</span>
+              <span>{bytes(p.reservedB)} reserved</span>
+              <span>{bytes(p.freeB)} free</span>
+            </>
+          )
+          : (
+            <>
+              <span>{pctLabel(claimed, p.capacityB)} used</span>
+              <span>{bytes(p.freeB)} free</span>
+            </>
+          )}
       </div>
     </div>
   );
@@ -199,7 +242,8 @@ function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
     capacityB: c.capacityB,
     usedB,
     otherB: c.otherB,
-    freeB: Math.max(0, c.capacityB - usedB - c.otherB),
+    reservedB: c.reservedB,
+    freeB: Math.max(0, c.capacityB - usedB - c.otherB - c.reservedB),
     overB: c.overB,
     buckets: [
       { key: "weights", label: "Weights", bytes: c.weightsB },
@@ -207,6 +251,48 @@ function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
       { key: "compute", label: "Compute (est.)", bytes: c.computeB },
     ],
   };
+}
+
+/**
+ * What the colours mean.
+ *
+ * Its own component because two maps in one panel need it once, not twice: it
+ * is identical in both, and printed twice it read as two different keys.
+ */
+export function MapLegend() {
+  return (
+    <div class="map-legend">
+      {
+        /* No VRAM/RAM swatches: every region is captioned with its own name in
+           the map above, so those two were a key to a label. What is left is
+           what a colour alone has to carry. */
+      }
+      <span class="legend-item">
+        <i class="legend-dot seg-weights" />Weights
+      </span>
+      <span class="legend-item">
+        <i class="legend-dot seg-experts" />Experts
+      </span>
+      <span class="legend-item">
+        <i class="legend-dot seg-kv" />KV cache
+      </span>
+      <span class="legend-item">
+        <i class="legend-dot seg-compute" />Compute
+      </span>
+      <span class="legend-item">
+        <i class="legend-dot seg-other" />In use elsewhere
+      </span>
+      {
+        /* Reserved is in the legend because it is in the map. It was drawn
+               all along and named nowhere, in a grey that read as empty track —
+               so the one band the user themselves put there was the one band with
+               no way to find out what it was. */
+      }
+      <span class="legend-item">
+        <i class="legend-dot seg-reserved" />Reserved
+      </span>
+    </div>
+  );
 }
 
 /**
@@ -219,17 +305,27 @@ function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
  * question a two-card machine actually asks is "which card is full, with
  * what". One pooled bar could read "fits" while a card overflowed.
  */
-export function MemoryMap(props: { plan: Plan }) {
+export function MemoryMap(props: {
+  plan: Plan;
+  /** Drop the parts that repeat when two maps share a panel: the "Memory map —
+   *  234 GB total" caption (the section title above already says which state
+   *  this is, and the machine is the same size in both) and the legend, which
+   *  is identical and belongs to the panel rather than to either map. The
+   *  hover line stays with its own map — it is that map's answer. */
+  compact?: boolean;
+}) {
   const [hovered, setHovered] = useLocal("");
   const p = props.plan;
   const total = p.vram.capacityB + p.ram.capacityB;
   const perCard = p.devices.cards.length > 1;
   return (
     <div class="memmap" t="memory-map">
-      <div class="map-head">
-        <span class="pool-name">Memory map</span>
-        <span class="dim">{bytes(total)} total on this machine</span>
-      </div>
+      {props.compact ? null : (
+        <div class="map-head">
+          <span class="pool-name">Memory map</span>
+          <span class="dim">{bytes(total)} total on this machine</span>
+        </div>
+      )}
       <div class="map-track">
         {perCard
           ? p.devices.cards.map((c, i) => (
@@ -254,32 +350,18 @@ export function MemoryMap(props: { plan: Plan }) {
           </div>
         )
         : null}
-      <div class="map-legend">
-        <span class="legend-item">
-          <i class="legend-dot region-swatch-vram" />VRAM
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot region-swatch-ram" />RAM
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot seg-weights" />Weights
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot seg-experts" />Experts
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot seg-kv" />KV cache
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot seg-compute" />Compute (est.)
-        </span>
-        <span class="legend-item">
-          <i class="legend-dot seg-other" />In use elsewhere
-        </span>
-      </div>
-      <div class="map-hover" t="map-hover">
-        {hovered || "Hover a band to see what claims it."}
-      </div>
+      {props.compact ? null : <MapLegend />}
+      {
+        /* The hover read-out belongs to a map that has room for it. Compact is
+           two maps in one column, where it was two identical lines of
+           instructions; every band keeps its own `title`, which is the same
+           text by another route. */
+      }
+      {props.compact ? null : (
+        <div class="map-hover" t="map-hover">
+          {hovered || "Hover a band to see what claims it."}
+        </div>
+      )}
     </div>
   );
 }
