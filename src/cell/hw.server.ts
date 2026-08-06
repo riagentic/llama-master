@@ -111,6 +111,26 @@ async function cpuNonLinux(): Promise<Cpu | null> {
   return base;
 }
 
+/**
+ * How much memory this process may pin, from its own limits.
+ *
+ * `/proc/self/limits` rather than a `ulimit` subshell: no process spawn, and it
+ * is the value llama-server will INHERIT, which is the one that decides whether
+ * `--mlock` does anything. "unlimited" is reported as `Infinity`; anything
+ * unreadable as 0, which the tuner reads as "do not promise pinning".
+ */
+async function lockable(): Promise<number> {
+  const text = await read("/proc/self/limits");
+  if (!text) return 0;
+  const line = text.split("\n").find((l) => /Max locked memory/i.test(l));
+  if (!line) return 0;
+  const soft = line.replace(/Max locked memory\s*/i, "").trim().split(/\s+/)[0];
+  if (!soft) return 0;
+  if (/unlimited/i.test(soft)) return Infinity;
+  const n = Number(soft);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 export async function mem(): Promise<Mem | null> {
   if (PLATFORM === "linux") {
     const info = await read("/proc/meminfo");
@@ -122,6 +142,7 @@ export async function mem(): Promise<Mem | null> {
       usedB: Number(j.usedB ?? 0),
       swapTotalB: Number(j.swapTotalB ?? 0),
       swapUsedB: Number(j.swapUsedB ?? 0),
+      lockableB: await lockable(),
     };
   }
   const totalB = PLATFORM === "darwin"
@@ -138,7 +159,16 @@ export async function mem(): Promise<Mem | null> {
       )?.[1] ?? 0,
     );
   return totalB
-    ? { totalB, availableB: totalB, usedB: 0, swapTotalB: 0, swapUsedB: 0 }
+    ? {
+      totalB,
+      availableB: totalB,
+      usedB: 0,
+      swapTotalB: 0,
+      swapUsedB: 0,
+      // Neither macOS nor Windows exposes this the way /proc does, and a guess
+      // here would be a promise about pinning we cannot keep.
+      lockableB: 0,
+    }
     : null;
 }
 

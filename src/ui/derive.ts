@@ -29,6 +29,7 @@ import {
   optimalCtx,
   pinnedCtx,
   trainedCtx,
+  tune,
   tuneAll,
 } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
@@ -43,7 +44,7 @@ import {
 import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
-import { str } from "../lib/params.ts";
+import { num, str } from "../lib/params.ts";
 import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
 import type { UpdateCheck } from "../lib/update.ts";
@@ -382,6 +383,57 @@ export function reserveNow(): Reserve {
     connectedB: cfg.reserveConnectedVramB,
     ramB: cfg.reserveRamB,
   };
+}
+
+/**
+ * What the user's reserve is costing them, in the units the tuner works in.
+ *
+ * A reserve is honoured by planning as if the memory were absent, which is the
+ * right thing and also an invisible one: the tuner simply returns a smaller
+ * answer, and nothing on screen connects "my context is 16k" to the 8 GB the
+ * user asked to keep. On a MoE model the connection is direct and steep — a
+ * layer of routed experts is 2.5 GB on this class of model, so 8 GB is three
+ * layers that could have been on the GPU, and each one measured about 2% of the
+ * generation rate.
+ *
+ * Deliberately reported as FACTS the tuner produced (layers, context) rather
+ * than as a predicted speed: the 2%-a-layer figure is measured on one model and
+ * one machine, and dressing it up as a general rate would be the kind of
+ * confident guess this app refuses everywhere else. Null when the reserve costs
+ * nothing, which is the common case and should say nothing at all.
+ */
+export function reserveCost():
+  | {
+    blocks: true;
+    layers?: undefined;
+    ctxLost?: undefined;
+    ctxWith?: undefined;
+  }
+  | { blocks?: false; layers: number; ctxLost: number; ctxWith: number }
+  | null {
+  const m = currentModel();
+  const r = reserveNow();
+  if (!m?.meta) return null;
+  if (r.perGpuB <= 0 && r.connectedB <= 0 && r.ramB <= 0) return null;
+  const base = planningHw();
+  const withReserve = tune(m.meta, base, cfg.settings);
+  const without = tune(m.meta, { ...base, reserve: undefined }, cfg.settings);
+  // The loudest case, and the one the first version of this returned `null`
+  // for: the reserve is what makes the model impossible. A refusal caused by
+  // the user's own setting has to name the control that gives the memory back,
+  // or it reads as "this machine cannot run this model".
+  if (!withReserve.possible) return without.possible ? { blocks: true } : null;
+  if (!without.possible) return null;
+  // `--n-cpu-moe` counts layers held BACK, so more is worse. A dense model
+  // moves `ngl` instead, and the difference there is layers too.
+  const held = (t: typeof withReserve) =>
+    m.meta && m.meta.nExpert > 0
+      ? num(t.settings, "nCpuMoe")
+      : Math.max(0, m.meta ? m.meta.nLayer - num(t.settings, "ngl") : 0);
+  const layers = Math.max(0, held(withReserve) - held(without));
+  const ctxLost = Math.max(0, without.ctx - withReserve.ctx);
+  if (layers === 0 && ctxLost === 0) return null;
+  return { layers, ctxLost, ctxWith: withReserve.ctx };
 }
 
 /**

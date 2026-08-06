@@ -45,6 +45,71 @@ export const MAX_FIT_RETRIES = 6;
 const CTX_STEP = 256;
 
 /**
+ * WHICH memory ran out — because the two have opposite answers.
+ *
+ * `context` is everything that scales with `-c`: the KV cache, the attention
+ * scratch, the compute graph, and CUDA's lazily-allocated pool. Halving the
+ * context halves it, which is what the rest of this file does.
+ *
+ * `weights` is the model itself — a device buffer that failed while the tensors
+ * were being loaded. **A smaller context does not move it by one byte.** That
+ * distinction was missing and it is the difference between recovering and not:
+ *
+ *   ggml_backend_cuda_buffer_type_alloc_buffer: allocating 34679.64 MiB on
+ *   device 1: cudaMalloc failed: out of memory
+ *   alloc_tensor_range: failed to allocate CUDA1 buffer of size 36364237312
+ *
+ * That run was retried six times at 8,192 → 4,096 → … → 256 tokens, reloading a
+ * 145 GB model each time, and every rung failed at the same 34,679.64 MiB. The
+ * answer was to hold one more layer's experts on the host, which the ladder had
+ * no way to say. It happens for the most ordinary reason there is: the plan was
+ * made when the desktop held 2 GB of VRAM and the start happened when it held
+ * 5.5 GB — a browser opened in between.
+ */
+export type FitFault = "weights" | "context";
+
+/** The load-time shapes. A buffer that failed while TENSORS were being placed is
+ *  the model, whatever else the same log also says. */
+const WEIGHTS_SIGNS =
+  /alloc_tensor_range|unable to allocate \w+ buffer|error loading model|failed to load model|create_memory: failed/i;
+
+/**
+ * What llama.cpp asked for and did not get, in bytes.
+ *
+ * From its own message, which prints MiB with two decimals and, on the next
+ * line, the exact byte count. The byte count is preferred when it is there.
+ * 0 when the log does not say — the caller then has no shortfall to size a step
+ * from and falls back to the context rung.
+ */
+export function requestedB(lines: readonly string[]): number {
+  const text = lines.join("\n");
+  const exact = text.match(/failed to allocate \w+ buffer of size (\d+)/i);
+  if (exact) {
+    const n = Number(exact[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const mib = text.match(/allocating ([\d.]+) MiB on device/i);
+  if (mib) {
+    const n = Number(mib[1]);
+    if (Number.isFinite(n) && n > 0) return Math.round(n * 1024 * 1024);
+  }
+  return 0;
+}
+
+/** Which device the failed allocation was for, or -1 when the log does not say. */
+export function faultDevice(lines: readonly string[]): number {
+  const m = lines.join("\n").match(/allocating [\d.]+ MiB on device (\d+)/i);
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isInteger(n) ? n : -1;
+}
+
+/** The two faults, told apart. `null` when nothing ran out of memory at all. */
+export function fitFault(lines: readonly string[]): FitFault | null {
+  if (!isFitFailure(lines)) return null;
+  return WEIGHTS_SIGNS.test(lines.join("\n")) ? "weights" : "context";
+}
+
+/**
  * Did this run die because something did not fit in memory?
  *
  * Deliberately narrow. A smaller context is the answer to an allocation that
@@ -90,17 +155,42 @@ export function retryCtx(current: number): number {
   return half >= MIN_CTX ? half : 0;
 }
 
+/**
+ * How many more layers' experts to hold on the host.
+ *
+ * Sized from the shortfall rather than stepped blindly: the app knows each
+ * layer's routed experts EXACTLY (the Rust tensor walk), and llama.cpp says
+ * exactly how many bytes it asked for, so this is arithmetic and not a search.
+ * One rung should therefore be enough — a geometric ladder would overshoot by
+ * up to 2x, and every layer moved to the host costs about 2% of the generation
+ * rate, so overshooting is not free.
+ *
+ * `+1` because the failed allocation must not merely become possible, it must
+ * leave room for the scratch the same device still needs.
+ */
+export function movedLayers(shortB: number, perLayerB: number): number {
+  if (!(shortB > 0) || !(perLayerB > 0)) return 0;
+  return Math.ceil(shortB / perLayerB) + 1;
+}
+
 /** What the app should do about a run that has just ended. */
 export type FitDecision =
   | { kind: "none" }
-  | { kind: "retry"; ctx: number; attempt: number; note: string };
+  | { kind: "retry"; ctx: number; attempt: number; note: string }
+  | { kind: "offload"; nCpuMoe: number; attempt: number; note: string };
 
 /**
- * Should the app try again, and at what context?
+ * Should the app try again, and with what changed?
  *
  * `tries` is how many automatic retries have already happened for this start —
  * reset whenever the user presses Start themselves, so a manual attempt always
  * gets the full ladder and never inherits an exhausted one.
+ *
+ * The fault picks the rung. A `weights` fault is answered by moving experts to
+ * the host, and ONLY by that: it is the one thing that makes a model buffer
+ * smaller. When there is nothing left to move — a dense model, or every layer
+ * already on the host — the ladder falls through to the context rung, which at
+ * least shrinks the KV cache sharing the same card.
  */
 export function fitDecision(args: {
   lines: readonly string[];
@@ -109,9 +199,46 @@ export function fitDecision(args: {
   /** Off when the user is driving the settings by hand: an automatic retry
    *  would silently overwrite a context they chose on purpose. */
   auto: boolean;
+  /** `--n-cpu-moe` as it ran. */
+  nCpuMoe?: number;
+  /** Layers this model has — the cap on the above. */
+  nLayer?: number;
+  /** One layer's routed experts, exact, from the header. 0 for a dense model. */
+  expertPerLayerB?: number;
+  /** VRAM the failing device had to give, so the shortfall is a real number
+   *  rather than the whole allocation. Card total minus what else is on it. */
+  deviceFreeB?: readonly number[];
 }): FitDecision {
   if (!args.auto || args.tries >= MAX_FIT_RETRIES) return { kind: "none" };
-  if (!isFitFailure(args.lines)) return { kind: "none" };
+  const fault = fitFault(args.lines);
+  if (!fault) return { kind: "none" };
+
+  if (fault === "weights") {
+    const perLayerB = args.expertPerLayerB ?? 0;
+    const nLayer = args.nLayer ?? 0;
+    const now = Math.max(0, args.nCpuMoe ?? 0);
+    const dev = faultDevice(args.lines);
+    const free = args.deviceFreeB?.[dev] ?? 0;
+    // The shortfall, not the request: asking for 34.7 GB of a card holding
+    // 22 GB of headroom is 12.7 GB short, and moving 34.7 GB of experts to the
+    // host would give away most of the GPU for no reason.
+    const shortB = Math.max(0, requestedB(args.lines) - free);
+    const move = movedLayers(shortB, perLayerB);
+    const next = Math.min(nLayer, now + move);
+    if (move > 0 && nLayer > 0 && next > now) {
+      return {
+        kind: "offload",
+        nCpuMoe: next,
+        attempt: args.tries + 1,
+        note:
+          `The weights did not fit on GPU ${dev < 0 ? "?" : dev} — short by ${
+            (shortB / 1024 ** 3).toFixed(1)
+          } GB. Retrying with ${next} layers' experts held in RAM instead of ${now}. ` +
+          `A smaller context would not have moved this: it is the model itself, not the cache.`,
+      };
+    }
+  }
+
   const next = retryCtx(args.ctx);
   if (next <= 0) return { kind: "none" };
   return {
@@ -154,6 +281,47 @@ export function withCtx(argv: readonly string[], ctx: number): string[] {
     }
   }
   out.push("-c", String(ctx));
+  return out;
+}
+
+/** `--n-cpu-moe` in an argv, or 0 when it does not say one. */
+export function nCpuMoeOf(argv: readonly string[]): number {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === "--n-cpu-moe" || argv[i] === "-ncmoe") {
+      const n = Number(argv[i + 1]);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+  }
+  return 0;
+}
+
+/**
+ * The same argv holding more layers' experts on the host.
+ *
+ * The `-ts` that went with it is DROPPED, and that is the whole subtlety: the
+ * split was computed for a placement that has just been proven wrong, and it
+ * pins the layers to exactly the cards that could not hold them. Removing it
+ * lets llama.cpp fall back to splitting by each device's free VRAM, which for
+ * the retry is the better information — it is measured at load time, on the
+ * machine as it is now, which is precisely what the stale plan was not.
+ */
+export function withNCpuMoe(argv: readonly string[], n: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-ts" || a === "--tensor-split") {
+      i++; // and its value
+      continue;
+    }
+    out.push(a as string);
+  }
+  for (let i = 0; i < out.length - 1; i++) {
+    if (out[i] === "--n-cpu-moe" || out[i] === "-ncmoe") {
+      out[i + 1] = String(n);
+      return out;
+    }
+  }
+  out.push("--n-cpu-moe", String(n));
   return out;
 }
 

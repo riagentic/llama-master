@@ -73,13 +73,19 @@ export function slotOnGpu(slot: number, o: Offload): boolean {
  */
 export function deviceBudgets(
   gpus: readonly Gpu[],
-  overheadB = 0,
+  /** Per-card overhead. A single number charges every card the same; an array
+   *  charges each its own, which is what the compute scratch needs — it follows
+   *  the layers, so the card holding more of them holds more of it. */
+  overheadB: number | readonly number[] = 0,
   userReservesB: readonly number[] = [],
 ): number[] {
   return gpus.map((g, i) => {
     const reserve = Math.max(512 * 1024 * 1024, g.vramTotalB * 0.05);
     const mine = Math.max(0, userReservesB[i] ?? 0);
-    return Math.max(0, g.vramTotalB - g.vramUsedB - reserve - mine - overheadB);
+    const over = typeof overheadB === "number"
+      ? overheadB
+      : Math.max(0, overheadB[i] ?? 0);
+    return Math.max(0, g.vramTotalB - g.vramUsedB - reserve - mine - over);
   });
 }
 
@@ -130,6 +136,51 @@ export function loadPerDevice(
     }
   }
   return out;
+}
+
+/**
+ * The cuts a GIVEN `-ts` produces — llama.cpp's arithmetic, run forwards.
+ *
+ * The inverse of `tensorSplitValue`, and it exists because the split is not
+ * always ours: a user may type one in the Tune page, and until this existed the
+ * plan drew the PACKER's cuts regardless, so the per-card bars described a
+ * placement that was not going to happen. "What you see is what runs" has to
+ * survive somebody disagreeing with the packer.
+ *
+ * The rule is `llama-model.cpp`'s: the values are normalised into cumulative
+ * fractions and slot `i` of the offloaded run goes to the first device whose
+ * cumulative fraction exceeds `i / count`. By count, as everywhere else here.
+ *
+ * `null` when the string says nothing usable — unparseable, or all zeros. The
+ * caller then falls back to packing, which is what llama.cpp would also do.
+ */
+export function countsFromSplit(
+  split: string,
+  count: number,
+  devices: number,
+): number[] | null {
+  if (devices <= 0 || count < 0) return null;
+  const raw = split.split(",").map((v) => Number(v.trim()));
+  if (raw.length === 0 || raw.some((v) => !Number.isFinite(v) || v < 0)) {
+    return null;
+  }
+  const vals = Array.from({ length: devices }, (_v, i) => raw[i] ?? 0);
+  const total = vals.reduce((a, b) => a + b, 0);
+  if (!(total > 0)) return null;
+  const cum: number[] = [];
+  let acc = 0;
+  for (const v of vals) {
+    acc += v / total;
+    cum.push(acc);
+  }
+  const counts = vals.map(() => 0);
+  for (let i = 0; i < count; i++) {
+    const at = i / count;
+    let d = cum.findIndex((c) => c > at);
+    if (d < 0) d = devices - 1;
+    counts[d] = (counts[d] ?? 0) + 1;
+  }
+  return counts;
 }
 
 /**

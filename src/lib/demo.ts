@@ -19,6 +19,7 @@
 import type { Build, Cpu, Disk, Gpu, Mem, ModelMeta } from "./types.ts";
 
 const GB = 1024 ** 3;
+const MB = 1024 ** 2;
 
 export const DEMO_ENV = "LLAMA_MASTER_DEMO";
 
@@ -43,6 +44,7 @@ export function demoMem(): Mem {
     usedB: 16 * GB,
     swapTotalB: 8 * GB,
     swapUsedB: 0,
+    lockableB: 64 * MB, // a stock Linux limit: small, which is the point
   };
 }
 

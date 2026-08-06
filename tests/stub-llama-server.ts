@@ -71,6 +71,14 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
     if (!ready()) {
       return Response.json({ error: "loading" }, { status: 503 });
     }
+    // `--slow-generate` is the OTHER thing a probe can meet: a process that is
+    // alive and simply has not finished. A cold start runs against a page
+    // cache that is still filling — measured 23x slower prompt processing on
+    // the first reply — and treating that as death left a working server
+    // "starting" forever.
+    if (args.includes("--slow-generate")) {
+      return new Promise<Response>(() => {});
+    }
     if (args.includes("--oom-on-generate")) {
       console.error(
         "/src/ggml-cuda/ggml-cuda.cu:106: CUDA error",

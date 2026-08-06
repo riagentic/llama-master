@@ -31,6 +31,10 @@ export const PARAMS: readonly Param[] = [
     group: "offload",
     scope: "both",
     def: 0,
+    // llama.cpp's default is AUTO — it offloads what it thinks fits. -1 is
+    // outside this parameter's range, so `-ngl` is always emitted: without it,
+    // "CPU only" silently ran on the GPU.
+    llamaDef: -1,
     min: 0,
     max: 999,
     tip:
@@ -135,6 +139,9 @@ export const PARAMS: readonly Param[] = [
     kind: "int",
     group: "performance",
     scope: "both",
+    // No llamaDef: 0 here means "not set", and the flag is inert unless
+    // --spec-type is on, so emitting it always would be noise on a command
+    // line the user reads.
     def: 0,
     min: 0,
     max: 16,
@@ -179,6 +186,10 @@ export const PARAMS: readonly Param[] = [
     group: "context",
     scope: "both",
     def: 4096,
+    // llama.cpp's default is 0 = take it from the model, which for a model
+    // declaring 1,048,576 is 1,048,576. Always emitted, or a plan drawn for
+    // 4,096 tokens starts a server that needs 256 times the memory.
+    llamaDef: 0,
     min: 256,
     max: 1048576,
     step: 256,
@@ -224,6 +235,9 @@ export const PARAMS: readonly Param[] = [
     group: "context",
     scope: "server",
     def: 1,
+    // llama.cpp's default is -1 = auto, and auto chose FOUR on this machine —
+    // so the panel said "1 slot" while the server ran four. Always emitted.
+    llamaDef: -1,
     min: 1,
     max: 64,
     tip:
@@ -631,6 +645,7 @@ export const PARAMS: readonly Param[] = [
     group: "server",
     scope: "server",
     def: 600,
+    llamaDef: 3600,
     min: 1,
     max: 86400,
     unit: "s",

@@ -64,6 +64,7 @@ import { chat } from "../src/cell/chat.ts";
 import {
   betterPlacement,
   placements,
+  reserveCost,
   startBlocker,
   startServer,
   stopServer,
@@ -191,7 +192,11 @@ testUI(
     await ui_.settle();
     if (!ui.showCommand) ui.toggleCommand();
     await ui_.settle();
-    assert(!ui_.html().includes("-ngl"), "a default config emits no -ngl");
+    // `-ngl` is ALWAYS on the command line now, because llama.cpp's own
+    // default for it is "auto" — omitting it is not neutral, it is a different
+    // run (`types.ts:Param.llamaDef`). What the strip must show is the value
+    // the panel is showing.
+    assertStringIncludes(ui_.html(), "-ngl 0");
 
     await cfg.set("ngl", "99");
     await cfg.set("ctxSize", "16384");
@@ -2521,6 +2526,44 @@ testUI(
           4 * 1024 ** 3,
           "the plan behind Start carries the reserve too",
         );
+
+        // And the page SAYS what the reserve costs. Honouring it by planning
+        // as if the memory were absent is right and completely invisible: the
+        // answer just comes back smaller, with nothing connecting the shorter
+        // context to the number the user typed. A reserve big enough to bite
+        // has to name its own price, in the tuner's units.
+        // Reserved to the point where it bites: 23 GB of each 24 GB card.
+        await page["one-reserve-gpu"].setValue("23");
+        await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 23 * GiB);
+        await ui_.settle();
+        const cost = reserveCost();
+        assertExists(cost, "46 of 48 GB held back must cost something");
+        assert(
+          cost.blocks || (cost.layers ?? 0) > 0 || (cost.ctxLost ?? 0) > 0,
+          `it costs layers, context, or the model itself: ${
+            JSON.stringify(cost)
+          }`,
+        );
+        assertStringIncludes(ui_.html(), "Costing you");
+        // Written once, like the summary above it — same fragment trap.
+        assertEquals(
+          (ui_.html().match(/Costing you/g) ?? []).length,
+          1,
+        );
+        // And it says nothing at all when it costs nothing, which is the
+        // common case: a line that always appears is a line nobody reads.
+        await page["one-reserve-gpu"].setValue("0");
+        await page["one-reserve-connected"].setValue("0");
+        await page["one-reserve-ram"].setValue("0");
+        await ui_.expectCell(
+          cfg,
+          (s) =>
+            s.reservePerGpuVramB === 0 && s.reserveConnectedVramB === 0 &&
+            s.reserveRamB === 0,
+        );
+        await ui_.settle();
+        assertEquals(reserveCost(), null, "nothing reserved, nothing to say");
+        assertEquals((ui_.html().match(/Costing you/g) ?? []).length, 0);
       });
     } finally {
       await removeStubBuild("stub-cuda");

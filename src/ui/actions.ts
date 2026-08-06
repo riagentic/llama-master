@@ -19,7 +19,7 @@ import { argv, serverUrl } from "../lib/command.ts";
 import { str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
-import type { Backend } from "../lib/types.ts";
+import type { Backend, ModelMeta } from "../lib/types.ts";
 import { bestPlacement, PLACEMENTS, tune } from "../lib/tune.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
@@ -33,6 +33,7 @@ import {
   paramBlocker,
   placements,
   planningHw,
+  reserveCost,
   serverRunning,
 } from "./derive.ts";
 
@@ -167,7 +168,7 @@ export function startBlocker(): string {
 // `placements` and `measuredCtx` moved to `derive.ts` — they are derived
 // values, not gestures, and the projection needs them without this module
 // importing itself in a circle. Re-exported so callers keep one import.
-export { measuredCtx, placements };
+export { measuredCtx, placements, reserveCost };
 
 /**
  * A placement that would clearly beat the one currently selected, if there is
@@ -278,7 +279,12 @@ export function pinMaxFor(placement: Placement): void {
 /** Is the current configuration going to hurt? Recomputed on every render, so
  *  the warning appears the moment a control is changed. */
 export function currentStability(): Stability {
-  return stability(currentModel()?.meta ?? null, planningHw(), cfg.settings);
+  // `lowPriority` is not a llama.cpp flag, so it is not in the catalog — but it
+  // decides whether "every core is claimed" is a problem or the intended
+  // answer, so the check has to be told about it.
+  return stability(currentModel()?.meta ?? null, planningHw(), cfg.settings, {
+    lowPriority: cfg.lowPriority,
+  });
 }
 
 /**
@@ -322,7 +328,32 @@ export function startServer(): Promise<void> {
     // overruling them silently (`src/lib/fitladder.ts`).
     autoFit: cfg.autoOptimal && !ctxOverride(),
     lowPriority: cfg.lowPriority,
+    shape: modelShape(model?.meta ?? null),
+    cardFreeB: hw.gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB)),
   }).then(() => {});
+}
+
+/**
+ * What the fit ladder needs to answer a weights overflow.
+ *
+ * The typical routed-expert weight of ONE layer, which is what `--n-cpu-moe`
+ * moves per step. The median rather than the mean: a MoE model usually has a
+ * few dense layers at the front with no experts at all, and averaging those in
+ * would under-size every step of the ladder and turn one rung into three — each
+ * of which reloads the whole model.
+ */
+export function modelShape(
+  meta: ModelMeta | null,
+): { nLayer: number; expertPerLayerB: number } {
+  if (!meta) return { nLayer: 0, expertPerLayerB: 0 };
+  const experts = meta.layers.map((l) => l.expert).filter((b) => b > 0).sort((
+    a,
+    b,
+  ) => a - b);
+  const mid = experts.length > 0
+    ? experts[Math.floor(experts.length / 2)] ?? 0
+    : 0;
+  return { nLayer: meta.nLayer, expertPerLayerB: mid };
 }
 
 /** Device-wide free memory right now — the baseline a run's drift note

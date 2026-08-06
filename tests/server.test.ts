@@ -226,6 +226,47 @@ Deno.test({
 });
 
 Deno.test({
+  name: "srv: a probe that times out is a slow machine, not a dead process",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // The bug: `AbortSignal.timeout` and a dropped connection both reject, and
+    // both were reported as `dead`. The poll then waited for an exit that was
+    // never coming and re-probed every second, so a server that was merely
+    // slow sat at "proving a first reply" indefinitely. The first reply after
+    // a cold start runs against a page cache still filling — measured 23x
+    // slower prompt processing on a 39 GB model — so this is the normal case
+    // on a big model, not an exotic one.
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const child = new Deno.Command(bin, {
+      args: ["-m", "/m.gguf", "--port", String(port), "--slow-generate"],
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    try {
+      await waitFor(
+        async () => (await io.health(url)).ok,
+        "the stub to answer /health",
+        15_000,
+      );
+      const slow = await io.probe(url, 1_000);
+      assertEquals(slow.kind, "slow", `got ${JSON.stringify(slow)}`);
+      assertStringIncludes(slow.detail, "no reply");
+    } finally {
+      child.kill("SIGKILL");
+      await child.status;
+    }
+    // And a process that is genuinely gone still reads as dead, which is the
+    // half that must keep working: it is how the OOM the probe provokes is
+    // handed to the crash path.
+    const gone = await io.probe(url, 2_000);
+    assertEquals(gone.kind, "dead");
+  },
+});
+
+Deno.test({
   name: "srv: refuses to run a binary outside its own builds directory",
   sanitizeOps: false,
   sanitizeResources: false,

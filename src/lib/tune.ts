@@ -27,6 +27,14 @@ import { reserveLabel, reserveOf } from "./reserve.ts";
 import { defaults, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
 
+/**
+ * How much residency the context search may give back, as a fraction of the
+ * host-weight bytes it starts from. See `bestCtx` — this is the exchange rate
+ * between speed and context, and it is deliberately small and deliberately not
+ * zero.
+ */
+const RESIDENCY_SLACK = 0.05;
+
 /** Where the model runs. The only placement choice the user makes. */
 export type Placement = "vram" | "hybrid" | "cpu";
 
@@ -354,10 +362,34 @@ function minCpuMoe(
 
 /** The CPU budget, which no longer varies by mode: two physical cores stay with
  *  the OS so the desktop keeps repainting, for generation and prefill alike. */
+/**
+ * Threads, and the two numbers that are not threads.
+ *
+ * EVERY physical core, and none of the SMT siblings. Measured on this machine
+ * (16C/32T Ryzen, DeepSeek-V4-Flash IQ3_XXS hybrid, 32 of 43 layers' experts on
+ * the host, generation tok/s):
+ *
+ *     -t 8    12.61      -t 16   13.24   ← every physical core
+ *     -t 14   13.07      -t 24   10.31
+ *                        -t 32    0.94   ← catastrophic, not merely slower
+ *
+ * Two things in that table. Past the physical cores it does not degrade, it
+ * collapses: 32 threads on 16 cores is a fourteenth of the speed, because the
+ * expert matmuls are memory-bound and the SMT siblings only add contention. And
+ * 8 threads is within 5% of 16, which says the same thing from the other side —
+ * this workload is bandwidth-bound, so the last cores buy little and the first
+ * ones buy most.
+ *
+ * It used to hold two cores back "so the desktop keeps moving". That is now the
+ * job of the "Low priority" switch (`src/lib/priority.ts`, on by default), which
+ * does it properly: at nice 19 in the idle I/O class llama.cpp yields to
+ * anything else that wants the CPU, so reserving cores as well pays 2-5% for
+ * protection that is already there.
+ */
 function cpuBudget(cores: number) {
   return {
-    threads: Math.max(1, cores - 2),
-    threadsBatch: Math.max(1, cores - 2),
+    threads: Math.max(1, cores),
+    threadsBatch: Math.max(1, cores),
     ubatch: 512,
     batch: 2048,
   };
@@ -489,10 +521,24 @@ function bestCtx(
       .filter((b) => b.key === "weights")
       .reduce((a, b) => a + b.bytes, 0);
   };
+  // ...but the anchor has SLACK, because a step function makes terrible trades
+  // at the margin. Measured on this machine (DeepSeek-V4-Flash IQ3_XXS, 2x24 GB,
+  // `--n-cpu-moe` sweep against a real server): one layer of routed experts
+  // moved back to the host costs about 2% of generation speed — 15.7 tok/s at
+  // 28 layers on the host, 14.0 at 30, 13.2 at 32. A strict anchor spends that
+  // 2% to defend a context THREE TIMES shorter: 9,728 tokens where 27,648 was
+  // available for one layer. Nobody would choose that, and the app was choosing
+  // it silently.
+  //
+  // 5% of the host-weight bytes is about two layers on a model like this. It is
+  // bounded on purpose — the unbounded version of this trade is the search that
+  // settled on one layer on the GPU at a 654,848 context, which fits and runs
+  // at CPU speed.
   const anchor = hostWeightsB(anchorAt);
+  const slack = anchor === Infinity ? 0 : anchor * RESIDENCY_SLACK;
   const keepsResidency = (c: number): boolean =>
     place(meta, hw, base, placement, c) !== null &&
-    hostWeightsB(c) <= anchor;
+    hostWeightsB(c) <= anchor + slack;
   const placeable = (c: number): boolean =>
     place(meta, hw, base, placement, c) !== null;
   return searchCtx(ceiling, keepResidency ? keepsResidency : placeable);
@@ -588,7 +634,7 @@ export function tune(
     s.ubatchSize = b.ubatch;
     s.batchSize = b.batch;
     reasons.push(
-      `${b.threads} of ${cores} physical cores — two are held back so the desktop keeps moving while the model runs.`,
+      `${b.threads} threads, one per physical core — past that it collapses rather than plateaus (32 threads on ${cores} cores measured a fourteenth of the speed). The desktop is protected by "Low priority" instead, which costs nothing when nothing else is running.`,
     );
   }
 
@@ -914,6 +960,9 @@ function finish(
   const hostNeed = p.ram.usedB;
   const margin = ramMarginB(availB);
   const roomToSpare = availB > 0 && hostNeed > 0 && hostNeed < availB * 0.7;
+  // What the kernel would actually let this process PIN, as opposed to what
+  // there is room for. 0 = the platform did not say, which is treated as "no".
+  const lockable = hw.mem?.lockableB ?? 0;
 
   if (roomToSpare && num(s, "nCpuMoe") > 0 && p.ram.overB === 0) {
     // MEASURED, not reasoned from folklore, on the 145 GB DeepSeek-V4 with 33
@@ -935,11 +984,31 @@ function finish(
     reasons.push(
       "Memory-mapped (llama.cpp's default): the routed experts run from the page cache, so a warm restart re-reads nothing — measured 6 s instead of 160 s on a 145 GB model, and every automatic retry reloads the model. --no-mmap would copy the whole file on every start, and --mlock would ask to pin more than stock memlock limits allow, so llama.cpp would warn and run unpinned anyway.",
     );
-  } else if (roomToSpare) {
+  } else if (roomToSpare && lockable >= hostNeed) {
     s.mlock = true;
     reasons.push(
       "--mlock on: the host-side weights fit in free RAM with room to spare, so pinning them stops the OS paging the model out mid-generation.",
     );
+  } else if (roomToSpare && hostNeed > 0) {
+    // Room in RAM is not permission to PIN it. Stock Linux caps RLIMIT_MEMLOCK
+    // far below a large model — 23.3 GB on the machine that found this, against
+    // ~100 GB of host-side weights — and llama.cpp's answer to being over is a
+    // warning and an unpinned run. The branch above already refuses `--mlock`
+    // for a partial offload; a CPU-ONLY placement has `--n-cpu-moe 0`, so it
+    // fell through to here and the app printed "pinning them stops the OS
+    // paging the model out" about something that did not happen. The limit is
+    // read, not assumed (`hw.server.ts:lockable`), and 0 means unknown, which
+    // is also a reason not to promise.
+    s.mlock = false;
+    if (lockable > 0) {
+      reasons.push(
+        `Memory-mapped: --mlock would ask to pin ${
+          (hostNeed / 1024 ** 3).toFixed(0)
+        } GB and this machine allows ${
+          (lockable / 1024 ** 3).toFixed(0)
+        } GB (RLIMIT_MEMLOCK), so llama.cpp would warn and run unpinned anyway.`,
+      );
+    }
   } else if (hostNeed > 0) {
     s.mlock = false;
   }

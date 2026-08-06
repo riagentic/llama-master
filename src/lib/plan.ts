@@ -12,6 +12,7 @@
 import type { Gpu, Hw, ModelMeta, Settings } from "./types.ts";
 import { bool, num, str } from "./params.ts";
 import {
+  countsFromSplit,
   deviceBudgets,
   loadPerDevice,
   offloadRange,
@@ -456,6 +457,11 @@ export function plan(
   // `-ub` tokens at a time. Four activation-sized tensors is the empirical
   // shape of the graph; the backend context is a flat per-process cost.
   const ubatch = Math.max(1, num(s, "ubatchSize"));
+  // Server slots multiply the compute scratch — each runs its own graph. Read
+  // from the settings the argv is built from, never assumed: llama.cpp's own
+  // default is `auto`, which chose four and quadrupled the buffer while the
+  // panel said one (`params.ts:parallel`, `types.ts:Param.llamaDef`).
+  const slots = Math.max(1, num(s, "parallel"));
   const activation = ubatch * whole(meta.nEmbd) * 4;
   const usingGpu = off.count > 0 && hw.gpus.length > 0;
 
@@ -470,9 +476,14 @@ export function plan(
     : 0;
   const mtpDraftB = mtpKvB > 0 ? mtpKvB + BACKEND_CONTEXT_B / 2 : 0;
 
+  // The pool total is the sum of what the cards below are charged, and it has
+  // to stay that way: one number for the bar and a different one for the packer
+  // is how a plan came to say "fits" on one line and "nowhere to go" on the
+  // next. Per-device costs times the devices, plus the scratch once.
   const gpuCompute = usingGpu
-    ? activation * 4 + BACKEND_CONTEXT_B * Math.max(1, hw.gpus.length) +
-      mtpDraftB + computeScratch(meta, ubatch, ctx)
+    ? (activation * 4 + BACKEND_CONTEXT_B + scratchFloor(meta)) *
+        Math.max(1, hw.gpus.length) +
+      mtpDraftB + computeScratch(meta, ubatch, ctx, slots)
     : 0;
   // On a CPU-only run the draft context is just as real, minus the GPU backend
   // half — it lands in RAM, where a tight MTP run is exactly the case that
@@ -484,21 +495,49 @@ export function plan(
   // Where each slot actually lands. The aggregate above says whether the model
   // fits the machine; this says whether any single card is being asked for more
   // than it has, which is a different question and the one that OOMs.
-  // The scratch lands ON a device, so it comes out of that device's budget too.
-  const perDeviceOverheadB = usingGpu
-    ? BACKEND_CONTEXT_B + activation * 4 + computeScratch(meta, ubatch, ctx)
+  //
+  // How much of the scratch each CARD must be able to give.
+  //
+  // The total is divided between the cards, not repeated on each — measured on
+  // the real model at a 1,048,576 context, the same placement costs 8,110 MiB
+  // of scratch on one card and 8,567 MiB spread over two. So the POOL above
+  // counts it once, and that is what the machine actually uses.
+  //
+  // But WHERE the division falls is llama.cpp's to choose, and it does not
+  // follow the layer count. With `--n-cpu-moe 32 -ts 33.5,10.5`, card 1 held
+  // 10 slots of 44 — 23% of the layers — and wanted about 60% of the scratch:
+  //
+  //   graph_reserve: failed to allocate compute buffers
+  //   allocating 1676.89 MiB on device 1: cudaMalloc failed: out of memory
+  //
+  // on a plan that had budgeted card 1 its proportional 23% and called it a
+  // fit. So a card is budgeted for the WHOLE scratch. That is pessimistic by
+  // construction and it is the pessimism that makes a proposal start: the
+  // question here is not "what will this cost" (the pool answers that) but
+  // "can this card hold whatever share it is handed", and the only share that
+  // is safe to promise is all of it.
+  const scratchB = computeScratch(meta, ubatch, ctx, slots);
+  const fixedPerDeviceB = usingGpu
+    ? BACKEND_CONTEXT_B + activation * 4 + scratchFloor(meta)
     : 0;
-  // A proposal is budgeted defensively — the fixed per-card safety reserve, the
-  // user's reserve and this device's scratch all come off before a slot may be
-  // placed. A run that is ALREADY UP gets the physical budget instead: whatever
-  // the card holds beside everybody else's bytes. Those margins exist to keep a
-  // future allocation from failing, and re-imposing them on an allocation that
-  // has already succeeded is how the picture came to strand layers that the
-  // driver was plainly holding.
+  const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
   const budgetsB = asked === "running"
     ? hw.gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB))
     : deviceBudgets(hw.gpus, perDeviceOverheadB, reserveShares);
-  const counts = usingGpu ? packSlots(slotCostsB, budgetsB) : [];
+  // A `-ts` on the command line is not advice, it is the placement. Until this
+  // read it, the plan drew the PACKER's cuts however the argv disagreed — so a
+  // user who typed a split saw per-card bars for a run that was not going to
+  // happen, on the one page whose whole promise is that it is not a form.
+  // (The tuner writes its own `-ts` here too, and this reading it back is the
+  // round trip: `tensorSplitValue` and `countsFromSplit` must agree, or the
+  // number we emit is not the placement we drew.)
+  const asked_ts = str(s, "tensorSplit").trim();
+  const pinnedCounts = usingGpu && asked_ts
+    ? countsFromSplit(asked_ts, off.count, hw.gpus.length)
+    : null;
+  const counts = usingGpu
+    ? (pinnedCounts ?? packSlots(slotCostsB, budgetsB))
+    : [];
 
   // The per-card picture — including when the packing FAILS. That is the
   // moment the user most needs to see it, so the display falls back to a
@@ -537,6 +576,11 @@ export function plan(
       const kvB = slotsPlaced > 0 && !kvOnCpu
         ? whole(kvOnGpu * (n / slotsPlaced))
         : 0;
+      // Drawn as it is budgeted, so the picture and the packer cannot disagree
+      // about the same card. See the note at `perDeviceOverheadB`: the pool
+      // counts the scratch once because that is what the machine uses; a card
+      // is charged all of it because llama.cpp decides the split and does not
+      // divide it by layer count.
       const computeB = n > 0 || i === 0 ? perDeviceOverheadB : 0;
       const otherB = g.vramUsedB;
       const reservedB = reserveShares[i] ?? 0;
@@ -581,8 +625,25 @@ export function plan(
   const devices: DevicePlan = {
     bytesB: counts ? loadPerDevice(slotCostsB, counts) : [],
     budgetsB,
-    tensorSplit: counts ? tensorSplitValue(counts) : "",
-    fits: counts !== null || placementSettled,
+    // The split that produces this placement — which, when the user pinned
+    // one, is theirs. Re-deriving it from the counts would answer "" for a
+    // pinned `1,0` (one card doing all the work needs no split of OURS), and
+    // "" does not produce that placement: llama.cpp would fall back to
+    // splitting by free VRAM and put half the model on the other card.
+    tensorSplit: pinnedCounts
+      ? asked_ts
+      : counts
+      ? tensorSplitValue(counts)
+      : "",
+    // A PINNED split always produces counts — it is an instruction, not a
+    // search — so "the packer found an arrangement" stops being the question.
+    // What is left is whether the arrangement it names actually holds, which
+    // is what the cards say. Reading `counts !== null` here made every hand-
+    // typed `-ts` fit by definition, including one that asks a 12 GB card for
+    // 12.2 GB.
+    fits: pinnedCounts
+      ? cards.every((c) => c.overB === 0)
+      : counts !== null || placementSettled,
     cards,
     unplacedB: placementSettled ? 0 : unplacedB,
   };
@@ -680,39 +741,98 @@ export function plan(
  * few micro-batch-sized activations, which is what the rest of `plan` assumes
  * and what holds for almost every model. A sparse-attention model breaks it:
  * DeepSeek-V4's "lightning indexer" scores the WHOLE context for every token in
- * the micro-batch, so the graph holds tensors of `ubatch x ctx`, and the cost
- * rises linearly with the context instead of not at all.
+ * the micro-batch, so the graph holds tensors sized by the context and the cost
+ * rises linearly with it instead of not at all. Without this term the app
+ * proposed contexts that could not be allocated on any machine and any split.
  *
- * How wrong that was: at a 1,048,576 context llama.cpp asked for a **68.5 GiB**
- * compute buffer where this function's absence left the estimate at 730 MB. The
- * app therefore proposed a context that could not be allocated on any machine
- * and any split — 68 GiB of scratch does not fit two 24 GB cards however the
- * layers are divided. Every "it still crashed" came back to this number.
+ * MEASURED, twice, and the second time changed both the constant AND the shape.
  *
- * `SCRATCH_TENSORS` is MEASURED, not derived: 68.5 GiB / (512 x 1,048,576 x 4 B)
- * = 34.3 score-sized tensors live in the graph at once. A GGUF header does not
- * say how many, so this is calibrated against a real allocation and rounded up.
- * Being a little pessimistic here is the right direction: it costs some context,
- * where being optimistic costs a failed load after a two-minute wait.
+ * The first calibration divided one observation — llama.cpp asking for 68.5 GiB
+ * at a 1,048,576 context — by `ubatch x ctx x 4` and got 34 "score-sized
+ * tensors". That made the scratch scale with the MICRO-BATCH, which turns out
+ * not to be how it behaves, and it made the estimate ~3.4x too large at every
+ * context anyone actually runs. On a 2x24 GB machine the app offered 27,648
+ * tokens on a model that runs at 262,144.
+ *
+ * The second calibration was a sweep at the default slot count, and it missed
+ * the largest term of all. The THIRD found it: the scratch is multiplied by the
+ * number of server SLOTS, and llama.cpp's `-np` default is `-1 = auto`, which
+ * chose FOUR. Same model, same placement, a 1,048,576 context:
+ *
+ *     -np auto (4 slots)   43,517 MiB of VRAM
+ *     -np 1                21,467 MiB
+ *
+ * So `parallel` is a term here, not a server detail. Measured at one slot
+ * (`--n-cpu-moe 43`, both cards, ub 512, VRAM read after a real generation so
+ * CUDA's lazy allocations have happened; the desktop's 2,762 MiB subtracted):
+ *
+ *     ctx        slots   ours        above the 4,096 baseline
+ *     4,096      1       10,158 MiB  —
+ *     262,144    1       12,203 MiB  +2,045 MiB   (8.1 KB/token)
+ *     1,048,576  1       18,705 MiB  +8,547 MiB   (8.4 KB/token)
+ *     4,096      4       10,381 MiB  —
+ *     262,144    4       17,687 MiB  +7,306 MiB   (29.0 KB/token)
+ *     524,288    4       25,123 MiB  +14,742 MiB  (29.0 KB/token)
+ *     1,048,576  4       40,749 MiB  +30,368 MiB  (29.8 KB/token)
+ *
+ * Straight lines both times, and the ratio between them is the slot count. The
+ * micro-batch term is taken from the earlier sweep, which varied `-ub` at a
+ * fixed context and found it small: 256/512/1024 moved the per-token cost by
+ * -12%/+17%, where a term proportional to `-ub` would have moved it 4x.
+ *
+ * The constants below round the measurement up by about a fifth. Pessimism here
+ * costs context; optimism costs a failed load, and the fit ladder
+ * (`src/lib/fitladder.ts`) now recovers from a miss in either direction — but
+ * being 3x out, as the first calibration was, is not something a ladder should
+ * have to fix.
  *
  * Gated on the model DECLARING the indexer, so nothing changes for the models
  * where the flat estimate was already correct.
+ */
+/** Per context token, per slot, independent of the micro-batch. */
+const SCRATCH_B_PER_CTX = 8 * 1024;
+/** Per context token per micro-batch token, per slot — the small term. */
+const SCRATCH_B_PER_CTX_UBATCH = 4;
+/**
+ * The part that does NOT scale with the context, per device.
  *
- * Wiring this in was only safe once the tuner stopped maximising the context:
- * priced honestly against the old objective, the search bought context by
- * evicting layers and settled on `-ngl 1` at a 654,848 context — which fits,
- * and runs at CPU speed. `tune.ts` now fixes residency first, so a scratch that
- * grows with the context costs CONTEXT, which is the correct thing for it to
- * cost.
+ * Found by measuring at 4,096 tokens, where the context term is worth about
+ * 30 MB and everything left over is this: 2,017 MiB on one card, 3,271 MiB
+ * spread over two — flat per device, and barely moved by the slot count
+ * (+223 MiB going from one slot to four). The app allowed 384 MB, so a plan at
+ * a 65,536 context budgeted 1.0 GB per card and llama.cpp asked for 1,985 MiB:
+ *
+ *   graph_reserve: failed to allocate compute buffers
+ *   allocating 1984.76 MiB on device 0: cudaMalloc failed: out of memory
+ *
+ * Gated on the indexer like the rest of this, because it is the indexer's
+ * non-context-scaled working set; an ordinary model's compute buffer really is
+ * the few hundred MB `BACKEND_CONTEXT_B` allows.
+ */
+const SCRATCH_FLOOR_PER_DEVICE_B = 2 * 1024 ** 3;
+
+/** The flat, per-device part of a sparse-attention model's compute buffer. */
+export function scratchFloor(meta: ModelMeta): number {
+  return whole(meta.indexerTopK) > 0 ? SCRATCH_FLOOR_PER_DEVICE_B : 0;
+}
+
+/**
+ * @param slots `-np`. Each server slot runs its own graph, so each one costs
+ * another copy of the context-sized tensors. Defaulting this to 1 would be the
+ * old bug in a new place, so the caller passes what the argv will say.
  */
 export function computeScratch(
   meta: ModelMeta,
   ubatch: number,
   ctx: number,
+  slots = 1,
 ): number {
   if (whole(meta.indexerTopK) <= 0) return 0;
-  const SCRATCH_TENSORS = 34;
-  return whole(Math.max(1, ubatch) * whole(ctx) * 4 * SCRATCH_TENSORS);
+  const ub = Math.max(1, ubatch);
+  const np = Math.max(1, whole(slots));
+  return whole(
+    whole(ctx) * (SCRATCH_B_PER_CTX + SCRATCH_B_PER_CTX_UBATCH * ub) * np,
+  );
 }
 
 function fmtGb(b: number): string {

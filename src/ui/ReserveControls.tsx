@@ -28,7 +28,7 @@ import {
   vramReserveShares,
 } from "../lib/reserve.ts";
 import { bytes } from "../lib/format.ts";
-import { planningHw, vramTotalB } from "./derive.ts";
+import { planningHw, reserveCost, vramTotalB } from "./derive.ts";
 
 function Field(props: {
   pool: "gpu" | "connected" | "ram";
@@ -133,6 +133,32 @@ export function ReserveControls(props: { t?: string }) {
         : "",
     ].filter(Boolean).join(" ")
     : "Nothing reserved — plans may use every byte the machine reports free.";
+  // What it COSTS, in the tuner's own units. A reserve is honoured by planning
+  // as if the memory were absent, which is correct and completely invisible:
+  // the answer just comes back smaller, and nothing connects "my context is
+  // 16k" to the 8 GB the user asked to keep. Layers and tokens, because those
+  // are facts the tuner produced — a predicted tok/s here would be a guess
+  // dressed as a measurement (`derive.ts:reserveCost`).
+  const cost = reserveCost();
+  const costNote = !cost
+    ? ""
+    : cost.blocks
+    ? "Costing you this model entirely — it fits on this machine, but not on what is left after the reserve. Lower the numbers above."
+    : [
+      "Costing you",
+      cost.layers > 0
+        ? `${cost.layers} layer${
+          cost.layers === 1 ? "" : "s"
+        } of experts moved to RAM`
+        : "",
+      cost.layers > 0 && cost.ctxLost > 0 ? "and" : "",
+      cost.ctxLost > 0
+        ? `${cost.ctxLost.toLocaleString()} tokens of context (${cost.ctxWith.toLocaleString()} instead of ${
+          (cost.ctxWith + cost.ctxLost).toLocaleString()
+        })`
+        : "",
+      "— set the numbers above to 0 to get it back.",
+    ].filter(Boolean).join(" ");
   return (
     <div class="reserve-controls" t={id}>
       <Field
@@ -171,6 +197,9 @@ export function ReserveControls(props: { t?: string }) {
            explaining a refusal can do. */
       }
       <span class="reserve-summary" t={`${id}-summary`}>{summary}</span>
+      {costNote
+        ? <span class="reserve-cost" t={`${id}-cost`}>{costNote}</span>
+        : null}
     </div>
   );
 }

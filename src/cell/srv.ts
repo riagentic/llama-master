@@ -10,7 +10,13 @@ import { cell, own } from "aio";
 import type { CellEffect } from "aio";
 import { appendLog } from "../lib/buildlog.ts";
 import { diagnoseServerExit } from "../lib/serverlog.ts";
-import { ctxOf, fitDecision, withCtx } from "../lib/fitladder.ts";
+import {
+  ctxOf,
+  fitDecision,
+  nCpuMoeOf,
+  withCtx,
+  withNCpuMoe,
+} from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
 
@@ -94,7 +100,28 @@ export type SrvState = {
   autoFit: boolean;
   /** What the last automatic step-down did, in words, for the panel. */
   fitNote: string;
+  /** Probes that timed out on this run. A timeout is a slow machine, not a
+   *  dead process — counting it as death left a working server "starting"
+   *  forever (see the probe branch in `poll`). */
+  probeSlow: number;
+  /** The running model's shape, kept for the ladder: a weights overflow is
+   *  answered by moving experts to the host, and that needs to know how many
+   *  layers there are and what one layer's experts weigh. */
+  runShape: { nLayer: number; expertPerLayerB: number } | null;
+  /** VRAM each card had free when this run was spawned — the denominator that
+   *  turns "asked for 34.7 GB" into "short by 12.7 GB". */
+  runCardFreeB: number[];
 };
+
+/**
+ * How many two-minute probes may time out before the app calls it ready anyway.
+ *
+ * Two, so a genuinely cold start on a slow disk gets four minutes to produce
+ * two tokens, and a machine that will never produce them stops being described
+ * as "starting". `proven` stays false either way, so nothing is written down as
+ * a measured fit off a probe that did not finish (`src/lib/fitladder.ts`).
+ */
+const PROBE_PATIENCE = 2;
 
 /** The `own` slot a server process lives in. One per pid, never shared — see
  *  the note at `start`. */
@@ -151,6 +178,9 @@ export const srv = cell("srv", {
     freeing: false,
     lastError: "",
     fitTries: 0,
+    probeSlow: 0,
+    runShape: null as { nLayer: number; expertPerLayerB: number } | null,
+    runCardFreeB: [] as number[],
     autoFit: false,
     fitNote: "",
   } as SrvState,
@@ -182,6 +212,14 @@ export const srv = cell("srv", {
          *  Applied to the process after the spawn — the argv on screen stays
          *  the argv that ran (`src/lib/priority.ts`). */
         lowPriority?: boolean;
+        /** What the ladder needs to answer a WEIGHTS overflow, which no smaller
+         *  context can fix: the layer count and one layer's routed experts,
+         *  both exact from the header. */
+        shape?: { nLayer: number; expertPerLayerB: number };
+        /** VRAM each card had to give at the moment of the spawn, so a failed
+         *  allocation can be turned into a shortfall instead of being taken at
+         *  face value. */
+        cardFreeB?: number[];
       },
     ): Promise<CellEffect | void> {
       if (s.status === "starting" || s.status === "ready") return;
@@ -199,6 +237,9 @@ export const srv = cell("srv", {
       s.healthy = false;
       s.healthDetail = "";
       s.proven = false;
+      // Per RUN, not per ladder rung: a rung is the same machine one number
+      // smaller, and it deserves its own patience.
+      s.probeSlow = 0;
       s.props = null;
       s.log = [];
       s.diagnosis = null;
@@ -207,6 +248,10 @@ export const srv = cell("srv", {
       s.runSettings = run?.settings ?? null;
       s.runModel = run?.model ?? "";
       s.runLowPriority = run?.lowPriority !== false;
+      if (!run?.retry) {
+        s.runShape = run?.shape ?? null;
+        s.runCardFreeB = run?.cardFreeB?.slice() ?? [];
+      }
       s.startFreeVramB = run?.freeAtStart?.vramB ?? 0;
       s.startFreeRamB = run?.freeAtStart?.ramB ?? 0;
       s.rssB = 0;
@@ -331,13 +376,35 @@ export const srv = cell("srv", {
             ctx: ctxOf(s.argv),
             tries: s.fitTries,
             auto: s.autoFit,
+            nCpuMoe: nCpuMoeOf(s.argv),
+            nLayer: s.runShape?.nLayer ?? 0,
+            expertPerLayerB: s.runShape?.expertPerLayerB ?? 0,
+            deviceFreeB: s.runCardFreeB.slice(),
           });
-          if (decision.kind === "retry") {
-            const next = withCtx(s.argv, decision.ctx);
+          if (decision.kind !== "none") {
+            // Two rungs, one restart. Which number changes is the ladder's
+            // decision (`fitladder.ts`); rewriting the argv that ACTUALLY ran —
+            // rather than re-composing one from settings that may have moved
+            // since — is what keeps "what you see is what runs" true across a
+            // retry.
+            const next = decision.kind === "retry"
+              ? withCtx(s.argv, decision.ctx)
+              : withNCpuMoe(s.argv, decision.nCpuMoe);
             s.fitTries += 1;
             s.fitNote = decision.note;
             s.argv = next;
-            if (s.runSettings) s.runSettings.ctxSize = decision.ctx;
+            if (s.runSettings) {
+              if (decision.kind === "retry") {
+                s.runSettings.ctxSize = decision.ctx;
+              } else {
+                s.runSettings.nCpuMoe = decision.nCpuMoe;
+                // The split went with the placement that just failed, and
+                // `withNCpuMoe` dropped it from the argv — so the settings it
+                // came from must stop claiming it too, or the command strip and
+                // the process disagree.
+                s.runSettings.tensorSplit = "";
+              }
+            }
             s.log = appendLog(s.log.slice(), [
               `[llama.master] ${decision.note}`,
             ]);
@@ -413,6 +480,28 @@ export const srv = cell("srv", {
               // dying of the OOM the probe provoked. Say nothing yet — the
               // next poll sees the exit and owns the diagnosis.
               s.healthDetail = p.detail;
+              return;
+            }
+            if (p.kind === "slow") {
+              // Alive, just not finished. A timeout used to land in `dead`, so
+              // the poll waited for an exit that was never coming and re-probed
+              // every second while the panel said "proving a first reply" —
+              // indefinitely, on a server that was working. The first reply
+              // after a cold start runs against a page cache that is still
+              // filling (measured: 23x slower prompt processing), so being slow
+              // once is normal and being slow twice is the machine, not a fault.
+              s.probeSlow += 1;
+              s.healthDetail = p.detail;
+              if (s.probeSlow < PROBE_PATIENCE) return;
+              // Out of patience: READY, and honest about what was not proved.
+              // Refusing to serve a working model because our own check was
+              // impatient would be the worse of the two errors — and `proven`
+              // stays false, so the fit ladder never records this as a fact.
+              s.proven = false;
+              s.status = "ready";
+              s.healthDetail =
+                `ready — the first reply is taking over ${PROBE_PATIENCE} minutes, so the context has not been proved at this size`;
+              s.props = await io.props(s.url);
               return;
             }
             // `refused` (an old build without /completion) still becomes

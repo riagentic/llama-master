@@ -3261,6 +3261,12 @@ pre.cmd-body {
   flex: 1 1 100%;
 }
 
+.reserve-cost {
+  font-size: var(--fs-sm);
+  color: var(--warn);
+  flex: 1 1 100%;
+}
+
 .reserve-over {
   font-size: var(--fs-sm);
   color: var(--bad);

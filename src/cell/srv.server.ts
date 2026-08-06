@@ -409,16 +409,25 @@ export async function health(
  * the same allocation path, which makes the fit ladder's verdict cover
  * generation instead of just loading.
  *
- * Three outcomes, and the caller treats them differently: `ok` (it generated),
+ * Four outcomes, and the caller treats them differently: `ok` (it generated),
  * `refused` (the process is alive but the endpoint said no — an old build
  * without /completion; readiness proceeds, the fit stays unproven), `dead`
  * (the connection failed — the process is most likely dying of exactly the
- * failure this probe exists to provoke; the poll's crash path will see it).
+ * failure this probe exists to provoke; the poll's crash path will see it),
+ * and `slow`.
+ *
+ * `slow` exists because a timeout is not a death and was being counted as one.
+ * The first generation after a cold start runs on a page cache that is still
+ * filling: measured on a 39 GB model, 64.7 tok/s of prompt processing cold
+ * against 1,493 warm — a 23x penalty that a 145 GB model on a slower disk can
+ * exceed. The caller was left with "the connection dropped, wait for the exit",
+ * so a server that was merely being slow never became ready and never said why;
+ * it re-probed every second, forever, showing "proving a first reply".
  */
 export async function probe(
   baseUrl: string,
   timeoutMs = 120_000,
-): Promise<{ kind: "ok" | "refused" | "dead"; detail: string }> {
+): Promise<{ kind: "ok" | "refused" | "dead" | "slow"; detail: string }> {
   try {
     const res = await fetch(`${baseUrl}/completion`, {
       method: "POST",
@@ -438,7 +447,15 @@ export async function probe(
     if (res.ok) return { kind: "ok", detail: "generated" };
     return { kind: "refused", detail: `${res.status}: ${body.slice(0, 120)}` };
   } catch (e) {
-    return { kind: "dead", detail: String(e) };
+    // `AbortSignal.timeout` rejects with a TimeoutError; a dropped connection
+    // rejects with a TypeError. Only the second one means the process is gone.
+    const timedOut = e instanceof DOMException && e.name === "TimeoutError";
+    return {
+      kind: timedOut ? "slow" : "dead",
+      detail: timedOut
+        ? `no reply in ${Math.round(timeoutMs / 1000)}s`
+        : String(e),
+    };
   }
 }
 

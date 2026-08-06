@@ -40,6 +40,7 @@ export function stability(
   meta: ModelMeta | null,
   hw: Hw,
   s: Settings,
+  opts: { lowPriority?: boolean } = {},
 ): Stability {
   const warnings: Warning[] = [];
   const cores = hw.cpu?.cores ?? 0;
@@ -120,25 +121,31 @@ export function stability(
           `${t} threads on ${threads} logical CPUs. Oversubscription makes generation slower, not faster.`,
       });
     } else if (t > cores) {
+      // Measured, not folklore: the same DeepSeek-V4 placement runs 15.91 tok/s
+      // at 16 threads (= physical cores) and 0.94 tok/s at 32. Generation with
+      // experts on the host is memory-bandwidth-bound, and two threads sharing
+      // one core's memory port thrash rather than pipeline.
       warnings.push({
-        severity: "caution",
+        severity: "risk",
         key: "threads",
         message:
-          `${t} threads on ${cores} physical cores. SMT siblings share a memory port, so this usually costs throughput.`,
+          `${t} threads on ${cores} physical cores. SMT siblings share one memory port and generation is bandwidth-bound — measured 15x slower than one thread per core.`,
       });
-    } else if (t >= cores && cores > 2) {
+    } else if (t >= cores && cores > 2 && !opts.lowPriority) {
       warnings.push({
         severity: "caution",
         key: "threads",
         message:
-          "Every physical core is claimed. Leave at least two for the OS or the desktop will stutter while a model runs.",
+          'Every physical core is claimed and llama-server runs at normal priority, so the desktop competes with it. Turn on "Low priority" — it keeps the throughput and yields the CPU the moment anything else asks.',
       });
     }
   }
 
-  // `-tb` was never checked at all, and it is the one that hurts most: prompt
-  // processing is the densest phase, so a batch thread count that claims the
-  // whole machine freezes the desktop for exactly as long as a long prompt runs.
+  // `-tb` was never checked at all, and prompt processing is the densest phase
+  // there is: an oversubscribed batch thread count slows the phase the user
+  // waits on most. Claiming every PHYSICAL core is not oversubscription — it is
+  // the fastest setting measured (`tune.ts:cpuBudget`), and what keeps the
+  // desktop responsive under it is the priority switch, not idle cores.
   const tb = num(s, "threadsBatch");
   if (cores > 0 && tb > 0) {
     if (tb > threads) {
@@ -148,12 +155,12 @@ export function stability(
         message:
           `${tb} batch threads on ${threads} logical CPUs. Oversubscription slows prompt processing down.`,
       });
-    } else if (tb >= cores && cores > 2) {
+    } else if (tb > cores) {
       warnings.push({
         severity: "caution",
         key: "threadsBatch",
         message:
-          `${tb} batch threads claims every physical core. Prompt processing is the densest phase there is — leave two, or the desktop stalls while a long prompt is read.`,
+          `${tb} batch threads on ${cores} physical cores. SMT siblings share one memory port, and prompt processing is memory-bound — measured 15x slower at two threads per core.`,
       });
     }
   }

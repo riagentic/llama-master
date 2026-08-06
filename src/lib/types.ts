@@ -131,6 +131,19 @@ export type Mem = {
   usedB: number;
   swapTotalB: number;
   swapUsedB: number;
+  /**
+   * RLIMIT_MEMLOCK — how much memory a process may actually PIN.
+   *
+   * Here because `--mlock` is a promise the kernel can refuse. Stock Linux caps
+   * this far below what a large model weighs (23.3 GB on the machine that
+   * motivated this, against ~100 GB of host-side weights), and llama.cpp's
+   * response to being over is a warning and an unpinned run — so the app would
+   * print "pinning them stops the OS paging the model out" about something that
+   * did not happen. Inherited by the child, so OUR limit is the right one to
+   * read. 0 means "not known" (a platform that does not report it), and the
+   * tuner treats that as "do not promise" — as does its absence.
+   */
+  lockableB?: number;
 };
 
 /** Everything the tuner is allowed to reason about. */
@@ -214,8 +227,26 @@ export type Param = {
   kind: ParamKind;
   group: ParamGroup;
   scope: ParamScope;
-  /** Value at which the flag is omitted — llama.cpp's own default. */
+  /** The value this app starts from and shows in the panel. */
   def: ParamValue;
+  /**
+   * llama.cpp's OWN default, when it is not `def`. The flag is omitted from the
+   * argv at THIS value, not at `def`.
+   *
+   * The two used to be assumed identical, and upstream moved: `-ngl` now
+   * defaults to **auto** rather than 0, and `-c` to **0 = take it from the
+   * model**. So "CPU only" emitted no `-ngl` and llama.cpp offloaded to the GPU
+   * anyway, and a plan drawn for a 4,096-token context emitted no `-c` and
+   * llama.cpp loaded the model's declared 1,048,576 — a plan for 4 GB of cache
+   * running as a plan for 40 GB of scratch, which is a start that cannot
+   * succeed and an error that names none of this.
+   *
+   * Where llama.cpp's default is not a value the app can hold ("auto"), use a
+   * sentinel outside the parameter's own range — the flag is then ALWAYS
+   * emitted, which for the three that decide the placement is the right answer
+   * anyway: their whole job is to pin what runs.
+   */
+  llamaDef?: ParamValue;
   min?: number;
   max?: number;
   step?: number;

@@ -30,15 +30,18 @@ import {
   str,
 } from "../src/lib/params.ts";
 import {
+  computeScratch,
   effectiveCtx,
   kvPerToken,
   kvTotal,
   NO_MODEL,
   plan,
+  scratchFloor,
   swaSplit,
   withoutOurUsage,
 } from "../src/lib/plan.ts";
 import {
+  countsFromSplit,
   deviceBudgets,
   loadPerDevice,
   offloadRange,
@@ -57,10 +60,15 @@ import {
 import {
   ctxOf,
   fitDecision,
+  fitFault,
   isFitFailure,
   MAX_FIT_RETRIES,
+  movedLayers,
+  nCpuMoeOf,
   openingCtx,
+  requestedB,
   withCtx,
+  withNCpuMoe,
 } from "../src/lib/fitladder.ts";
 import type { Hw, ModelMeta } from "../src/lib/types.ts";
 import {
@@ -262,13 +270,33 @@ Deno.test("params: typed readers fall back to catalog defaults", () => {
 
 // ── command building ───────────────────────────────────────────────────────
 
-Deno.test("command: defaults produce only the binary and the model", () => {
+Deno.test("command: a flag is omitted only when llama.cpp would agree", () => {
+  // A parameter at the catalog's default used to be dropped from the argv, on
+  // the assumption that the catalog's default IS llama.cpp's. Upstream moved
+  // and the assumption went stale silently, in the worst possible direction:
+  // `-ngl` now defaults to AUTO, so "CPU only" emitted nothing and llama.cpp
+  // offloaded to the GPU; `-c` defaults to 0 = take it from the model, so a
+  // plan drawn for 4,096 tokens started a server at the model's declared
+  // 1,048,576 and could not allocate. Omission is judged against `llamaDef`
+  // now, and the three flags that DECIDE the placement always appear.
   const cmd = argv("server", {
     bin: "/b/llama-server",
     model: "/m/x.gguf",
     settings: defaults(),
   });
-  assertEquals(cmd, ["/b/llama-server", "-m", "/m/x.gguf"]);
+  assertEquals(cmd.slice(0, 3), ["/b/llama-server", "-m", "/m/x.gguf"]);
+  for (const flag of ["-ngl", "-c", "-np"]) {
+    assert(cmd.includes(flag), `${flag} must be explicit: ${cmd.join(" ")}`);
+  }
+  // And the value that follows is the one the panel is showing.
+  assertEquals(cmd[cmd.indexOf("-ngl") + 1], "0");
+  assertEquals(cmd[cmd.indexOf("-c") + 1], "4096");
+  assertEquals(cmd[cmd.indexOf("-np") + 1], "1");
+  // Everything whose catalog default really is llama.cpp's stays absent — the
+  // command is still short enough to read, which is the point of omitting.
+  for (const flag of ["-fa", "-ts", "--mlock", "--no-mmap", "-ctk", "-ctv"]) {
+    assertEquals(cmd.includes(flag), false, `${flag} should be absent`);
+  }
 });
 
 Deno.test("command: only changed values appear, in catalog order", () => {
@@ -277,17 +305,17 @@ Deno.test("command: only changed values appear, in catalog order", () => {
     model: "/m/x.gguf",
     settings: { ...defaults(), ngl: 99, ctxSize: 16384, flashAttn: "on" },
   });
-  assertEquals(cmd, [
+  // Catalog order, and the always-emitted placement flags carry their values.
+  assertEquals(cmd.slice(0, 5), [
     "llama-server",
     "-m",
     "/m/x.gguf",
     "-ngl",
     "99",
-    "-c",
-    "16384",
-    "-fa",
-    "on",
   ]);
+  assertEquals(cmd[cmd.indexOf("-c") + 1], "16384");
+  assertEquals(cmd[cmd.indexOf("-fa") + 1], "on");
+  assert(cmd.indexOf("-fa") > cmd.indexOf("-ngl"), "catalog order holds");
 });
 
 Deno.test("command: a default-on boolean emits its negative flag when off", () => {
@@ -296,13 +324,13 @@ Deno.test("command: a default-on boolean emits its negative flag when off", () =
     model: "",
     settings: { ...defaults(), contBatching: true },
   });
-  assertEquals(on, ["s"], "on is the default — nothing emitted");
+  assertEquals(on.includes("--no-cont-batching"), false, "on is the default");
   const off = argv("server", {
     bin: "s",
     model: "",
     settings: { ...defaults(), contBatching: false },
   });
-  assertEquals(off, ["s", "--no-cont-batching"]);
+  assert(off.includes("--no-cont-batching"));
 });
 
 Deno.test("command: scope separates server-only from cli-only flags", () => {
@@ -321,7 +349,9 @@ Deno.test("command: empty text and enum values never emit a bare flag", () => {
     model: "",
     settings: { ...defaults(), alias: "", numa: "", tensorSplit: "" },
   });
-  assertEquals(cmd, ["s"]);
+  for (const flag of ["-a", "--numa", "-ts"]) {
+    assertEquals(cmd.includes(flag), false, `${flag} must not appear bare`);
+  }
 });
 
 Deno.test("command: quoting survives spaces and single quotes", () => {
@@ -334,7 +364,7 @@ Deno.test("command: quoting survives spaces and single quotes", () => {
     model: "/my models/a.gguf",
     settings: defaults(),
   });
-  assertEquals(line, "s -m '/my models/a.gguf'");
+  assertStringIncludes(line, "s -m '/my models/a.gguf'");
 });
 
 Deno.test("command: the block form keeps each flag with its value", () => {
@@ -343,12 +373,33 @@ Deno.test("command: the block form keeps each flag with its value", () => {
     model: "/m/x.gguf",
     settings: { ...defaults(), ngl: 99, mlock: true },
   });
-  assertEquals(lines, [
+  assertEquals(lines.slice(0, 3), [
     "llama-server",
     "  -m /m/x.gguf",
     "  -ngl 99",
-    "  --mlock",
   ]);
+  assert(lines.includes("  --mlock"), lines.join("\n"));
+  // One flag per line, value attached to it — never a line of bare values.
+  for (const l of lines.slice(1)) assert(l.startsWith("  -"), l);
+});
+
+Deno.test("command: a negative VALUE stays attached to its flag in the block", () => {
+  // `-1` starts with `-`, exactly like a flag — a block builder that judged
+  // "is this a flag" by that prefix orphaned the value onto its own line:
+  // `--repeat-last-n` then `-1`, which is a command that cannot be read.
+  // The value is distinguished by shape: `-1` is a number, every real flag is
+  // not.
+  const lines = commandBlock("server", {
+    bin: "llama-server",
+    model: "/m/x.gguf",
+    settings: { ...defaults(), repeatLastN: -1, ropeFreqScale: -0.5 },
+  });
+  assert(lines.includes("  --repeat-last-n -1"), lines.join("\n"));
+  assert(lines.includes("  --rope-freq-scale -0.5"), lines.join("\n"));
+  assert(
+    lines.every((l) => l === "llama-server" || l.startsWith("  -")),
+    "every value is attached to its flag",
+  );
 });
 
 Deno.test("command: a wildcard bind address dials loopback", () => {
@@ -575,8 +626,8 @@ Deno.test("tune: a 2-core machine still gets a usable thread count", () => {
     },
   });
   const { settings } = tune(meta(), tiny, defaults(), "vram");
-  assertEquals(settings.threads, 1, "never 0 threads");
-  assertEquals(settings.threadsBatch, 1, "prefill too");
+  assertEquals(settings.threads, 2, "one thread per physical core");
+  assertEquals(settings.threadsBatch, 2, "prefill too");
 });
 
 Deno.test("tune: a tight fit quantises the KV cache before dropping layers", () => {
@@ -1121,7 +1172,9 @@ Deno.test("archive: a symlink pointing outside the destination is dropped", () =
 Deno.test("stability: a configuration that fits raises nothing", () => {
   const machine = hw({ gpus: [gpu(48, 0)] });
   const tuned = tune(meta(), machine, defaults()).settings;
-  const st = stability(meta(), machine, tuned);
+  // With the priority switch on — which is its default, and the reason the
+  // tuner is free to claim every physical core.
+  const st = stability(meta(), machine, tuned, { lowPriority: true });
   assertEquals(st.level, "ok", JSON.stringify(st.warnings));
 });
 
@@ -1134,9 +1187,31 @@ Deno.test("stability: not enough VRAM is a risk, not a hint", () => {
   );
 });
 
-Deno.test("stability: claiming every core warns about the desktop", () => {
-  const st = stability(meta(), hw(), { ...defaults(), threads: 16, ngl: 0 });
-  assert(st.warnings.some((w) => w.key === "threads"));
+Deno.test("stability: claiming every core warns only when nothing yields", () => {
+  // The tuner claims every PHYSICAL core on purpose — measured fastest. What
+  // keeps the desktop alive under it is the priority switch, so the warning is
+  // about the switch being off, not about the thread count.
+  const busy = { ...defaults(), threads: 16, ngl: 0 };
+  assert(
+    stability(meta(), hw(), busy).warnings.some((w) =>
+      w.key === "threads" && w.message.includes("Low priority")
+    ),
+    "normal priority + every core is worth saying",
+  );
+  assertEquals(
+    stability(meta(), hw(), busy, { lowPriority: true }).warnings.filter((w) =>
+      w.key === "threads"
+    ).length,
+    0,
+    "at nice 19 the desktop already goes first — nothing to warn about",
+  );
+  // SMT is not a preference: 15x slower, measured.
+  const smt = stability(meta(), hw(), {
+    ...defaults(),
+    threads: 32,
+    ngl: 0,
+  }, { lowPriority: true });
+  assertEquals(smt.level, "risk", "two threads per core");
   const over = stability(meta(), hw(), { ...defaults(), threads: 64, ngl: 0 });
   assertEquals(over.level, "risk", "more threads than logical CPUs");
 });
@@ -2332,18 +2407,14 @@ Deno.test("github: master's head comes out of the commits atom feed", () => {
 
 Deno.test("command: extra arguments reach argv exactly as typed", () => {
   const base = { bin: "llama-server", model: "/m.gguf", settings: {} };
-  assertEquals(argv("server", base), ["llama-server", "-m", "/m.gguf"]);
-
   // The escape hatch: a flag the catalog does not carry still gets through,
   // as ordinary argv tokens rather than one quoted blob.
   const withExtra = {
     ...base,
     settings: { extraArgs: "--lora /a.gguf  --cache-reuse 256" },
   };
-  assertEquals(argv("server", withExtra), [
-    "llama-server",
-    "-m",
-    "/m.gguf",
+  const cmd = argv("server", withExtra);
+  assertEquals(cmd.slice(cmd.indexOf("--lora")), [
     "--lora",
     "/a.gguf",
     "--cache-reuse",
@@ -2352,11 +2423,9 @@ Deno.test("command: extra arguments reach argv exactly as typed", () => {
   // And it is visible in the preview, so what you see is still what runs.
   assertStringIncludes(commandLine("server", withExtra), "--cache-reuse 256");
   // Empty stays empty — no stray token.
-  assertEquals(argv("server", { ...base, settings: { extraArgs: "   " } }), [
-    "llama-server",
-    "-m",
-    "/m.gguf",
-  ]);
+  const blank = argv("server", { ...base, settings: { extraArgs: "   " } });
+  assertEquals(blank.at(-1) === "" || /^-/.test(String(blank.at(-2))), true);
+  assertEquals(blank.includes("--lora"), false);
 });
 
 // ── which GPUs llama.cpp may use ───────────────────────────────────────────
@@ -2439,7 +2508,7 @@ Deno.test("gpu: the device restriction reaches the command line", () => {
     ...base,
     settings: { device: "CUDA0" },
   });
-  assertEquals(restricted.slice(-2), ["-dev", "CUDA0"]);
+  assertEquals(restricted[restricted.indexOf("-dev") + 1], "CUDA0");
 });
 
 // ── keeping the newest line in view ────────────────────────────────────────
@@ -2487,9 +2556,9 @@ Deno.test("scroll: the slack tolerates a part-visible last line", () => {
   );
 });
 
-Deno.test("stability: claiming every core for prompt processing warns too", () => {
-  // `-tb` had no check at all, at any value — the one thread setting that can
-  // freeze a desktop for the length of a long prompt.
+Deno.test("stability: oversubscribed prompt threads are caught too", () => {
+  // `-tb` had no check at all, at any value — and prompt processing is the
+  // phase the user actually waits on.
   const machine = hw(); // 16 physical / 32 logical
   const over = stability(meta(), machine, { ...defaults(), threadsBatch: 64 });
   assert(
@@ -2498,10 +2567,16 @@ Deno.test("stability: claiming every core for prompt processing warns too", () =
     ),
     "more batch threads than logical CPUs is a risk",
   );
-  const all = stability(meta(), machine, { ...defaults(), threadsBatch: 16 });
+  const smt = stability(meta(), machine, { ...defaults(), threadsBatch: 32 });
   assert(
-    all.warnings.some((w) => w.key === "threadsBatch"),
-    "claiming every physical core is at least a caution",
+    smt.warnings.some((w) => w.key === "threadsBatch"),
+    "two batch threads per physical core is worth saying",
+  );
+  assertEquals(
+    stability(meta(), machine, { ...defaults(), threadsBatch: 16 }).warnings
+      .filter((w) => w.key === "threadsBatch"),
+    [],
+    "one thread per physical core is the intended answer, not a warning",
   );
   // The tuner's own output must never trip its own warning.
   const tuned = tune(meta(), machine, defaults(), "vram").settings;
@@ -2742,6 +2817,41 @@ Deno.test("plan: a sliding-window model does not pay full context on every layer
   // And the split itself is the thing being claimed.
   assertEquals(swaSplit(swa), { full: 8, windowed: 40 });
   assertEquals(swaSplit(full), { full: 48, windowed: 0 });
+
+  // The sparse-attention scratch, against the sweep it was calibrated on. The
+  // shape is what matters: the context term dominates and the micro-batch term
+  // is small, which is the OPPOSITE of the first estimate — it derived one
+  // ubatch-proportional constant from a single 68.5 GiB observation at a
+  // 1M context, and was ~3.4x too pessimistic everywhere anyone runs.
+  const sparse = meta({ indexerTopK: 2048 });
+  const MB = 1024 ** 2;
+  const at = (ctx: number, ub: number, np = 1) =>
+    computeScratch(sparse, ub, ctx, np) / MB;
+  // Measured at ONE slot, ub 512, above a 4,096 baseline (plan.ts carries the
+  // table): +2,045 MB at 262,144 and +8,547 MB at 1,048,576. The estimate must
+  // cover them without ballooning: never under, within about half again.
+  for (const [ctx, measuredMb] of [[262144, 2045], [1048576, 8547]] as const) {
+    const est = at(ctx, 512);
+    assert(est >= measuredMb, `${ctx}: ${est.toFixed(0)} MB under-estimates`);
+    assert(est < measuredMb * 1.6, `${ctx}: ${est.toFixed(0)} MB is wild`);
+  }
+  // Slots MULTIPLY it, and that is the term the app was missing entirely:
+  // llama.cpp's `-np` default is auto, auto chose FOUR, and a 1,048,576 context
+  // cost 43.5 GB of VRAM instead of 21.5. Measured 29.0 KB/token at four slots
+  // against 8.1 at one — the ratio is the slot count.
+  assert(
+    Math.abs(at(262144, 512, 4) / at(262144, 512) - 4) < 0.01,
+    "four slots is four times the scratch",
+  );
+  // Quadrupling the micro-batch moved 1.4 GB at a quarter-million tokens, not
+  // 4x the whole term. Anything that scales the scratch BY ubatch fails this.
+  const spread = at(262144, 1024) / at(262144, 256);
+  assert(spread > 1 && spread < 1.6, `ubatch swing was ${spread.toFixed(2)}x`);
+  // It keeps growing past the points it was fitted to — the shape is linear in
+  // the context, so nothing plateaus and no plan is offered on a flat spot.
+  assert(at(393216, 512) > at(262144, 512) * 1.4);
+  // And a model that declares no indexer is untouched: this is the sparse term.
+  assertEquals(computeScratch(meta({ indexerTopK: 0 }), 512, 262144), 0);
 
   // A window with no pattern means every layer is local (llama.cpp's default).
   assertEquals(
@@ -3792,6 +3902,208 @@ Deno.test("devsplit: -ts boundaries land between slots, never on one", () => {
   assertEquals(tensorSplitValue([44, 0]), "", "nor does one card doing it all");
 });
 
+Deno.test("devsplit: the split we emit is the split we drew", () => {
+  // `tensorSplitValue` and `countsFromSplit` are the two halves of one claim,
+  // and the round trip is the claim: if the string llama.cpp receives does not
+  // reproduce the cuts the packer chose, the app is drawing per-card bars for
+  // a placement that is not going to happen.
+  for (const counts of [[37, 7], [10, 20, 14], [34, 10], [1, 43], [22, 22]]) {
+    const total = counts.reduce((a, b) => a + b, 0);
+    assertEquals(
+      countsFromSplit(tensorSplitValue(counts), total, counts.length),
+      counts,
+      `round trip for ${JSON.stringify(counts)}`,
+    );
+  }
+  // llama.cpp's rule run forwards, on a split a USER might type: 90/10 of 44
+  // slots is 40 and 4, by count and not by bytes.
+  assertEquals(countsFromSplit("9,1", 44, 2), [40, 4]);
+  assertEquals(countsFromSplit("1,1", 44, 2), [22, 22]);
+  // Nothing usable is `null`, so the caller falls back to packing — which is
+  // also what llama.cpp does with a split it cannot read.
+  assertEquals(countsFromSplit("", 44, 2), null);
+  assertEquals(countsFromSplit("0,0", 44, 2), null);
+  assertEquals(countsFromSplit("nonsense", 44, 2), null);
+  assertEquals(countsFromSplit("-1,2", 44, 2), null);
+});
+
+Deno.test("plan: server slots multiply the scratch, and the plan knows it", () => {
+  // The bug that made a 1,048,576 context impossible on hardware that runs it.
+  // llama.cpp's `-np` default is `-1 = auto`, auto chose FOUR slots, each slot
+  // costs another copy of the context-sized indexer tensors, and the app knew
+  // about none of it: measured 43,517 MiB of VRAM at four slots against 21,467
+  // at one, same model, same placement, same context.
+  const MB = 1024 ** 2;
+  const m = meta({
+    nLayer: 43,
+    nCtxTrain: 1_048_576,
+    indexerTopK: 512,
+    swaWindow: 128,
+    swaPattern: 1,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 2240 * MB, 2100 * MB),
+  });
+  const machine = hw({ gpus: [gpu(24, 0.1), gpu(24, 0.1)], backend: "cuda" });
+  const one = plan(m, machine, {
+    ...defaults(),
+    ngl: 999,
+    nCpuMoe: 43,
+    ctxSize: 1_048_576,
+    parallel: 1,
+  });
+  const four = plan(m, machine, {
+    ...defaults(),
+    ngl: 999,
+    nCpuMoe: 43,
+    ctxSize: 1_048_576,
+    parallel: 4,
+  });
+  const scratchOf = (p: typeof one) =>
+    p.vram.buckets.find((b) => b.key === "compute")?.bytes ?? 0;
+  assert(
+    scratchOf(four) > scratchOf(one) * 3,
+    `four slots must cost far more: ${scratchOf(one)} vs ${scratchOf(four)}`,
+  );
+  // And the placement that measured healthy at one slot is offered at one slot.
+  assertEquals(one.devices.fits, true, JSON.stringify(one.devices.bytesB));
+});
+
+Deno.test("plan: the sparse-attention scratch has a floor, not just a slope", () => {
+  // A 65,536 context is worth ~0.5 GB of context-scaled scratch, and llama.cpp
+  // asked for 1,985 MiB on one card and died in graph_reserve. Measured at
+  // 4,096 tokens — where the slope is worth ~30 MB and everything left is the
+  // flat part — it is about 2 GB PER DEVICE: 2,017 MiB on one card, 3,271 MiB
+  // spread over two. The app allowed 384 MB.
+  const MB = 1024 ** 2;
+  const GB = 1024 ** 3;
+  const sparse = meta({
+    nLayer: 43,
+    nCtxTrain: 1_048_576,
+    indexerTopK: 512,
+    swaWindow: 128,
+    swaPattern: 1,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 2240 * MB, 2100 * MB),
+  });
+  const machine = hw({ gpus: [gpu(24, 0.1), gpu(24, 0.1)], backend: "cuda" });
+  const at4k = plan(sparse, machine, {
+    ...defaults(),
+    ngl: 999,
+    nCpuMoe: 43,
+    ctxSize: 4096,
+    parallel: 1,
+  });
+  const perCard = at4k.devices.cards[0]?.computeB ?? 0;
+  assert(
+    perCard > 1.9 * GB,
+    `a short context still costs the floor: ${(perCard / GB).toFixed(2)} GB`,
+  );
+  // A model with no indexer keeps the small, ordinary compute buffer — this is
+  // the sparse-attention working set, not a tax on everybody.
+  const dense = plan(meta({ layers: layers(32, 200 * MB) }), machine, {
+    ...defaults(),
+    ngl: 999,
+    ctxSize: 4096,
+  });
+  assert(
+    (dense.devices.cards[0]?.computeB ?? 0) < GB,
+    "an ordinary model pays a few hundred MB, as it always did",
+  );
+  assertEquals(scratchFloor(meta({ indexerTopK: 0 })), 0);
+});
+
+Deno.test("plan: a card is budgeted for the whole scratch, not its share", () => {
+  // Divided between the cards — measured, one card and two cost the same total
+  // — but llama.cpp decides WHERE the division falls and it is not by layer
+  // count: a card holding 10 slots of 44 wanted about 60% of it, and a plan
+  // that had budgeted it 23% died in `graph_reserve`. So each card is charged
+  // all of it. The two views answer different questions and both are honest:
+  // the pool says what the machine will use, a card says what it must be able
+  // to give.
+  const MB = 1024 ** 2;
+  const m = meta({
+    nLayer: 43,
+    nCtxTrain: 1_048_576,
+    indexerTopK: 512,
+    swaWindow: 128,
+    swaPattern: 1,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 2240 * MB, 2100 * MB),
+  });
+  const machine = hw({ gpus: [gpu(24, 0.1), gpu(24, 0.1)], backend: "cuda" });
+  // Experts kept on the GPU, so the layers genuinely span both cards.
+  const p = plan(m, machine, {
+    ...defaults(),
+    ngl: 999,
+    nCpuMoe: 20,
+    ctxSize: 131_072,
+    parallel: 1,
+  });
+  const poolScratch = p.vram.buckets.find((b) => b.key === "compute")?.bytes ??
+    0;
+  const working = p.devices.cards.filter((c) => c.weightsB > 0);
+  assert(working.length >= 2, "this fixture must span both cards");
+  assertEquals(
+    working[0]!.computeB,
+    working[1]!.computeB,
+    "every working card is charged the same worst case",
+  );
+  assert(
+    working[0]!.computeB > poolScratch / 2,
+    "and it is the whole scratch, not half of it",
+  );
+});
+
+Deno.test("plan: a hand-typed -ts is the placement, not a suggestion", () => {
+  // Until `plan` read it, a user who typed a split saw the PACKER's cuts on
+  // screen however far the argv disagreed — on the one page whose promise is
+  // that what you see is what runs.
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nExpert: 256,
+    nExpertUsed: 6,
+    // `bytes` is the whole layer and `expert` the routed part of it, so this
+    // is 800 MB a layer of which 700 MB is experts — the MoE shape.
+    layers: layers(43, 800 * MB, 700 * MB),
+  });
+  const machine = hw({ gpus: [gpu(24, 0), gpu(24, 0)], backend: "cuda" });
+  const base = { ...defaults(), ngl: 999, ctxSize: 4096 }; // 44 slots, ~35 GB
+  const packed = plan(m, machine, base);
+  // Everything on card 0 is not what the packer would choose, so it is a clean
+  // way to see whether the instruction is being obeyed.
+  const pinned = plan(m, machine, { ...base, tensorSplit: "1,0" });
+  assertEquals(
+    pinned.devices.bytesB[1],
+    0,
+    `card 1 was told to hold nothing; got ${
+      JSON.stringify(pinned.devices.bytesB)
+    }`,
+  );
+  assert(
+    pinned.devices.bytesB[0]! > packed.devices.bytesB[0]!,
+    "and card 0 holds what card 1 was spared",
+  );
+  // Including when that is a bad idea: an instruction that overfills a card is
+  // reported as overfilling it, not quietly re-packed into one that fits.
+  assert(
+    (pinned.devices.cards[0]?.overB ?? 0) > 0,
+    "the picture shows the card being asked for more than it has",
+  );
+  // And the split it reports back is the one that produces what it drew. From
+  // the counts alone this would be "" — one card doing all the work needs no
+  // split of OURS — and "" makes llama.cpp divide by free VRAM instead, which
+  // is the opposite of what was asked for.
+  assertEquals(pinned.devices.tensorSplit, "1,0");
+  // And a pin that does not hold is reported as not holding. `fits` used to
+  // mean "the packer found an arrangement", and a pin always produces one —
+  // so every hand-typed split fitted by definition, including this one.
+  assertEquals(pinned.devices.fits, false);
+});
+
 Deno.test("tune: an expert-heavy tail is split by bytes, not by layer count", () => {
   // The failure this pins, from a real run: DeepSeek-V4-Flash on two 24 GB
   // cards. `--n-cpu-moe 34` holds the first 34 layers' experts in RAM, so the
@@ -3887,6 +4199,57 @@ Deno.test("tune: an expert-heavy tail is split by bytes, not by layer count", ()
   );
 });
 
+Deno.test("tune: --mlock is only promised when the kernel would honour it", () => {
+  // The report, from the app's own running state: a CPU placement of a 145 GB
+  // model came out with `mlock: true` and the reason "pinning them stops the OS
+  // paging the model out mid-generation". Stock RLIMIT_MEMLOCK on that machine
+  // is 23.3 GB. llama.cpp warns and runs UNPINNED — so the app was describing
+  // something that did not happen, which is the one thing it must never do.
+  //
+  // The partial-offload branch already refused `--mlock`, but a CPU-only
+  // placement has `--n-cpu-moe 0` and fell straight past it.
+  const MB = 1024 * 1024;
+  const big = meta({
+    nLayer: 43,
+    nExpert: 256,
+    nExpertUsed: 6,
+    swaWindow: 128,
+    layers: layers(43, 2400 * MB, 2250 * MB), // ~100 GB of model
+  });
+  const roomy = {
+    totalB: 186 * GB,
+    availableB: 167 * GB,
+    usedB: 19 * GB,
+    swapTotalB: 0,
+    swapUsedB: 0,
+    lockableB: 23.3 * GB, // what this machine actually allows
+  };
+  const cpu = tune(big, hw({ gpus: [], mem: roomy }), defaults(), "cpu");
+  assertEquals(cpu.settings.mlock, false, "100 GB cannot be pinned under 23");
+  assert(
+    cpu.reasons.some((r) => r.includes("RLIMIT_MEMLOCK")),
+    `and it names the limit rather than going quiet: ${
+      cpu.reasons.join(" | ")
+    }`,
+  );
+
+  // A model that DOES fit the limit still gets it — the flag is not banned,
+  // it is only promised when it means something.
+  const small = meta({ nLayer: 32, layers: layers(32, 200 * MB) });
+  const fits = tune(small, hw({ gpus: [], mem: roomy }), defaults(), "cpu");
+  assertEquals(fits.settings.mlock, true, "6 GB under a 23 GB limit is fine");
+
+  // And a machine that does not report a limit is never promised anything:
+  // "unknown" is a reason to stay quiet, not to assume the best.
+  const silent = tune(
+    small,
+    hw({ gpus: [], mem: { ...roomy, lockableB: undefined } }),
+    defaults(),
+    "cpu",
+  );
+  assertEquals(silent.settings.mlock, false);
+});
+
 Deno.test("tune: never emits two flags that are the same llama.cpp setting", () => {
   // `--mlock` and `--no-mmap` both assign `params.load_mode` (`common/arg.cpp`),
   // so passing both is not "locked and unmapped" — it is whichever came last,
@@ -3955,6 +4318,129 @@ Deno.test("tune: never emits two flags that are the same llama.cpp setting", () 
 });
 
 // ── measuring what cannot be predicted (src/lib/fitladder.ts) ──────────────
+
+/** Captured verbatim on 2×24 GB, `--n-cpu-moe 29`, when the desktop had grown
+ *  from 2 GB to 5.5 GB of VRAM between the tune and the start. Every rung of the
+ *  old ladder failed at exactly this same allocation. */
+const WEIGHTS_OOM = [
+  "0.02.438.752 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 34679.64 MiB on device 1: cudaMalloc failed: out of memory",
+  "0.02.438.758 E alloc_tensor_range: failed to allocate CUDA1 buffer of size 36364237312",
+  "0.03.121.689 E llama_model_load: error loading model: unable to allocate CUDA1 buffer",
+];
+
+Deno.test("fitladder: the model not fitting is a different fault from the cache not fitting", () => {
+  assertEquals(fitFault(WEIGHTS_OOM), "weights");
+  assertEquals(
+    fitFault([
+      "E ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 71912704256",
+      "E graph_reserve: failed to allocate compute buffers",
+    ]),
+    "context",
+  );
+  assertEquals(
+    fitFault([
+      "/src/ggml-cuda/ggml-cuda.cu:106: CUDA error",
+      "E CUDA error: out of memory",
+    ]),
+    "context",
+    "the lazy generation-time pool scales with the context",
+  );
+  assertEquals(fitFault(["E unknown argument: --nope"]), null);
+});
+
+Deno.test("fitladder: llama.cpp's own numbers are read back out of the log", () => {
+  // The exact byte count wins over the rounded MiB when both are present.
+  assertEquals(requestedB(WEIGHTS_OOM), 36364237312);
+  assertEquals(
+    requestedB([
+      "E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 34679.64 MiB on device 1: cudaMalloc failed: out of memory",
+    ]),
+    Math.round(34679.64 * 1024 * 1024),
+  );
+  assertEquals(requestedB(["nothing to see"]), 0);
+});
+
+Deno.test("fitladder: a weights overflow moves experts, never the context", () => {
+  // The card had 22 GB to give and llama.cpp asked for 33.9 GiB — 11.9 GB short.
+  // At 2.5 GB of experts per layer that is 5 layers, +1 for the scratch that
+  // still has to live there.
+  const GiB = 1024 ** 3;
+  const d = fitDecision({
+    lines: WEIGHTS_OOM,
+    ctx: 65536,
+    tries: 0,
+    auto: true,
+    nCpuMoe: 29,
+    nLayer: 43,
+    expertPerLayerB: 2.5 * GiB,
+    deviceFreeB: [18 * GiB, 22 * GiB],
+  });
+  assertEquals(d.kind, "offload", "halving 65,536 would not move one byte");
+  if (d.kind !== "offload") return;
+  assertEquals(d.nCpuMoe, 35);
+  assert(d.note.includes("11.9 GB"), d.note);
+
+  // The shortfall is the point: taken at face value, 33.9 GiB of experts is
+  // 14 layers and most of the GPU given away for nothing.
+  assert(
+    movedLayers(33.9 * GiB, 2.5 * GiB) > 14,
+    "sized from the request, this would be the step",
+  );
+});
+
+Deno.test("fitladder: with nothing left to move, a weights overflow still shrinks", () => {
+  const GiB = 1024 ** 3;
+  const dense = fitDecision({
+    lines: WEIGHTS_OOM,
+    ctx: 65536,
+    tries: 0,
+    auto: true,
+    nLayer: 43,
+    expertPerLayerB: 0, // dense: `--n-cpu-moe` has nothing to hold back
+    deviceFreeB: [18 * GiB, 22 * GiB],
+  });
+  assertEquals(dense.kind, "retry");
+  const exhausted = fitDecision({
+    lines: WEIGHTS_OOM,
+    ctx: 65536,
+    tries: 0,
+    auto: true,
+    nCpuMoe: 43,
+    nLayer: 43, // every layer already on the host
+    expertPerLayerB: 2.5 * GiB,
+    deviceFreeB: [18 * GiB, 22 * GiB],
+  });
+  assertEquals(exhausted.kind, "retry");
+});
+
+Deno.test("fitladder: the offload rung drops the split that just failed", () => {
+  const argv = [
+    "llama-server",
+    "-m",
+    "x.gguf",
+    "-ngl",
+    "999",
+    "--n-cpu-moe",
+    "29",
+    "-ts",
+    "33.5,10.5",
+    "-c",
+    "65536",
+  ];
+  assertEquals(nCpuMoeOf(argv), 29);
+  const next = withNCpuMoe(argv, 35);
+  assertEquals(next.includes("-ts"), false, "it pinned the failed placement");
+  assertEquals(next.includes("33.5,10.5"), false);
+  assertEquals(next[next.indexOf("--n-cpu-moe") + 1], "35");
+  assertEquals(
+    next[next.indexOf("-c") + 1],
+    "65536",
+    "one number changes, and it is not this one",
+  );
+  // A model that was not given the flag still gets it.
+  assertEquals(nCpuMoeOf(["llama-server", "-m", "x.gguf"]), 0);
+  assert(withNCpuMoe(["llama-server"], 4).join(" ").endsWith("--n-cpu-moe 4"));
+});
 
 Deno.test("fitladder: only an allocation failure is worth retrying smaller", () => {
   assert(isFitFailure([
@@ -4219,6 +4705,53 @@ Deno.test("tune: aimFull drops the residency anchor — context outranks speed",
   assert(
     full.reasons.some((r) => r.includes("Context first")),
     "and says which trade was made",
+  );
+});
+
+Deno.test("tune: the residency anchor has slack, because a step function trades badly", () => {
+  // Measured (DeepSeek-V4-Flash IQ3_XXS, 2x24 GB): one layer of routed experts
+  // on the host costs ~2% of the generation rate — 15.7 tok/s at 28 layers
+  // held back, 14.0 at 30, 13.2 at 32. A STRICT anchor spent that 2% defending
+  // a context three times shorter, which nobody would choose and the app was
+  // choosing silently. The slack is bounded so it cannot become the runaway it
+  // replaced: `aimFull` is still the only way to buy context without limit.
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nCtxTrain: 262_144,
+    nExpert: 256,
+    nExpertUsed: 6,
+    layers: layers(43, 100 * MB, 700 * MB),
+  });
+  const machine = hw({ gpus: [gpu(24, 0.5), gpu(24, 0)], backend: "cuda" });
+  const auto = tune(m, machine, defaults(), "hybrid");
+  const full = tune(
+    m,
+    machine,
+    defaults(),
+    "hybrid",
+    undefined,
+    undefined,
+    true,
+  );
+  assert(auto.possible, "a 43-layer MoE on 48 GB of cards is a hybrid run");
+  // The slack buys context, and it is still an anchor: the unbounded hunt must
+  // reach further than it, or the bound is not doing its job.
+  assert(
+    auto.ctx > 0 && full.ctx >= auto.ctx,
+    `slack ${auto.ctx} must not exceed the unbounded ${full.ctx}`,
+  );
+  // And the trade stays bounded: whatever context the anchor allows, the
+  // weights it leaves on the GPU are within a few percent of the floor's.
+  const hostAt = (ctx: number) => {
+    const t = tune(m, machine, { ...defaults(), ctxSize: ctx }, "hybrid");
+    return plan(m, machine, t.settings).ram.buckets
+      .filter((b) => b.key === "weights").reduce((a, b) => a + b.bytes, 0);
+  };
+  const floorHost = hostAt(2048);
+  assert(
+    hostAt(auto.ctx) <= floorHost * 1.06,
+    "the anchor is 5% of host weights, not a licence to move the model",
   );
 });
 

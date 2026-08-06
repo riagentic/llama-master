@@ -365,6 +365,92 @@ Data flow worth knowing:
   "what you see is what runs" survives it, and it is off whenever the user typed
   the context themselves. `tests/deepseek.e2e.test.ts` proves the whole path on
   the real 145 GB model (opt-in: `LLAMA_MASTER_E2E=1`).
+- **A model is not a cache, so the ladder has two rungs.** The rung above only
+  ever shrank `-c`, and the commonest overflow on a workstation is not the
+  cache: the plan is made when the desktop holds 2 GB of VRAM and Start happens
+  when it holds 5.5, a browser having opened in between. The weights buffer then
+  fails (`alloc_tensor_range: failed to allocate CUDA1 buffer`), and halving the
+  context does not move it by one byte — six full reloads, then defeat, with the
+  answer one `--n-cpu-moe` step away. `fitladder.ts:fitFault` tells the two
+  apart: an OOM whose signature says the TENSORS were being placed is `weights`,
+  everything else is `context`. The weights rung is sized from the SHORTFALL and
+  not the request — the card had 22 GB to give and llama.cpp asked for 33.9 GiB,
+  which is six layers at 2.5 GB of routed experts each, not the fourteen the
+  request alone implies — and it DROPS the `-ts`, because that split pins the
+  layers to the cards that just proved they could not hold them, while
+  llama.cpp's own free-VRAM split is measured at load time on the machine as it
+  actually is.
+- **The sparse-attention scratch is measured, and the biggest term was SLOTS.**
+  llama.cpp's `-np` default is `-1 = auto`, and auto chose **four**. Each server
+  slot runs its own graph, so each one costs another copy of the context-sized
+  indexer tensors: the same model, placement and context cost **43,517 MiB of
+  VRAM at four slots and 21,467 at one**. That is why a 1,048,576-token context
+  looked impossible on 48 GB of cards that run it comfortably. `parallel` is a
+  term in `plan.ts:computeScratch` now, read from the settings the argv is built
+  from. Measured at one slot, both cards, ub 512, VRAM read after a real
+  generation: **8.1 KB per context token**, straight from 4,096 to 1,048,576
+  (2,045 MiB of scratch at 262,144; 8,547 MiB at 1,048,576). At four slots the
+  same line reads 29.0 KB/token — the ratio is the slot count. Two earlier
+  calibrations missed this because both were run at the default.
+  - **The scratch is divided between the cards, but not by layer count.** One
+    card and two cost the same TOTAL (8,110 MiB against 8,567 at 1M), so the
+    pool counts it once. Where the division falls is llama.cpp's decision and it
+    is not proportional: a card holding 10 slots of 44 wanted about 60% of it
+    and died in `graph_reserve` under a plan that had budgeted it 23%. So each
+    CARD is budgeted for the whole thing. The two views answer different
+    questions — the pool says what the machine will use, a card says what it
+    must be able to give — and `plan.devices.fits` was already a separate
+    constraint from `vram.overB === 0` for exactly this reason.
+  - Verified end to end on the real model: the app's own answer at 1,048,576
+    (`--n-cpu-moe 36 -np 1 -ts 37.5,6.5`) starts and generates at 13.1 tok/s;
+    at 524,288 (`--n-cpu-moe 32`) 14.9 tok/s.
+- **A catalog default is not llama.cpp's default, and assuming so shipped two
+  silent lies.** `command.ts` omits a flag whose value equals `def`, on the
+  theory that `def` IS what llama.cpp does without it. Upstream moved:
+  `-ngl` now defaults to **auto**, so "CPU only" emitted no `-ngl` and llama.cpp
+  offloaded to the GPU anyway; `-c` defaults to **0 = take it from the model**,
+  so a plan drawn for 4,096 tokens started a server at this model's declared
+  1,048,576 and could not allocate — a start that cannot succeed, with an error
+  naming none of it. `Param.llamaDef` (`types.ts`) carries llama.cpp's own
+  default when it differs, and omission is judged against THAT. The three flags
+  that decide the placement — `-ngl`, `-c`, `-np` — are always emitted, because
+  their whole job is to pin what runs. Re-check after any llama.cpp bump: the
+  failure mode is silent, and `llama-server --help` prints every default.
+- **One thread per PHYSICAL core, and the priority switch is what protects the
+  desktop.** `cpuBudget` used to leave two cores to the OS. Measured on the same
+  DeepSeek placement: 16 threads 15.91 tok/s, 32 threads (SMT) **0.94** — two
+  threads sharing one core's memory port thrash rather than pipeline, because
+  generation with experts on the host is bandwidth-bound. Leaving cores idle
+  costs throughput and buys responsiveness that nice 19 + idle I/O
+  (`src/lib/priority.ts`) already provides, so `stability` now warns about the
+  SWITCH being off rather than about the thread count, and SMT is a `risk`.
+- **The residency anchor has 5% of slack.** One layer of routed experts moved
+  back to the host costs about 2% of the generation rate (15.7 tok/s at 28 held
+  back, 14.0 at 30, 13.2 at 32). A STRICT anchor spent that 2% to defend a
+  context three times shorter — 9,728 tokens where 27,648 was available — and
+  said nothing. The slack is bounded on purpose; `aimFull` remains the only way
+  to buy context without limit.
+- **A reserve that costs something says so.** Honouring it by planning as if the
+  memory were absent is right and completely invisible: the answer just comes
+  back smaller. `derive.ts:reserveCost` re-tunes with the reserve dropped and
+  reports the difference in the tuner's own units — layers of experts, tokens of
+  context, or the whole model when the reserve is what makes it impossible.
+  Never a predicted tok/s: the 2%-a-layer figure is one model on one machine.
+- **`--mlock` is a promise the kernel can refuse, so the limit is read.** The
+  partial-offload branch already declined it; a CPU-ONLY placement has
+  `--n-cpu-moe 0` and fell straight past that guard, so the app emitted
+  `--mlock` for a 97 GB host-side model and printed "pinning them stops the OS
+  paging the model out" — against a stock `RLIMIT_MEMLOCK` of 23.3 GB, where
+  llama.cpp warns and runs unpinned. `hw.server.ts:lockable` reads
+  `/proc/self/limits` (the child inherits ours, so ours is the right one) into
+  `Mem.lockableB`, and `tune` promises the flag only when the limit covers the
+  need. Absent — macOS, Windows — is treated as "do not promise": unknown is a
+  reason to stay quiet, not to assume the best.
+- **The build is already native, and it matters.** `GGML_NATIVE=ON` is passed
+  for source builds and the resulting `libggml-cpu.so` on this Zen 5 box carries
+  AVX-512 (`zmm`), VNNI (`vpdpbusd`) and BF16 (`vdpbf16ps`). Worth re-checking
+  after any build-flag change: with experts on the host, the CPU kernels are
+  half the generation path, and a generic x86-64 build would quietly halve it.
 
 ## Never a raw error
 
