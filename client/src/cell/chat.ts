@@ -43,12 +43,14 @@ export type ChatState = {
 };
 
 export const chat = cell("chat", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // A conversation survives a restart; nothing in flight does.
   persist: { include: ["messages", "system"] },
   // `lastLatencyMs` trips aio's "looks like a secret" heuristic on its name
   // alone; it is a measurement of the last reply and belongs on screen, so it
   // is declared public rather than hidden (dep/aio/docs/state/cells.md).
-  ui: { publicFields: ["lastLatencyMs"] },
+  visible: { publicFields: ["lastLatencyMs"] },
   state: {
     messages: [] as ChatMessage[],
     input: "",

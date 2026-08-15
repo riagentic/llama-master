@@ -78,6 +78,8 @@ const EMPTY_JOB = (label: string, steps: string[]): Job => ({
 });
 
 export const builds = cell("builds", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // The chosen ref/backend and the active build are worth remembering; the
   // volatile fields are excluded so a restart never resumes a dead job.
   persist: {

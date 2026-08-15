@@ -36,6 +36,8 @@ export type ChatState = {
 };
 
 export const chat = cell("chat", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // A conversation is worth keeping across restarts; the in-flight fields are
   // not, and restoring `streaming: true` would show a spinner forever.
   persist: { include: ["messages", "system"] },

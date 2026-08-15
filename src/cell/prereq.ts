@@ -26,6 +26,8 @@ export type PrereqState = {
 };
 
 export const prereq = cell("prereq", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // Tool paths and versions change outside the app (a package upgrade), so a
   // persisted list would be confidently wrong; re-detect on every boot.
   persist: "none",

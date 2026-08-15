@@ -9,7 +9,7 @@
 // the model's own head geometry. The only estimated term is the compute buffer,
 // which is labelled as such everywhere it is shown.
 
-import type { Gpu, Hw, ModelMeta, Settings } from "./types.ts";
+import type { Hw, ModelMeta, Settings } from "./types.ts";
 import { bool, num, str } from "./params.ts";
 import {
   countsFromSplit,
@@ -157,7 +157,48 @@ function cacheBytes(type: string): number {
 }
 
 /**
- * KV bytes per token for ONE full-attention layer.
+ * How many layers actually hold a per-token KV cache.
+ *
+ * Every layer, for almost every model. A hybrid linear-attention model
+ * (Qwen3-Next / Qwen3.5-class) breaks it: `full_attention_interval` says only
+ * every Nth trunk layer is full attention, and the rest are recurrent — their
+ * state is constant-size (`recurrentStateB`), not per-token. The MTP block is
+ * dense attention (llama.cpp flags it non-recurrent, `models/qwen35.cpp`), so
+ * it keeps its cache. Qwen3.8-27B: 65 declared layers, 17 with a KV cache —
+ * billing all 65 said "128k does not fit in 48 GB of VRAM" about a model that
+ * runs there at its full 262,144.
+ */
+export function kvLayers(meta: ModelMeta): number {
+  const nLayer = whole(meta.nLayer);
+  const interval = whole(meta.fullAttnInterval);
+  if (interval < 2 || nLayer <= 0) return nLayer;
+  const nextn = Math.min(whole(meta.nextnLayers), nLayer);
+  const trunk = nLayer - nextn;
+  // llama.cpp: trunk layer i is full attention iff (i + 1) % interval == 0.
+  return Math.floor(trunk / interval) + nextn;
+}
+
+/**
+ * Constant per-sequence state of the recurrent (linear-attention) layers.
+ *
+ * llama.cpp's `n_embd_r` (conv state) + `n_embd_s` (delta/ssm state), f32 per
+ * element, per recurrent layer, per server slot. Does not grow with the
+ * context and is never quantised by `-ctk` — which is why it is its own term
+ * rather than part of the per-token rate. ~157 MB on Qwen3.8-27B at one slot.
+ */
+export function recurrentStateB(meta: ModelMeta, seqs = 1): number {
+  const nLayer = whole(meta.nLayer);
+  const interval = whole(meta.fullAttnInterval);
+  if (interval < 2 || nLayer <= 0) return 0;
+  const recurrent = nLayer - kvLayers(meta);
+  const convB = Math.max(0, whole(meta.ssmDConv) - 1) *
+    (whole(meta.ssmDInner) + 2 * whole(meta.ssmNGroup) * whole(meta.ssmDState));
+  const stateB = whole(meta.ssmDState) * whole(meta.ssmDInner);
+  return whole(recurrent * (convB + stateB) * 4 * Math.max(1, whole(seqs)));
+}
+
+/**
+ * KV bytes per token across every layer that HAS a per-token cache.
  *
  * Exported for the "per 1k tokens" figure in the UI, which is a per-token rate
  * and so cannot express a sliding window (a windowed layer stops growing). Use
@@ -179,10 +220,13 @@ export function kvPerToken(meta: ModelMeta, s: Settings): number {
   // MLA (DeepSeek-V2/V3) caches one compressed latent per token per layer
   // instead of one entry per head: the rank plus the 64-wide RoPE part. Billing
   // it as 128 heads x (192 + 128) overstates V3's cache by about seventy times.
+  // Only the layers that hold a per-token cache pay the rate — every layer on
+  // an ordinary model, one in four (plus the MTP block) on a hybrid one.
+  const nKv = kvLayers(meta);
   if (meta.kvLoraRank > 0) {
-    return whole(meta.nLayer * (meta.kvLoraRank + MLA_ROPE_DIM) * bk);
+    return whole(nKv * (meta.kvLoraRank + MLA_ROPE_DIM) * bk);
   }
-  return whole(meta.nLayer * heads * (kLen * bk + vLen * bv));
+  return whole(nKv * heads * (kLen * bk + vLen * bv));
 }
 
 /** The RoPE-carrying part of an MLA cache entry, fixed by the architecture. */
@@ -214,15 +258,23 @@ export function swaSplit(meta: ModelMeta): { full: number; windowed: number } {
  * needs 3.7x the VRAM it actually does".
  */
 export function kvTotal(meta: ModelMeta, s: Settings, ctx: number): number {
-  const perLayer = meta.nLayer > 0 ? kvPerToken(meta, s) / meta.nLayer : 0;
+  const nKv = kvLayers(meta);
+  const perLayer = nKv > 0 ? kvPerToken(meta, s) / nKv : 0;
+  // The recurrent layers' constant state rides along here because it is
+  // allocated by the same memory module and lives on the same devices as the
+  // cache — every consumer (the pools, the placement, `-nkvo`) treats it the
+  // way llama.cpp does. Zero for every non-hybrid model.
+  const stateB = recurrentStateB(meta, Math.max(1, num(s, "parallel")));
   const { full, windowed } = swaSplit(meta);
-  if (windowed === 0) return perLayer * meta.nLayer * ctx;
+  // A hybrid model's KV-bearing layers all see the whole context; no known
+  // model interleaves a sliding window on top of them.
+  if (windowed === 0 || nKv < meta.nLayer) return perLayer * nKv * ctx + stateB;
   // A windowed layer still has to hold the current batch alongside its window.
   const windowTokens = Math.min(
     ctx,
     meta.swaWindow + Math.min(ctx, num(s, "batchSize")),
   );
-  return perLayer * (full * ctx + windowed * windowTokens);
+  return perLayer * (full * ctx + windowed * windowTokens) + stateB;
 }
 
 /** The context llama.cpp will actually allocate: `-c 0` means "the model's". */
@@ -282,6 +334,11 @@ export const NO_MODEL: ModelMeta = {
   swaWindow: 0,
   swaPattern: 1,
   kvLoraRank: 0,
+  fullAttnInterval: 0,
+  ssmDConv: 0,
+  ssmDInner: 0,
+  ssmDState: 0,
+  ssmNGroup: 0,
   nextnLayers: 0,
   nExpert: 0,
   nExpertUsed: 0,
@@ -336,11 +393,6 @@ export function withoutOurUsage(hw: Hw, ourVramB: number, ourRamB: number): Hw {
   return { ...hw, gpus, mem };
 }
 
-/** VRAM currently held by anything other than the run we are planning. */
-function vramInUse(gpus: Gpu[]): number {
-  return sum(gpus.map((g) => g.vramUsedB));
-}
-
 /**
  * Is this plan a PROPOSAL or a description of a run that is already up?
  *
@@ -391,6 +443,27 @@ export function plan(
   hw: Hw,
   s: Settings,
   asked: PlanQuestion = "proposed",
+  /**
+   * Free VRAM per card at the moment this run was spawned (`srv.runCardFreeB`),
+   * in the SAME order as `hw.gpus` — which means the list the planner sees, so
+   * the recorder must filter its cards the way `hwSnapshot` does.
+   *
+   * With it, a `"running"` plan stops guessing which card holds what. Without
+   * it, the per-card picture is `packSlots`' first-fit proposal, and on a live
+   * run that proposal is routinely wrong in a way the user can see: with
+   * `--n-cpu-moe 42` every offloaded slot is attention-only, the whole 9.2 GB
+   * fits inside card 0's budget, so the packer answers `[44, 0]` — and the
+   * panel drew GPU 1 holding nothing of ours while nvidia-smi showed 12 GB on
+   * it. It is not even a split we ASKED for: the packer emits `-ts` only when
+   * it needs one, so llama.cpp divided the layers by its own free-VRAM rule and
+   * used both cards. The measurement settles it; a difference of a card is not
+   * a rounding error, and our own bytes were being drawn as somebody else's.
+   *
+   * Ignored unless it names every card — a length that disagrees with `hw.gpus`
+   * is an index mismatch, and attributing card 2's memory to card 1 would be a
+   * worse answer than the packer's.
+   */
+  cardFreeAtStartB: readonly number[] = [],
 ): Plan {
   // What the user has kept for themselves. Clamped to the machine here, once,
   // so every figure below — the pools, the per-card picture and the packing
@@ -414,7 +487,12 @@ export function plan(
   // Per-slot GPU bytes, in slot order — the shape `devsplit` needs to cut into
   // per-card ranges, and the sums the pools need. Slot `nLayer` is the output.
   const kvPerLayerB = kvOnCpu || nLayer <= 0 ? 0 : kvTotalB / nLayer;
+  // Two parallel per-slot arrays: `slotCostsB` carries weights PLUS the KV so
+  // the packer places the cache with its layers; `slotWeightsB` is the weights
+  // alone, so the per-card picture can draw them separately without ever
+  // double-counting the KV (see the note at `perCardBytes`).
   const slotCostsB: number[] = [];
+  const slotWeightsB: number[] = [];
   let gpuDense = 0;
   let gpuExperts = 0;
   let cpuWeights = 0;
@@ -435,6 +513,7 @@ export function plan(
       gpuExperts += expertsHere;
       cpuWeights += expert - expertsHere;
       slotCostsB.push(dense + expertsHere + kvPerLayerB);
+      slotWeightsB.push(dense + expertsHere);
     } else {
       cpuWeights += bytes;
     }
@@ -443,6 +522,7 @@ export function plan(
   if (outputOnGpu) {
     gpuDense += whole(meta.outputBytes);
     slotCostsB.push(whole(meta.outputBytes));
+    slotWeightsB.push(whole(meta.outputBytes));
   } else {
     cpuWeights += whole(meta.outputBytes);
   }
@@ -471,8 +551,11 @@ export function plan(
   // That second context is one block's KV over the same window, so it is small,
   // but it is real and a plan that ignored it could hand back settings that no
   // longer fit the moment the flag is emitted (server-context.cpp:1085).
+  // One layer's rate — divided by the KV-bearing layer count, because that is
+  // what `kvPerTokenB` is a sum over (17 on Qwen3.8-27B, not its 65 declared
+  // layers).
   const mtpKvB = specMtpActive(meta, s)
-    ? whole(kvPerTokenB / Math.max(1, nLayer) * ctx)
+    ? whole(kvPerTokenB / Math.max(1, kvLayers(meta)) * ctx)
     : 0;
   const mtpDraftB = mtpKvB > 0 ? mtpKvB + BACKEND_CONTEXT_B / 2 : 0;
 
@@ -521,8 +604,37 @@ export function plan(
     ? BACKEND_CONTEXT_B + activation * 4 + scratchFloor(meta)
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
+
+  // OUR OWN VRAM, PER CARD, MEASURED — free-at-spawn minus free-now, which is
+  // the same baseline `adapt.ts:drift` reads for "memory came back". Only for a
+  // run that is up, only when the baseline names every card, and only when it
+  // says we took something: a run that recorded nothing (an adopted server, a
+  // start before this was kept) falls back to the packer rather than drawing an
+  // empty machine.
+  //
+  // Anything else that allocated since the spawn lands in this figure too. That
+  // is the honest error bar of a device-wide counter — and it is bounded by the
+  // thing it replaces, which was not measurement at all but a first-fit guess
+  // about a placement llama.cpp had already made differently.
+  const measuredOursB: number[] | null = (() => {
+    if (asked !== "running" || !usingGpu) return null;
+    if (cardFreeAtStartB.length !== hw.gpus.length) return null;
+    const ours = hw.gpus.map((g, i) =>
+      Math.max(
+        0,
+        (cardFreeAtStartB[i] ?? 0) - Math.max(0, g.vramTotalB - g.vramUsedB),
+      )
+    );
+    return ours.some((b) => b > 0) ? ours : null;
+  })();
+  /** What is on each card that is NOT this run. Our bytes are itemised as our
+   *  buckets, so leaving them in "in use elsewhere" would draw them twice. */
+  const othersUsedB = hw.gpus.map((g, i) =>
+    Math.max(0, g.vramUsedB - (measuredOursB?.[i] ?? 0))
+  );
+
   const budgetsB = asked === "running"
-    ? hw.gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB))
+    ? hw.gpus.map((g, i) => Math.max(0, g.vramTotalB - (othersUsedB[i] ?? 0)))
     : deviceBudgets(hw.gpus, perDeviceOverheadB, reserveShares);
   // A `-ts` on the command line is not advice, it is the placement. Until this
   // read it, the plan drew the PACKER's cuts however the argv disagreed — so a
@@ -563,26 +675,52 @@ export function plan(
     }
     displayCounts = dc;
   }
-  const perCardBytes = displayCounts
-    ? loadPerDevice(slotCostsB, displayCounts)
-    : [];
   const slotsPlaced = displayCounts
     ? displayCounts.reduce((a, c) => a + c, 0)
     : 0;
+  // The per-card picture splits each slot's cost back into weights and KV.
+  // `slotCostsB` includes `kvPerLayerB` so the PACKER places the cache with its
+  // layers, but `loadPerDevice` over it would give weights that ALREADY contain
+  // the cache — and adding `kvB` on top double-counted it, so card0 + card1
+  // exceeded the pool's own "VRAM used" for the same plan. Weights come from a
+  // KV-free array, so they reconcile with the pool to the byte.
+  const weightsNoKvB = (counts: readonly number[]): number[] =>
+    loadPerDevice(slotWeightsB, counts);
+  // Our machine-wide GPU total, as the buckets add it up — the denominator that
+  // turns a card's measured bytes back into the three bands the map draws.
+  const gpuOursB = gpuDense + gpuExperts + kvOnGpu + gpuCompute;
   const cards = usingGpu
     ? hw.gpus.map((g, i) => {
       const n = displayCounts?.[i] ?? 0;
-      const weightsB = perCardBytes[i] ?? 0;
-      const kvB = slotsPlaced > 0 && !kvOnCpu
+      // Measured: the card's own total is a fact, and the three bands inside it
+      // are that fact cut by the proportions the buckets already carry. The
+      // split between bands stays derived — the driver reports bytes, not what
+      // they are for — but which CARD they are on stops being a guess, and that
+      // is the part that was visibly wrong.
+      const mine = measuredOursB?.[i] ?? 0;
+      const share = measuredOursB && gpuOursB > 0 ? mine / gpuOursB : 0;
+      const weightsB = measuredOursB
+        ? whole((gpuDense + gpuExperts) * share)
+        : displayCounts
+        ? weightsNoKvB(displayCounts)[i] ?? 0
+        : 0;
+      const kvB = measuredOursB
+        ? whole(kvOnGpu * share)
+        : slotsPlaced > 0 && !kvOnCpu
         ? whole(kvOnGpu * (n / slotsPlaced))
         : 0;
       // Drawn as it is budgeted, so the picture and the packer cannot disagree
       // about the same card. See the note at `perDeviceOverheadB`: the pool
       // counts the scratch once because that is what the machine uses; a card
       // is charged all of it because llama.cpp decides the split and does not
-      // divide it by layer count.
-      const computeB = n > 0 || i === 0 ? perDeviceOverheadB : 0;
-      const otherB = g.vramUsedB;
+      // divide it by layer count. That pessimism is a PROPOSAL's job — for a
+      // measured run the scratch is already inside the bytes on the card.
+      const computeB = measuredOursB
+        ? whole(gpuCompute * share)
+        : n > 0 || i === 0
+        ? perDeviceOverheadB
+        : 0;
+      const otherB = othersUsedB[i] ?? g.vramUsedB;
       const reservedB = reserveShares[i] ?? 0;
       const overB = Math.max(
         0,
@@ -605,7 +743,12 @@ export function plan(
   const ramCapacity = hw.mem?.totalB ?? 0;
   const ramOther = hw.mem ? hw.mem.totalB - hw.mem.availableB : 0;
 
-  const vram = pool("VRAM", vramCapacity, vramInUse(hw.gpus), reservedVramB, [
+  // "In use" here means BY EVERYONE ELSE — our own buckets are itemised below,
+  // so a figure that still contained them would draw this run twice. When the
+  // per-card measurement is available it has already been taken out per card
+  // (`othersUsedB`); otherwise this is the device-wide reading and the caller
+  // is the one that subtracts us (`derive.ts:withoutOurUsage`).
+  const vram = pool("VRAM", vramCapacity, sum(othersUsedB), reservedVramB, [
     { key: "weights", label: "Weights", bytes: gpuDense },
     { key: "experts", label: "Experts", bytes: gpuExperts },
     { key: "kv", label: "KV cache", bytes: kvOnGpu },
@@ -623,7 +766,10 @@ export function plan(
   // proposal is subject to the packer's verdict.
   const placementSettled = asked === "running" && vram.overB === 0;
   const devices: DevicePlan = {
-    bytesB: counts ? loadPerDevice(slotCostsB, counts) : [],
+    // Measured first: on a live run this is what each card holds of ours, not
+    // what a packer would have given it.
+    bytesB: measuredOursB ??
+      (counts ? loadPerDevice(slotCostsB, counts) : []),
     budgetsB,
     // The split that produces this placement — which, when the user pinned
     // one, is theirs. Re-deriving it from the counts would answer "" for a

@@ -7,7 +7,7 @@
 // dispatched start and assumed it worked".
 
 import { cell, own } from "aio";
-import type { CellEffect } from "aio";
+import type { MethodDraftServed } from "aio";
 import { appendLog } from "../lib/buildlog.ts";
 import { diagnoseServerExit } from "../lib/serverlog.ts";
 import {
@@ -138,17 +138,19 @@ function slotId(pid: number): string {
  * names a process that has already exited, so it can only ever be a no-op.
  */
 function ownProcess(
+  s: MethodDraftServed,
   prevPid: number,
   pid: number,
   close: () => void,
-): CellEffect {
+): void {
   const take = own.set(slotId(pid), () => ({ close }));
-  return prevPid && prevPid !== pid
-    ? [own.dispose(slotId(prevPid)), take]
-    : take;
+  if (prevPid && prevPid !== pid) s.$do(own.dispose(slotId(prevPid)), take);
+  else s.$do(take);
 }
 
 export const srv = cell("srv", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // A process cannot survive a restart of this app, so persisting its state
   // would only ever restore a lie.
   persist: "none",
@@ -221,7 +223,7 @@ export const srv = cell("srv", {
          *  face value. */
         cardFreeB?: number[];
       },
-    ): Promise<CellEffect | void> {
+    ): Promise<void> {
       if (s.status === "starting" || s.status === "ready") return;
       // The pid this start REPLACES, captured before anything overwrites it —
       // its `own` slot is released below, by name (see the note at `own.set`).
@@ -279,9 +281,10 @@ export const srv = cell("srv", {
         //
         // The dead process's slot is released in the same breath, so a session
         // of starts and stops does not accumulate one no-op disposer per run.
-        return ownProcess(prevPid, pid, () => {
+        ownProcess(s, prevPid, pid, () => {
           void io.stopOwned(pid);
         });
+        return;
       } catch (e) {
         // A refused duplicate start is not a crash — an impatient double-click
         // used to leave the cell "crashed" with pid 0 while the first server ran
@@ -304,7 +307,7 @@ export const srv = cell("srv", {
       }
     },
 
-    async stop(s): Promise<CellEffect | void> {
+    async stop(s): Promise<void> {
       // Whose slot this releases, read before the fields are cleared.
       const stopping = s.pid;
       // No early return on `status === "stopped"`, however tempting: a Start
@@ -329,7 +332,7 @@ export const srv = cell("srv", {
         s.startFreeRamB = 0;
         s.rssB = 0;
         s.rssFileB = 0;
-        return own.dispose(slotId(stopping));
+        s.$do(own.dispose(slotId(stopping)));
       } catch (e) {
         s.lastError = String(e);
       }
@@ -425,9 +428,10 @@ export const srv = cell("srv", {
               if (s.runLowPriority) void io.lowerPriority(pid); // aiol-ok
 
               // Same as `start`: the rung that just died hands its slot over.
-              return ownProcess(dead, pid, () => {
+              ownProcess(s, dead, pid, () => {
                 void io.stopOwned(pid);
               });
+              return;
             } catch (e) {
               s.status = "crashed";
               s.lastError = String(e);

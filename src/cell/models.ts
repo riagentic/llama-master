@@ -20,6 +20,8 @@ export type ModelsState = {
 };
 
 export const models = cell("models", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // The library itself is re-derived by a scan; the user's directory list and
   // their selection are the parts worth keeping across restarts.
   persist: { include: ["dirs", "selected"] },

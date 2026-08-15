@@ -13,9 +13,19 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.0-alpha38`**, vendored at `dep/aio` → symlink to
+- **Deno 2.9+ + aio `1.0.0-alpha55`**, vendored at `dep/aio` → symlink to
   `../../aio`. Never `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs
-  index: `dep/aio/docs/content.md`.
+  index: `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must
+  name the version the symlink actually resolves to — `deno task aiol` says so
+  when they drift, and a declaration that lags the code is how the app came to
+  be running alpha54 while claiming alpha44.
+- **Async cells carry `transaction: false`.** alpha52 made `transaction: true`
+  (snapshot reads, atomic commit at return) the async default; every cell here
+  was written for incremental commits — `srv.poll` is an observer that must read
+  state that moved under it, `chat.send` streams — so they opt out explicitly.
+  Adopting transactions is a per-cell decision (`s.$commit()` to publish
+  mid-method, `s.$live` to read past a pinned snapshot), not a default to drift
+  into. Effects go through `s.$do(effect)`; returning them is deprecated.
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.
@@ -169,8 +179,8 @@ Data flow worth knowing:
   picking llama-server's neighbour. It is honoured by planning as if the memory
   were ABSENT, so it enters through `Hw` (`types.ts:Reserve`, attached only in
   `derive.ts:planningHw`) and every consumer of `plan` — the tuner, the picker,
-  stability, the bars, the per-card packing budgets — inherits it without knowing
-  it exists.
+  stability, the bars, the per-card packing budgets — inherits it without
+  knowing it exists.
   - **Three numbers, because the display is on ONE card.** Reserved per GPU
     (default 0) is charged to every card; reserved on the connected GPU (default
     8 GB) only to the card(s) with a monitor attached; reserved RAM (16 GB) is
@@ -181,27 +191,28 @@ Data flow worth knowing:
     actually need. Applying one figure to every card is the other error — a
     two-card machine paying twice for one desktop.
   - **Which card has the display is MEASURED, and "unknown" is a third answer.**
-    `Gpu.display` comes from `nvidia-smi --query-gpu=display_mode,display_active`
-    (cached 30 s — it changes when a monitor is plugged in, not on the 1 s poll;
-    `display_mode` is deprecated on current drivers and returns a sentence, hence
-    reading both) and, for sysfs cards, `/sys/class/drm/<card>-*/status`.
-    Verified against this machine: nvidia-smi index 0 = PCI 01:00.0 = `card2`,
-    which is the one with two connected DisplayPort outputs. `undefined` (a
-    vendor that does not report, no DRM connectors) falls back to card 0 and the
-    UI says it is an assumption; every card answering `false` is taken at its
-    word and reserves nothing (`reserve.ts:displayGpus`).
+    `Gpu.display` comes from
+    `nvidia-smi --query-gpu=display_mode,display_active` (cached 30 s — it
+    changes when a monitor is plugged in, not on the 1 s poll; `display_mode` is
+    deprecated on current drivers and returns a sentence, hence reading both)
+    and, for sysfs cards, `/sys/class/drm/<card>-*/status`. Verified against
+    this machine: nvidia-smi index 0 = PCI 01:00.0 = `card2`, which is the one
+    with two connected DisplayPort outputs. `undefined` (a vendor that does not
+    report, no DRM connectors) falls back to card 0 and the UI says it is an
+    assumption; every card answering `false` is taken at its word and reserves
+    nothing (`reserve.ts:displayGpus`).
   - It is labelled apart from "in use elsewhere" everywhere it is shown
-    (`Pool.reservedB`), because a refusal caused by the user's own setting has to
-    name the control that gives the memory back. In the memory MAP that means a
-    band with a colour of its own (teal, `--seg-reserved`, still hatched because
-    a decision must not look like a measurement) and an entry in the legend: it
-    was drawn all along in the machine's greys and named nowhere, so the one
-    band the user put there themselves read as empty track — which is the one
-    thing it is not. The region foot counts it as a third figure, because
-    reserved bytes are neither used (nothing is in them) nor free (nothing may
-    go in them). `hwSnapshot` never carries it —
-    the current-state view reports real free memory; reserved bytes are free until
-    something takes them, they are merely not SPENDABLE.
+    (`Pool.reservedB`), because a refusal caused by the user's own setting has
+    to name the control that gives the memory back. In the memory MAP that means
+    a band with a colour of its own (teal, `--seg-reserved`, still hatched
+    because a decision must not look like a measurement) and an entry in the
+    legend: it was drawn all along in the machine's greys and named nowhere, so
+    the one band the user put there themselves read as empty track — which is
+    the one thing it is not. The region foot counts it as a third figure,
+    because reserved bytes are neither used (nothing is in them) nor free
+    (nothing may go in them). `hwSnapshot` never carries it — the current-state
+    view reports real free memory; reserved bytes are free until something takes
+    them, they are merely not SPENDABLE.
 - **Of the four context bands, only Max is a fact.** `.katana/context.md` asks
   for Min / Opt / Big / Max buttons and a picture of the usable range
   (`src/lib/tune.ts:ctxBands`, `src/ui/CtxControls.tsx`, on both the all-in-one
@@ -218,13 +229,21 @@ Data flow worth knowing:
   server, a chat client and an SSE parser, so it is equipped to, and does not
   yet.
 - **KV-cache size is per-architecture.** One uniform formula overestimated
-  Gemma-3-class sliding-window attention ~3.7x and DeepSeek MLA ~71x, while the
-  UI labelled the figure exact. `rust/src/gguf.rs` reads
-  `attention.sliding_window{,_pattern}` and `attention.kv_lora_rank`;
-  `plan.ts:kvTotal` caps windowed layers at their window and bills MLA as one
-  compressed latent per layer. `kvPerToken` remains the per-token rate the UI
-  shows — a windowed layer has no constant rate, which is why the fit uses
-  `kvTotal`.
+  Gemma-3-class sliding-window attention ~3.7x, DeepSeek MLA ~71x, and
+  Qwen3.5-class hybrid linear attention ~3.8x, while the UI labelled the figure
+  exact. `rust/src/gguf.rs` reads `attention.sliding_window{,_pattern}`,
+  `attention.kv_lora_rank`, and `full_attention_interval` + `ssm.*`;
+  `plan.ts:kvTotal` caps windowed layers at their window, bills MLA as one
+  compressed latent per layer, and bills a hybrid model only for its KV-bearing
+  layers (`kvLayers` — every Nth trunk layer plus the MTP block, llama.cpp's
+  `is_recr_impl` rule) while the recurrent layers pay a constant per-sequence
+  f32 state (`recurrentStateB`, ~157 MB on Qwen3.8-27B, one copy per server
+  slot, untouched by `-ctk`). This was found the expensive way: the tuner
+  refused Qwen3.8-27B a 131,072 context on 48 GB of VRAM over an 18.5 GB q8
+  cache that is really 4.9 GB — the model runs VRAM-only at its full 262,144 (17
+  of 65 declared layers hold a cache; verified against a live run's measured
+  footprint). `kvPerToken` remains the per-token rate the UI shows — a windowed
+  layer has no constant rate, which is why the fit uses `kvTotal`.
 - **Every append-at-the-bottom box follows its newest line.** Both chats and
   every `LogView` are capped scroll containers; with no scroll handling a reply
   stayed below the fold exactly when the user was waiting for it. One hook
@@ -245,15 +264,15 @@ Data flow worth knowing:
   `title="…"`. The block header names the FILE over the language, and carries
   its own copy button — the file is the unit people want, not the message.
   `src/ui/ChatMessage.tsx` is the one renderer for both surfaces: they had
-  drifted (tok/s above the answer on one, below on the other; the
-  "ended while still thinking" fallback on only one), which is what two copies
-  of a message renderer always do. tok/s belongs AFTER the answer — it is a
-  measurement of the thing above it, and printing it in the role line put a
-  number the user cannot have yet over the text they are waiting for.
+  drifted (tok/s above the answer on one, below on the other; the "ended while
+  still thinking" fallback on only one), which is what two copies of a message
+  renderer always do. tok/s belongs AFTER the answer — it is a measurement of
+  the thing above it, and printing it in the role line put a number the user
+  cannot have yet over the text they are waiting for.
 - **One Memory section, and what is in it depends on whether the answer is
-  already known.** Nothing running: both maps, now and next, because that IS
-  the decision. A model running: only the measurement — the projection's
-  question has been answered by the machine itself, and an estimate beside the
+  already known.** Nothing running: both maps, now and next, because that IS the
+  decision. A model running: only the measurement — the projection's question
+  has been answered by the machine itself, and an estimate beside the
   measurement of the same thing asks the reader which one to believe. What a
   restart would cost is still on screen, in the placement picker and the fit
   line (`src/ui/OnePage.tsx`, keyed on `memoryIsLive()`).
@@ -304,6 +323,28 @@ Data flow worth knowing:
   `drift` reads, so genuine pressure is still reported). `currentStatePlan()` is
   the only caller that passes `"running"`, and it is the only one describing
   something that already exists.
+  - **And its per-card BYTES are measured too, not just its verdict.** Dropping
+    the packer's `fits` was half the job: `bytesB` and the three bands per card
+    still came from `packSlots`, which is first-fit. With `--n-cpu-moe 42` every
+    offloaded slot but one is attention-only, so the whole 9.2 GB fits inside
+    card 0 and the packer answers `[44, 0]` — while nvidia-smi showed 11.6 and
+    12.2 GB on the two cards. It was never even a split we ASKED for: the packer
+    emits `-ts` only when it needs one, so llama.cpp divided the layers by its
+    own free-VRAM rule and used both. The panel drew GPU 1 holding nothing of
+    ours and filed our own 12 GB there as somebody else's memory. `plan()` now
+    takes `cardFreeAtStartB` (`srv.runCardFreeB`, free per card at the spawn —
+    the same baseline `drift` reads) and a live plan attributes per card by
+    free-at-spawn minus free-now. The card TOTAL is then measured; the split
+    between weights/KV/compute inside it stays apportioned, because the driver
+    reports bytes and not what they are for. When the baseline is absent, all
+    zeroes, or names a different number of cards, the packer's answer stands —
+    an index mismatch would be worse than the guess it replaces.
+  - **That baseline is recorded against the cards the PLANNER sees.** It was
+    taken from the raw `hw.gpus`, which on this machine includes an AMD iGPU a
+    CUDA build filters out (`backend.ts:usableGpus`), while both readers index
+    by a position that excludes it — `plan` against `hwSnapshot().gpus`, and the
+    fit ladder against the `CUDA1` in llama.cpp's own error. Harmless only while
+    the NVIDIA cards happen to sort first.
 - **The projection is of the command Start would issue.** The panel says "after
   starting", and with auto-optimal on what starts is the tuner's answer for the
   machine as it is NOW — while the tuner is deliberately suspended during a run,
@@ -402,12 +443,12 @@ Data flow worth knowing:
     must be able to give — and `plan.devices.fits` was already a separate
     constraint from `vram.overB === 0` for exactly this reason.
   - Verified end to end on the real model: the app's own answer at 1,048,576
-    (`--n-cpu-moe 36 -np 1 -ts 37.5,6.5`) starts and generates at 13.1 tok/s;
-    at 524,288 (`--n-cpu-moe 32`) 14.9 tok/s.
+    (`--n-cpu-moe 36 -np 1 -ts 37.5,6.5`) starts and generates at 13.1 tok/s; at
+    524,288 (`--n-cpu-moe 32`) 14.9 tok/s.
 - **A catalog default is not llama.cpp's default, and assuming so shipped two
   silent lies.** `command.ts` omits a flag whose value equals `def`, on the
-  theory that `def` IS what llama.cpp does without it. Upstream moved:
-  `-ngl` now defaults to **auto**, so "CPU only" emitted no `-ngl` and llama.cpp
+  theory that `def` IS what llama.cpp does without it. Upstream moved: `-ngl`
+  now defaults to **auto**, so "CPU only" emitted no `-ngl` and llama.cpp
   offloaded to the GPU anyway; `-c` defaults to **0 = take it from the model**,
   so a plan drawn for 4,096 tokens started a server at this model's declared
   1,048,576 and could not allocate — a start that cannot succeed, with an error
@@ -522,14 +563,14 @@ cannot act on is a bug.
   "nothing is running" while llama-server held its VRAM.
 - **The all-in-one page is a budget, and the machine column is where it runs
   out.** Three columns, each scrolling alone, and the left one carries the
-  vitals, both memory states and the command — so anything added there has to
-  be paid for. It was paid for once already: the vitals lost their sparklines
-  and two sub-lines apiece (the history graphs are one click away on the pages
-  built for them), the current-state table is drawn only when something IS
-  running (idle, every row of it is a zero the map above already shows), the two
-  maps share one legend and drop the "Memory map — 234 GB total" caption they
-  both repeated, and the command shows the server line wrapped rather than one
-  flag per line. Verified the way layout has to be verified — by looking:
+  vitals, both memory states and the command — so anything added there has to be
+  paid for. It was paid for once already: the vitals lost their sparklines and
+  two sub-lines apiece (the history graphs are one click away on the pages built
+  for them), the current-state table is drawn only when something IS running
+  (idle, every row of it is a zero the map above already shows), the two maps
+  share one legend and drop the "Memory map — 234 GB total" caption they both
+  repeated, and the command shows the server line wrapped rather than one flag
+  per line. Verified the way layout has to be verified — by looking:
   `chromium --headless --window-size=1600,1000 --screenshot` against the running
   dev server (`am instances` for the port). For what a picture cannot settle,
   the same chromium with `--remote-debugging-port` and a five-line CDP client
@@ -623,10 +664,10 @@ cannot act on is a bug.
     from `srv.runLowPriority` (the RUN's choice, not the toggle's current
     position two minutes later).
   - **It degrades rather than fails.** The idle I/O class is refused on some
-    kernels and in containers, so the fallback is the lowest best-effort band;
-    a machine with no `ionice` at all still gets the renice. Whatever happened
-    is one line in the server log, including "could not lower the priority" —
-    a run left at normal priority while the switch says otherwise is the kind of
+    kernels and in containers, so the fallback is the lowest best-effort band; a
+    machine with no `ionice` at all still gets the renice. Whatever happened is
+    one line in the server log, including "could not lower the priority" — a run
+    left at normal priority while the switch says otherwise is the kind of
     silent disagreement this app refuses everywhere else. `tests/server.test.ts`
     reads `/proc/<pid>/stat` back and asserts the KERNEL agrees, both ways.
   - Turning it off while a server runs says "takes effect on the next start",
@@ -639,12 +680,12 @@ cannot act on is a bug.
   argv that is spawned and the switch cannot disagree. OFF by default: binding
   to the world is not a default. What it adds beside itself is the ADDRESS —
   `0.0.0.0` is what llama-server binds, not what anyone dials, and typing it
-  into the client reaches nothing (`src/lib/lan.ts:pickLanIp` over
-  `hw.lanIps`, a real LAN address ahead of a link-local one). What it does NOT
-  repeat is the risk: an open bind with no API key already raises a red banner
-  on the same page (`stability.ts:189`), and saying it twice makes both
-  quieter. It lives in its own `run-row`, not in the actions row — there its
-  address line wrapped into a narrow column and squeezed Start against it.
+  into the client reaches nothing (`src/lib/lan.ts:pickLanIp` over `hw.lanIps`,
+  a real LAN address ahead of a link-local one). What it does NOT repeat is the
+  risk: an open bind with no API key already raises a red banner on the same
+  page (`stability.ts:189`), and saying it twice makes both quieter. It lives in
+  its own `run-row`, not in the actions row — there its address line wrapped
+  into a narrow column and squeezed Start against it.
 
 ## The client (`client/`)
 
@@ -658,10 +699,10 @@ llama.master somebody else is running (`.katana/client.md`). `deno task dev`,
   There is no start, no stop, no settings, and a UI test asserts that no other
   path is ever requested.
 - **Discovery is a sweep, because llama-server does not announce itself.** One
-  /24 (this machine's own subnets, private ranges only), the four ports llama.cpp
-  is served on, 64 probes in flight, localhost first — and the identifying answer
-  is `/props`, not a 200, or every router admin page on the subnet would be
-  reported as a server (`client/src/lib/discover.ts`).
+  /24 (this machine's own subnets, private ranges only), the four ports
+  llama.cpp is served on, 64 probes in flight, localhost first — and the
+  identifying answer is `/props`, not a 200, or every router admin page on the
+  subnet would be reported as a server (`client/src/lib/discover.ts`).
 - **The commonest LAN failure has a sentence, not a shrug.** llama.cpp binds to
   127.0.0.1 unless told otherwise, so it is invisible from every other machine;
   both "unreachable" and "nothing found" name `--host 0.0.0.0`.
@@ -670,8 +711,8 @@ llama.master somebody else is running (`.katana/client.md`). `deno task dev`,
   it)". A client that renders 0% because it could not ask is lying.
 - **The shared libraries are COPIED, and a test polices the copy.** aio serves
   the browser bundle only from inside the app's own root and refuses a symlink
-  out of it (`server-static.ts`), so `client/src/shared/` is a mechanical copy of
-  `src/lib` made by `deno task sync`; `client/tests/shared.test.ts` fails the
+  out of it (`server-static.ts`), so `client/src/shared/` is a mechanical copy
+  of `src/lib` made by `deno task sync`; `client/tests/shared.test.ts` fails the
   moment the two differ, naming the command that fixes it. Same arrangement as
   `src/llama-sys.wasm`: committed so nothing has to be built, guarded so it
   cannot fall behind.

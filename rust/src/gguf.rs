@@ -290,6 +290,22 @@ pub struct Gguf {
     /// compressed latent of this rank plus the RoPE part, not one entry per
     /// head, which is a ~70x difference on V3. 0 = not an MLA model.
     pub kv_lora_rank: u64,
+    /// Hybrid linear attention (Qwen3-Next / Qwen3.5-class,
+    /// `<arch>.full_attention_interval`): only every Nth trunk layer is full
+    /// attention with a per-token KV cache; the rest are recurrent (gated
+    /// delta net) and hold a CONSTANT per-sequence state instead. Billing all
+    /// 65 of Qwen3.8-27B's layers for the context overstates its cache ~4x —
+    /// the difference between "128k does not fit in VRAM" and the 262,144 the
+    /// same cards actually run. 0 = every layer is full attention.
+    pub full_attn_interval: u64,
+    /// Recurrent-state geometry (`<arch>.ssm.*`), the terms of llama.cpp's
+    /// `n_embd_r`/`n_embd_s`: conv state `(d_conv-1) * (d_inner +
+    /// 2*n_group*d_state)` plus ssm state `d_state * d_inner`, f32, per
+    /// sequence per recurrent layer. All 0 = no recurrent layers.
+    pub ssm_d_conv: u64,
+    pub ssm_d_inner: u64,
+    pub ssm_d_state: u64,
+    pub ssm_n_group: u64,
     /// Multi-token-prediction blocks (`<arch>.nextn_predict_layers`). A model
     /// that declares these ships an extra block that can DRAFT the next tokens,
     /// which llama.cpp verifies against the full model — speculative decoding
@@ -414,6 +430,13 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     // i.e. every layer is local.
     let swa_pattern = a("attention.sliding_window_pattern").unwrap_or(1.0) as u64;
     let kv_lora_rank = a("attention.kv_lora_rank").unwrap_or(0.0) as u64;
+    // Hybrid linear attention: absent on the great majority of models, and
+    // absent means "full attention on every layer".
+    let full_attn_interval = a("full_attention_interval").unwrap_or(0.0) as u64;
+    let ssm_d_conv = a("ssm.conv_kernel").unwrap_or(0.0) as u64;
+    let ssm_d_inner = a("ssm.inner_size").unwrap_or(0.0) as u64;
+    let ssm_d_state = a("ssm.state_size").unwrap_or(0.0) as u64;
+    let ssm_n_group = a("ssm.group_count").unwrap_or(0.0) as u64;
 
     let mut layers = vec![Layer::default(); n_layer];
     let mut embd_bytes: u64 = 0;
@@ -502,6 +525,11 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         swa_window,
         swa_pattern,
         kv_lora_rank,
+        full_attn_interval,
+        ssm_d_conv,
+        ssm_d_inner,
+        ssm_d_state,
+        ssm_n_group,
         nextn_layers: a("nextn_predict_layers").unwrap_or(0.0) as u64,
         n_expert: a("expert_count").unwrap_or(0.0) as u64,
         n_expert_used: a("expert_used_count").unwrap_or(0.0) as u64,
@@ -535,7 +563,8 @@ pub fn to_json(g: &Gguf) -> String {
             "{{\"ok\":true,\"version\":{},\"arch\":{},\"name\":{},\"quant\":{},",
             "\"nLayer\":{},\"nCtxTrain\":{},\"nEmbd\":{},\"nHead\":{},\"nHeadKv\":{},",
             "\"keyLength\":{},\"valueLength\":{},",
-            "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"nextnLayers\":{},",
+            "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"fullAttnInterval\":{},",
+            "\"ssmDConv\":{},\"ssmDInner\":{},\"ssmDState\":{},\"ssmNGroup\":{},\"nextnLayers\":{},",
             "\"nExpert\":{},\"nExpertUsed\":{},",
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"embdBytes\":{},\"outputBytes\":{},",
             "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},",
@@ -555,6 +584,11 @@ pub fn to_json(g: &Gguf) -> String {
         g.swa_window,
         g.swa_pattern,
         g.kv_lora_rank,
+        g.full_attn_interval,
+        g.ssm_d_conv,
+        g.ssm_d_inner,
+        g.ssm_d_state,
+        g.ssm_n_group,
         g.nextn_layers,
         g.n_expert,
         g.n_expert_used,
@@ -670,6 +704,44 @@ mod tests {
         assert_eq!(g.output_bytes, 4096 * 4, "output_norm is the output group");
         assert_eq!(g.tensor_bytes, q4k * 3 + embd + 4096 * 4);
         assert_eq!(g.unknown_types, 0);
+    }
+
+    /// Hybrid linear attention (Qwen3.5-class) declares which layers actually
+    /// hold a KV cache; missing these keys is how a 4.8 GB cache got billed as
+    /// 18.5 GB and a model that runs at 262,144 was refused 131,072.
+    #[test]
+    fn reads_hybrid_linear_attention_geometry() {
+        let mut b = Buf::new();
+        b.u64(0); // tensors
+        b.u64(7); // kv
+        b.kv_str("general.architecture", "qwen35");
+        b.kv_u32("qwen35.block_count", 65);
+        b.kv_u32("qwen35.full_attention_interval", 4);
+        b.kv_u32("qwen35.ssm.conv_kernel", 4);
+        b.kv_u32("qwen35.ssm.inner_size", 6144);
+        b.kv_u32("qwen35.ssm.state_size", 128);
+        b.kv_u32("qwen35.ssm.group_count", 16);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.full_attn_interval, 4);
+        assert_eq!(g.ssm_d_conv, 4);
+        assert_eq!(g.ssm_d_inner, 6144);
+        assert_eq!(g.ssm_d_state, 128);
+        assert_eq!(g.ssm_n_group, 16);
+        let j = to_json(&g);
+        assert!(j.contains("\"fullAttnInterval\":4"), "{}", j);
+        assert!(j.contains("\"ssmDInner\":6144"), "{}", j);
+    }
+
+    /// Absent on ordinary models, and absent means zero — full attention on
+    /// every layer, the formula the planner already had.
+    #[test]
+    fn hybrid_keys_default_to_zero() {
+        let g = parse(&fixture()).unwrap();
+        assert_eq!(g.full_attn_interval, 0);
+        assert_eq!(g.ssm_d_conv, 0);
+        assert_eq!(g.ssm_d_inner, 0);
+        assert_eq!(g.ssm_d_state, 0);
+        assert_eq!(g.ssm_n_group, 0);
     }
 
     /// A part of a split model reports how much of the model it is NOT.

@@ -53,6 +53,19 @@ export type ModelMeta = {
   swaPattern: number;
   /** Multi-head latent attention rank (DeepSeek-V2/V3). 0 = not MLA. */
   kvLoraRank: number;
+  /** Hybrid linear attention (`full_attention_interval`, Qwen3-Next /
+   *  Qwen3.5-class): only every Nth trunk layer is full attention with a
+   *  per-token KV cache; the rest are recurrent and hold a constant
+   *  per-sequence state (`plan.ts:kvLayers`, `recurrentStateB`). Billing every
+   *  layer for the context overstates the cache ~4x on Qwen3.8-27B. 0 = every
+   *  layer is full attention. */
+  fullAttnInterval: number;
+  /** Recurrent-state geometry (`ssm.*`), the terms of llama.cpp's
+   *  `n_embd_r`/`n_embd_s`. All 0 = no recurrent layers. */
+  ssmDConv: number;
+  ssmDInner: number;
+  ssmDState: number;
+  ssmNGroup: number;
   /** Multi-token-prediction blocks (`nextn_predict_layers`). A model declaring
    *  these ships a block that drafts the next tokens for llama.cpp to verify
    *  against the full model — speculative decoding with no second model and no

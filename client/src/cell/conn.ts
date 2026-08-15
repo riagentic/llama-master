@@ -60,6 +60,8 @@ export type ConnState = {
 };
 
 export const conn = cell("conn", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // The address is worth keeping between sessions — it is the one thing the
   // user typed. Nothing else here survives a restart: a status, a health
   // reading or an occupancy from last week would all be fiction.

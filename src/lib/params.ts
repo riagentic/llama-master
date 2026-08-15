@@ -263,7 +263,11 @@ export const PARAMS: readonly Param[] = [
     group: "context",
     scope: "both",
     def: 0,
-    min: 0,
+    // `-1` means "keep everything", and the tip says so — the range must allow
+    // it or a user who types the documented value silently gets `0` (keep
+    // nothing) instead. Same pattern as `repeatLastN`, which already ships
+    // `min: -1` for exactly this reason.
+    min: -1,
     max: 100000,
     advanced: true,
     tip:

@@ -29,6 +29,7 @@ import {
   ctxOverride,
   currentModel,
   foundPrereqs,
+  hwSnapshot,
   measuredCtx,
   paramBlocker,
   placements,
@@ -329,7 +330,16 @@ export function startServer(): Promise<void> {
     autoFit: cfg.autoOptimal && !ctxOverride(),
     lowPriority: cfg.lowPriority,
     shape: modelShape(model?.meta ?? null),
-    cardFreeB: hw.gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB)),
+    // The cards llama.cpp will see, not every card the machine has. Both readers
+    // of this index into it by a position that excludes the others: the fit
+    // ladder reads `CUDA1` out of llama.cpp's own error, and `plan` lines it up
+    // with `hwSnapshot().gpus`. Taken from the raw `hw.gpus` it was a list with
+    // this machine's AMD iGPU in it — harmless while the NVIDIA cards happen to
+    // sort first, and an off-by-one attributing card 1's memory to card 0 the
+    // moment they do not.
+    cardFreeB: hwSnapshot().gpus.map((g) =>
+      Math.max(0, g.vramTotalB - g.vramUsedB)
+    ),
   }).then(() => {});
 }
 

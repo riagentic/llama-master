@@ -62,19 +62,42 @@ export function argv(
   return out;
 }
 
+/** Shell-safe without quoting — the set `quote` leaves untouched. */
+const SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
 /** POSIX-quote a single argv token for display and for copy-paste. */
 export function quote(token: string): string {
   if (token === "") return "''";
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(token)) return token;
+  if (SAFE.test(token)) return token;
   return `'${token.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * One token, quoted for display — with the user's home compacted to `$HOME`.
+ *
+ * Presentation only: the argv that is SPAWNED keeps the absolute path. The
+ * copy-pasted line still runs identically because an unquoted `$HOME` expands
+ * back to the same absolute path in any POSIX shell — which is also why the
+ * compaction only applies when the remainder needs no quoting: quotes would
+ * silence the `$HOME` and paste a path that does not exist. A path that needs
+ * quoting keeps its absolute spelling instead.
+ */
+function displayToken(token: string, home: string): string {
+  if (home.length > 1 && (token === home || token.startsWith(home + "/"))) {
+    const rest = token.slice(home.length);
+    if (rest === "" || SAFE.test(rest)) return "$HOME" + rest;
+  }
+  return quote(token);
 }
 
 /** The copy-pasteable one-liner shown read-only in the UI. */
 export function commandLine(
   target: Target,
-  opts: { bin: string; model: string; settings: Settings },
+  opts: { bin: string; model: string; settings: Settings; home?: string },
 ): string {
-  return argv(target, opts).map(quote).join(" ");
+  return argv(target, opts).map((t) => displayToken(t, opts.home ?? "")).join(
+    " ",
+  );
 }
 
 /** Is an argv token a flag rather than a value? A value, even a numeric one,
@@ -91,9 +114,9 @@ function isFlag(token: string): boolean {
  *  marker. Long llama.cpp invocations are unreadable on one line. */
 export function commandBlock(
   target: Target,
-  opts: { bin: string; model: string; settings: Settings },
+  opts: { bin: string; model: string; settings: Settings; home?: string },
 ): string[] {
-  const parts = argv(target, opts).map(quote);
+  const parts = argv(target, opts).map((t) => displayToken(t, opts.home ?? ""));
   const lines: string[] = [];
   let cur = parts.shift() ?? "";
   while (parts.length) {

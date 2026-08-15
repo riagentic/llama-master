@@ -41,6 +41,7 @@ import type { Placement, Tuning } from "../lib/tune.ts";
 import { CtxControls } from "./CtxControls.tsx";
 import { ChatMessage } from "./ChatMessage.tsx";
 import { CommandPanel } from "./CommandView.tsx";
+import { SetupPanel } from "./SetupView.tsx";
 import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
 import { ReserveControls } from "./ReserveControls.tsx";
 import { MemoryDetail } from "./MemoryDetail.tsx";
@@ -1051,6 +1052,12 @@ export function OnePage() {
              wrapped anyway, stealing a band of height from every page. Here it
              is a section like the rest, beside the settings that compose it. */
         }
+        {
+          /* The same setup the Server page spells out, paid for in chips
+             rather than rows — this column is a budget. Hover a chip for the
+             sentence. */
+        }
+        <SetupPanel t="one-setup" compact />
         <CommandPanel t="one-cmd" targets={["server"]} />
       </div>
 

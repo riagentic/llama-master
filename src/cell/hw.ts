@@ -22,6 +22,10 @@ export type HwState = {
   /** Where this install actually lives — `paths()` honours LLAMA_MASTER_HOME,
    *  so a page must print these rather than a hardcoded `~/.llama-master`. */
   appPaths: { home: string; builds: string; cache: string } | null;
+  /** The user's OS home directory (`$HOME`) — for DISPLAY compaction of the
+   *  long absolute paths in the command view. "" until read; the compaction
+   *  simply stays off, which is honest rather than wrong. */
+  osHome: string;
   os: string;
   arch: string;
   /** Previous `/proc/stat` samples — the other half of the utilization delta. */
@@ -47,6 +51,8 @@ export type HwState = {
 };
 
 export const hw = cell("hw", {
+  // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
+  transaction: false,
   // Live telemetry is worthless after a restart, and persisting it would write
   // to SQLite every second for no reader.
   persist: "none",
@@ -57,6 +63,7 @@ export const hw = cell("hw", {
     disks: [] as Disk[],
     lanIps: [] as string[],
     appPaths: null as HwState["appPaths"],
+    osHome: "",
     os: "",
     arch: "",
     prevStat: "",
@@ -85,6 +92,7 @@ export const hw = cell("hw", {
           return { home: p.home, builds: p.builds, cache: p.cache };
         });
         s.appPaths = app;
+        s.osHome = io.osHome();
         const models = await import("./models.server.ts").then((m) =>
           m.defaultDirs()
         );

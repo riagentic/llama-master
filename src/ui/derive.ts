@@ -44,6 +44,8 @@ import {
 import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
+import { setupRows } from "../lib/setup.ts";
+import type { SetupRow } from "../lib/setup.ts";
 import { num, str } from "../lib/params.ts";
 import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
@@ -270,6 +272,15 @@ export function shownSettings(): Settings {
   return srv.runSettings ?? cfg.settings;
 }
 
+/**
+ * The shown configuration in words — the command's flags, humanly readable.
+ * Same sources as the command view, so the two cannot disagree: a running
+ * server's rows describe what it was STARTED with.
+ */
+export function shownSetup(): SetupRow[] {
+  return setupRows(shownModel()?.meta ?? null, shownSettings(), hwSnapshot());
+}
+
 /** The model the memory view should describe — the running one while it runs. */
 export function shownModel(): Model | null {
   const path = srv.runModel;
@@ -313,9 +324,19 @@ export function currentStatePlan(): Plan {
     // our share out of "everyone else" first. Our buckets do not depend on what
     // anyone else holds, so the first pass is only there to size us.
     const raw = computePlan(m, hwSnapshot(), srv.runSettings, "running");
+    // VRAM: only when there is nothing better. `withoutOurUsage` divides our
+    // footprint across the cards BY PROPORTION of what each already holds,
+    // which is a guess about the one thing the machine can be asked directly —
+    // free-at-spawn against free-now, per card (`srv.runCardFreeB`). When that
+    // baseline is present `plan` does the subtraction itself, exactly, and
+    // taking a proportional share out here first would remove those bytes
+    // twice. RAM has no per-card question and keeps the measured RSS either way.
+    const cardFreeB = srv.runCardFreeB;
+    const perCard = cardFreeB.length === hwSnapshot().gpus.length &&
+      cardFreeB.some((b) => b > 0);
     const base = withoutOurUsage(
       hwSnapshot(),
-      raw.vram.usedB,
+      perCard ? 0 : raw.vram.usedB,
       srv.rssB || raw.ram.usedB,
     );
     // "running", so the fitter does not re-litigate a placement llama.cpp has
@@ -324,7 +345,7 @@ export function currentStatePlan(): Plan {
     // a loaded model came up short and this panel announced "1010 MB of layers
     // have nowhere to go" while `vram.overB` read 0 beside it and the model
     // answered prompts (`src/lib/plan.ts:PlanQuestion`).
-    return computePlan(m, base, srv.runSettings, "running");
+    return computePlan(m, base, srv.runSettings, "running", cardFreeB);
   }
   return computePlan(NO_MODEL, hwSnapshot(), { ...cfg.settings, ngl: 0 });
 }
@@ -531,7 +552,15 @@ export function perTokenBytes(): { gpuB: number; ramB: number } | null {
   if (!m) return null;
   const p = projectedStatePlan();
   if (!p) return null;
-  return bytesPerToken(m, p, cfg.settings, p.ctx);
+  // The bytes must come from the SAME settings the plan was drawn from — which,
+  // with auto-optimal on, is the tuner's answer, not the stale map the user's
+  // panel still shows. Feeding `cfg.settings` here made the two halves of the
+  // page disagree about the same model: the memory bars drew the tuned
+  // placement (say 29 layers on the GPU) while the projected tokens/second was
+  // computed from the user's older `-ngl` (say 0, all in RAM), reporting a far
+  // slower speed than the placement actually shown would reach. Same bug the
+  // speed.ts fix addresses — plan and speed must describe one placement.
+  return bytesPerToken(m, p, projectedSettings(), p.ctx);
 }
 
 /** Tokens per second these settings should reach, and whether it is measured. */

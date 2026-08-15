@@ -16,6 +16,7 @@ import {
 import { Empty, ErrorNote, KV, LogView, Panel, Pill } from "./kit.tsx";
 import { Guidance } from "./Guidance.tsx";
 import { CommandPanel } from "./CommandView.tsx";
+import { SetupPanel } from "./SetupView.tsx";
 import { activeBuild, currentModel, serverRunning } from "./derive.ts";
 
 /**
@@ -235,6 +236,12 @@ export function ServerPanel() {
              implementation, so the command on this page cannot disagree with
              the command on that one. */
         }
+        {
+          /* The same flags as sentences — a running server's rows describe
+             what it was started with, exactly like the command above them. */
+        }
+        <SetupPanel t="server-setup" />
+
         <CommandPanel t="server-cmd" />
 
         <ServerLog rows={18} />

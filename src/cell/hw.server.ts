@@ -172,8 +172,12 @@ export async function mem(): Promise<Mem | null> {
     : null;
 }
 
+// The column list is a CONTRACT with the wasm parser (`rust/src/sys.rs:gpu`),
+// which reads by position and documents this exact order. It had drifted:
+// `compute_cap` was in the parser's spec and not in the query, so every card
+// reported capability 0 — 12.0 on the Blackwell cards this was found on.
 const NVIDIA_QUERY = [
-  "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.used,power.draw,power.limit",
+  "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.used,power.draw,power.limit,compute_cap",
   "--format=csv,noheader,nounits",
 ];
 
@@ -290,6 +294,18 @@ async function amdSysfs(): Promise<{
  * dial, and `0.0.0.0` is not one (`src/lib/lan.ts`). Ordering is the OS's, and
  * the choosing is `pickLanIp`'s; this only reads.
  */
+/** The user's home directory, for `$HOME` display compaction — the SHELL's
+ *  `$HOME`, which is why this reads the environment rather than a platform
+ *  API: the copied command expands `$HOME` to exactly this value or not at
+ *  all. "" (no compaction) when the platform does not set one. */
+export function osHome(): string {
+  try {
+    return Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export function lanAddresses(): string[] {
   try {
     return Deno.networkInterfaces()

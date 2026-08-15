@@ -22,6 +22,7 @@ import { CtxControls } from "./CtxControls.tsx";
 import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
 import { ReserveControls } from "./ReserveControls.tsx";
 import { CommandPanel } from "./CommandView.tsx";
+import { SetupPanel } from "./SetupView.tsx";
 import {
   changedCount,
   ctxOverride,
@@ -318,6 +319,7 @@ export function TunePanel() {
                control it reflects is a preview nobody reads. */
           }
           <CommandPanel t="tune-cmd" />
+          <SetupPanel t="tune-setup" />
           {cfg.reasons.length > 0
             ? (
               <Panel

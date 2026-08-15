@@ -232,11 +232,14 @@ export function Ring(props: {
 }) {
   const size = props.size ?? 62;
   const v = Math.max(0, Math.min(100, props.value));
+  // A 44px dial has a ~28px hole; the default centre type is sized for the
+  // 62px dial, and its digits sat ON the track (the all-in-one vitals).
+  const small = size <= 48;
   return (
     <div
       class={`ring-wrap tone-${props.tone ?? "accent"}${
         props.hideLabel ? " no-label" : ""
-      }`}
+      }${small ? " ring-sm" : ""}`}
       title={props.label}
     >
       <svg class="ring" viewBox="0 0 36 36" width={size} height={size}>

@@ -51,13 +51,17 @@ import { meta } from "./fixtures.ts";
 import { hw } from "../src/cell/hw.ts";
 import { devices, isEnabled } from "../src/lib/gpu.ts";
 import { plan as computePlan, withoutOurUsage } from "../src/lib/plan.ts";
+import { bytesPerToken } from "../src/lib/speed.ts";
+import { str } from "../src/lib/params.ts";
 import {
   activeBuild,
   currentStatePlan,
   headroomNow,
   hwSnapshot,
   paramBlocker,
+  perTokenBytes,
   planningHw,
+  projectedSettings,
   projectedStatePlan,
 } from "../src/ui/derive.ts";
 import { chat } from "../src/cell/chat.ts";
@@ -752,6 +756,12 @@ testUI(
 );
 
 testUI(App, "a workable selection says so, plainly", async (ui_) => {
+  // Settle first, for the reason spelled out on the test above: `ui.tab` is
+  // persisted and rehydrates asynchronously, so a rail click issued before that
+  // lands is reverted to whatever the previous test left in the store — and the
+  // assertions below then describe some other tab. Measured at roughly one run
+  // in six of the full suite, and never once when this file runs alone.
+  await ui_.settle();
   ui_.App["tab-build"].click();
   await ui_.settle();
   await prereq.scan();
@@ -3008,6 +3018,21 @@ testUI(
           : projected.layersOnGpu,
       );
 
+      // The projected speed must describe the SAME placement the bars draw.
+      // With auto-optimal on, `projectedStatePlan` uses the tuner's settings.
+      // `perTokenBytes` must follow that projected map, not the stale `cfg`
+      // map the panel still holds — a regression passed `cfg.settings` here, so
+      // a cache type or -nkvo the tuner had since rewritten re-billed the KV
+      // between pools and the projected tok/s disagreed with the bars.
+      const ps = projectedSettings();
+      const pps = projectedStatePlan();
+      assertExists(pps);
+      const pb = perTokenBytes();
+      assertExists(pb);
+      const expected = bytesPerToken(m.meta!, pps, ps, pps.ctx);
+      assertEquals(pb.gpuB, expected.gpuB);
+      assertEquals(pb.ramB, expected.ramB);
+
       // With auto-optimal OFF the user's own settings are what Start runs, so
       // those are what gets projected — including a stale-looking one they
       // typed on purpose.
@@ -3021,6 +3046,58 @@ testUI(
       // will run rather than as it reads (`src/lib/devsplit.ts:offloadRange`).
       assertEquals(own.layersOnGpu, 0);
       await cfg.toggleAutoOptimal();
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "the projected speed follows the tuner's settings, not a stale cache type",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await ui_.settle();
+
+      // With auto-optimal ON, what Start would run is the TUNER's settings.
+      // Leave a STALE q8_0 cache in the panel — as if a previous model had set
+      // it — and confirm the projected speed uses the tuner's f16 (which it
+      // chooses on this roomy machine), not the stale map that is still on
+      // screen. The bug this pins: `perTokenBytes` used to read `cfg.settings`
+      // for the KV geometry while `projectedStatePlan` used the tuner's map,
+      // so the two halves of the page disagreed about the same cache — the
+      // speed projection billed ~2x the KV read the bars drew.
+      const all = placements();
+      assertExists(all, "the tuner has an answer");
+      assertEquals(
+        str(all.vram.settings, "cacheTypeK"),
+        "f16",
+        "the roomy fixture should keep an f16 cache (this makes the divergence real)",
+      );
+      await cfg.set("cacheTypeK", "q8_0");
+      await cfg.set("cacheTypeV", "q8_0");
+      await ui_.settle();
+
+      const ps = projectedSettings();
+      const pps = projectedStatePlan();
+      assertExists(pps);
+      const pb = perTokenBytes();
+      assertExists(pb);
+      const expected = bytesPerToken(m.meta!, pps, ps, pps.ctx);
+      assertEquals(pb.gpuB, expected.gpuB);
+      assertEquals(pb.ramB, expected.ramB);
+      // The stale q8_0 must not win: the projected bytes are the f16 cache's.
+      const stale = bytesPerToken(m.meta!, pps, cfg.settings, pps.ctx);
+      assert(
+        expected.totalB > stale.totalB,
+        `projecting the stale q8_0 cache would under-state the KV read: ` +
+          `${expected.totalB} vs ${stale.totalB}`,
+      );
     });
   },
 );

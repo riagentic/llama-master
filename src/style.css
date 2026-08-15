@@ -433,6 +433,14 @@ body {
   color: var(--warn);
 }
 
+/* The all-in-one setup: every fact of the running configuration as one
+   wrapping row of chips — the full sentence lives in each chip's hover. */
+.setup-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -1022,6 +1030,18 @@ input[type="checkbox"] {
   color: var(--text-faint);
   text-align: center;
   display: block;
+}
+
+/* A small dial (the 44px all-in-one vitals) scales its centre down with it:
+   at the default sizes the number and the stacked % were ~28px of type inside
+   a ~28px hole, and the digits sat on the ring track. */
+.ring-wrap.ring-sm .ring-text b {
+  font-size: var(--fs-sm);
+}
+
+.ring-wrap.ring-sm .ring-text small {
+  font-size: calc(var(--fs) * 0.6);
+  line-height: 1;
 }
 
 .ring-label {

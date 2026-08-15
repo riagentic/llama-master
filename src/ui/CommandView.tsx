@@ -16,6 +16,7 @@
 // since.
 
 import { cfg } from "../cell/cfg.ts";
+import { hw } from "../cell/hw.ts";
 import { ui } from "../cell/ui.ts";
 import { commandBlock } from "../lib/command.ts";
 import { cliBin, serverBin } from "./actions.ts";
@@ -32,6 +33,9 @@ function commandFor(target: "server" | "cli"): string[] {
     bin,
     model: model?.path ?? "",
     settings: shownSettings(),
+    // Display compaction only: `$HOME/...` reads shorter and pastes back to
+    // the same absolute path. The spawned argv is untouched.
+    home: hw.osHome,
   });
 }
 

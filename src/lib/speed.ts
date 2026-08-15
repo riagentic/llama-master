@@ -24,6 +24,7 @@
 import type { ModelMeta, Settings } from "./types.ts";
 import { kvTotal, whole } from "./plan.ts";
 import type { Plan } from "./plan.ts";
+import { offloadRange, slotOnGpu } from "./devsplit.ts";
 import { num, str } from "./params.ts";
 
 /**
@@ -84,9 +85,18 @@ export function bytesPerToken(
   // embedding table is a LOOKUP — one row per token, a few KB — so billing the
   // whole table would inflate bytes/token by hundreds of MB on a large-vocab
   // model and teach `calibrate` a bandwidth off by the same phantom bytes.
-  // Placement matches plan.ts: the ends move only on full offload (ngl > nLayer).
+  // Placement must match plan.ts exactly, and it did not. plan.ts offloads the
+  // output head whenever `-ngl >= 1`: the head is the LAST slot, and there are
+  // `nLayer + 1` of them, so `-ngl 1` offloads the head and nothing else
+  // (`devsplit.ts:offloadRange`). speed.ts only billed it to the GPU at
+  // `ngl > nLayer`, so at every partial offload the two halves of the page
+  // disagreed about the same ~300 MB — the memory map drew the head in VRAM
+  // while the projected tokens/second still read it from RAM, which skewed the
+  // estimate toward "slower than it will be". Reading the same `slotOnGpu` the
+  // planner uses makes the speed projection describe the placement the bars
+  // draw, whatever the `-ngl`.
   const ends = whole(meta.outputBytes);
-  if (num(s, "ngl") > nLayer && nLayer > 0) gpuB += ends;
+  if (nLayer > 0 && slotOnGpu(nLayer, offloadRange(nLayer, s))) gpuB += ends;
   else ramB += ends;
 
   // The KV cache is read in whole every token — except a sliding-window

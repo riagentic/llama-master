@@ -32,10 +32,12 @@ import {
 import {
   computeScratch,
   effectiveCtx,
+  kvLayers,
   kvPerToken,
   kvTotal,
   NO_MODEL,
   plan,
+  recurrentStateB,
   scratchFloor,
   swaSplit,
   withoutOurUsage,
@@ -137,6 +139,7 @@ import {
 } from "../src/lib/backend.ts";
 import { diagnoseFailure, diagnoseNoAsset } from "../src/lib/diagnose.ts";
 import { isNearBottom, stickToBottom } from "../src/lib/scroll.ts";
+import { setupRows } from "../src/lib/setup.ts";
 import { parseDf, tooFullToBuild } from "../src/lib/disk.ts";
 import { demoCpu, demoGpus, demoMem, demoModels } from "../src/lib/demo.ts";
 import {
@@ -261,6 +264,22 @@ Deno.test("params: coerce clamps, rejects NaN, and keeps types", () => {
   assertEquals(coerce(mlock, "false"), false);
 });
 
+Deno.test("params: a range that the tip documents is actually reachable", () => {
+  // The `keep` tip says "-1 keeps all of them"; a control whose `min` clamps
+  // -1 to 0 would silently turn "keep everything" into "keep nothing", with no
+  // error on screen. The documented value has to be inside the range.
+  const keep = param("keep")!;
+  assertEquals(
+    coerce(keep, "-1"),
+    -1,
+    "-1 must survive coerce, the tip names it",
+  );
+  assert(
+    keep.min !== undefined && keep.min <= -1,
+    "min must not clamp -1 away",
+  );
+});
+
 Deno.test("params: typed readers fall back to catalog defaults", () => {
   assertEquals(num({}, "ctxSize"), 4096);
   assertEquals(str({}, "host"), "127.0.0.1");
@@ -365,6 +384,126 @@ Deno.test("command: quoting survives spaces and single quotes", () => {
     settings: defaults(),
   });
   assertStringIncludes(line, "s -m '/my models/a.gguf'");
+});
+
+Deno.test("command: the home prefix compacts to $HOME, and only where a shell would expand it", () => {
+  const home = "/home/dev";
+  const opts = {
+    bin: `${home}/.llama-master/data/files/builds/cuda/bin/llama-server`,
+    model: `${home}/.lmstudio/models/q/Qwen3.8-27B-Q8_0.gguf`,
+    settings: defaults(),
+  };
+  // Display compaction: both the one-liner and the block show `$HOME/…`,
+  // which pastes back to the identical absolute path.
+  const line = commandLine("server", { ...opts, home });
+  assertStringIncludes(
+    line,
+    "$HOME/.llama-master/data/files/builds/cuda/bin/llama-server",
+  );
+  assertStringIncludes(
+    line,
+    "-m $HOME/.lmstudio/models/q/Qwen3.8-27B-Q8_0.gguf",
+  );
+  const block = commandBlock("server", { ...opts, home });
+  assertStringIncludes(block[0] ?? "", "$HOME/");
+  // No home given (or not yet read): nothing changes.
+  assertStringIncludes(commandLine("server", opts), opts.bin);
+  // A path that needs quoting keeps its absolute spelling — quotes would
+  // silence the `$HOME` and paste a path that does not exist.
+  const spaced = commandLine("server", {
+    ...opts,
+    model: `${home}/my models/a.gguf`,
+    home,
+  });
+  assertStringIncludes(spaced, `-m '${home}/my models/a.gguf'`);
+  // Prefix means PATH prefix: `/home/devote/…` is not under `/home/dev`.
+  const sibling = commandLine("server", {
+    ...opts,
+    model: "/home/devote/a.gguf",
+    home,
+  });
+  assertStringIncludes(sibling, "-m /home/devote/a.gguf");
+});
+
+Deno.test("setup: the flags come back as sentences, and they follow the settings", () => {
+  // The tuned Qwen3.8-27B run: everything on the GPU, q8 cache, MTP drafting.
+  const m = meta({
+    nLayer: 65,
+    nCtxTrain: 262144,
+    nextnLayers: 1,
+    layers: layers(65, 400 * 1024 * 1024),
+  });
+  const machine = hw({ gpus: [gpu(24), gpu(24)] });
+  const s = {
+    ...defaults(),
+    ngl: 999,
+    ctxSize: 262144,
+    cacheTypeK: "q8_0",
+    cacheTypeV: "f16",
+    threads: 16,
+    threadsBatch: 16,
+    specType: "draft-mtp",
+    flashAttn: "on",
+    tensorSplit: "37.5,28.5",
+    port: 18080,
+  };
+  const rows = setupRows(m, s, machine);
+  const row = (label: string) =>
+    rows.find((r) => r.label === label)?.value ?? "(missing)";
+  assertEquals(row("GPU offload"), "all 65 layers + output head");
+  assertStringIncludes(row("CPU threads"), "16 generate · 16 batch");
+  assertStringIncludes(row("K cache type"), "q8_0");
+  assertStringIncludes(row("V cache type"), "f16");
+  assertStringIncludes(row("Context"), "262,144 tokens — the trained maximum");
+  assertStringIncludes(row("Speculative decoding"), "MTP");
+  assertStringIncludes(row("Tensor split"), "-ts 37.5,28.5");
+  // A port is an identifier: 18080, never 18,080.
+  assertStringIncludes(row("Listening on"), "127.0.0.1:18080");
+  assertStringIncludes(row("Listening on"), "this machine only");
+  // Rows that only matter when set stay out of the way.
+  assert(!rows.some((r) => r.label === "MoE experts on CPU"));
+  assert(!rows.some((r) => r.label === "KV cache placement"));
+
+  // The chip forms — same facts, fewest characters, for the all-in-one page.
+  const short = (label: string) =>
+    rows.find((r) => r.label === label)?.short ?? "(missing)";
+  assertEquals(short("GPU offload"), "GPU all 65+head");
+  assertEquals(short("CPU threads"), "t 16·16");
+  assertEquals(short("K cache type"), "K q8_0");
+  assertEquals(short("V cache type"), "V f16");
+  assertEquals(short("Context"), "ctx 262,144 max");
+  assertEquals(short("Speculative decoding"), "MTP");
+  assertEquals(short("Listening on"), "local :18080");
+  // Every row has one — the compact view may not come up blank anywhere.
+  for (const r of rows) assert(r.short.length > 0, r.label);
+
+  // Partial offload with experts held back, KV pinned to host, LAN bind.
+  const partial = setupRows(m, {
+    ...s,
+    ngl: 43,
+    nCpuMoe: 30,
+    noKvOffload: true,
+    host: "0.0.0.0",
+    tensorSplit: "",
+    specType: "",
+  }, machine);
+  const p = (label: string) =>
+    partial.find((r) => r.label === label)?.value ?? "(missing)";
+  // 43 slots = 42 layers + the output head; layer 0..22 stay on the host.
+  assertEquals(p("GPU offload"), "42 of 65 layers + output head");
+  assertStringIncludes(p("MoE experts on CPU"), "first 30 layers");
+  assertEquals(p("KV cache placement"), "system RAM (-nkvo)");
+  assertStringIncludes(p("Listening on"), "reachable from the LAN");
+  assertEquals(p("Speculative decoding"), "off");
+  assert(!partial.some((r) => r.label === "Tensor split"));
+
+  // CPU-only says so instead of counting to zero.
+  assertEquals(
+    setupRows(m, { ...s, ngl: 0 }, machine).find((r) =>
+      r.label === "GPU offload"
+    )?.value,
+    "off — CPU only",
+  );
 });
 
 Deno.test("command: the block form keeps each flag with its value", () => {
@@ -2860,6 +2999,71 @@ Deno.test("plan: a sliding-window model does not pay full context on every layer
   );
 });
 
+Deno.test("plan: a hybrid linear-attention model caches only its full-attention layers", () => {
+  // Qwen3.8-27B shape: 65 declared layers, but `full_attention_interval: 4`
+  // means only every 4th trunk layer holds a per-token KV cache — 16 of 64,
+  // plus the MTP block, which is dense attention. The other 48 are recurrent
+  // (gated delta net) and hold a constant per-sequence state. Billing all 65
+  // layers said a 131,072 context needs 18.5 GB of q8_0 cache on a model whose
+  // real cache is 4.9 GB — the difference between "does not fit in 48 GB of
+  // VRAM" and the 262,144 the same cards actually run.
+  const qwen = meta({
+    name: "Qwen3.8 27B shape",
+    arch: "qwen35",
+    nLayer: 65,
+    nCtxTrain: 262144,
+    nEmbd: 5120,
+    nHead: 24,
+    nHeadKv: 4,
+    keyLength: 256,
+    valueLength: 256,
+    fullAttnInterval: 4,
+    ssmDConv: 4,
+    ssmDInner: 6144,
+    ssmDState: 128,
+    ssmNGroup: 16,
+    nextnLayers: 1,
+    layers: layers(65, 400 * 1024 * 1024),
+  });
+  const dense = meta({ ...qwen, fullAttnInterval: 0 });
+  assertEquals(
+    kvLayers(qwen),
+    17,
+    "16 full-attention trunk layers + the MTP block",
+  );
+  assertEquals(kvLayers(dense), 65);
+
+  const s = { ...defaults(), ctxSize: 131072 };
+  const kvHybrid = kvTotal(qwen, s, 131072);
+  const kvDense = kvTotal(dense, s, 131072);
+  // 17/65 of the uniform figure, plus the small constant recurrent state.
+  const state = recurrentStateB(qwen, 1);
+  assertEquals(kvHybrid, kvDense * (17 / 65) + state);
+  // The state itself: 48 recurrent layers x (n_embd_r + n_embd_s) x f32 —
+  // (3 * (6144 + 2*16*128) + 128 * 6144) * 4 bytes = ~157 MB, per slot.
+  assertEquals(state, 48 * (3 * (6144 + 2 * 16 * 128) + 128 * 6144) * 4);
+  assertEquals(recurrentStateB(qwen, 4), state * 4, "each slot holds its own");
+  assertEquals(recurrentStateB(dense), 0, "no recurrent layers, no state");
+
+  // The per-token rate the UI shows follows the same split — 17 layers' worth.
+  const perTok = kvPerToken(qwen, s);
+  assertEquals(perTok, 17 * 4 * (256 * 2 + 256 * 2));
+  // At f16 and 131,072 tokens that is ~9.1 GB where uniform billing said 34.9.
+  assert(
+    kvHybrid < 10 * 1024 ** 3,
+    `hybrid cache is ${kvHybrid / 1024 ** 3} GB`,
+  );
+  assert(kvDense > 30 * 1024 ** 3);
+
+  // A quantised cache shrinks the per-token half and leaves the recurrent
+  // state alone — it is f32 in llama.cpp regardless of `-ctk`.
+  const q8 = { ...s, cacheTypeK: "q8_0", cacheTypeV: "q8_0" };
+  assertEquals(
+    kvTotal(qwen, q8, 131072),
+    kvDense * (17 / 65) * (34 / 64) + state,
+  );
+});
+
 Deno.test("plan: an MLA model caches a latent, not one entry per head", () => {
   // DeepSeek-V2/V3 compress the cache to a rank-512 latent plus a 64-wide RoPE
   // part, per layer. Billing 128 heads x (192 + 128) overstated V3 ~70x.
@@ -3731,15 +3935,42 @@ Deno.test("speed: the embedding table is a lookup, not a per-token read", () => 
 Deno.test("speed: ends placement agrees with the planner at the boundary", () => {
   const m = meta();
   const machine = hw({ gpus: [gpu(80)] });
-  // ngl == nLayer: plan.ts bills the ends to the CPU (full offload is >, not
-  // >=). The speed estimate must place them the same way or the two halves of
-  // the page disagree about the same bytes.
-  const at = { ...defaults(), ngl: 32, ctxSize: 2048 };
+  // The output head is the LAST of `nLayer + 1` slots, so it moves to the GPU
+  // the moment `-ngl >= 1` — the planner's `slotOnGpu(nLayer, offloadRange)`.
+  // The speed estimate must place it the same way or the two halves of the page
+  // disagree about the same bytes at every partial offload.
+  const at = { ...defaults(), ngl: 32, ctxSize: 2048 }; // ngl == nLayer
   const bAt = bytesPerToken(m, plan(m, machine, at), at, 0);
-  assert(bAt.ramB >= m.outputBytes, `ends stay on CPU at ngl==nLayer`);
-  const past = { ...defaults(), ngl: 999, ctxSize: 2048 };
-  const bPast = bytesPerToken(m, plan(m, machine, past), past, 0);
-  assertEquals(bPast.ramB, 0);
+  assert(bAt.gpuB >= m.outputBytes, `head is on the GPU at ngl==nLayer`);
+  const zero = { ...defaults(), ngl: 0, ctxSize: 2048 };
+  const bZero = bytesPerToken(m, plan(m, machine, zero), zero, 0);
+  assert(
+    bZero.ramB >= m.outputBytes,
+    "and stays in RAM with the GPU idle",
+  );
+  // Speed and planner must never disagree about where the head lives, for any
+  // `-ngl`. The two halves of the page describe the same placement.
+  for (const ngl of [0, 1, 16, 31, 32, 33, 999]) {
+    const s = { ...defaults(), ngl, ctxSize: 2048 };
+    const p = plan(m, machine, s);
+    const layersAttention = p.layersOnGpu * 128 * 1024 ** 2;
+    const planHeadOnGpu = (p.vram.buckets.find((b) =>
+      b.key === "weights"
+    )?.bytes ?? 0) >
+      layersAttention;
+    const b = bytesPerToken(m, p, s, 0);
+    const speedHeadOnGpu = b.gpuB > layersAttention;
+    assertEquals(
+      speedHeadOnGpu,
+      planHeadOnGpu,
+      `head placement agrees at ngl=${ngl}`,
+    );
+    assertEquals(
+      slotOnGpu(m.nLayer, offloadRange(m.nLayer, s)),
+      planHeadOnGpu,
+      `planner's own rule at ngl=${ngl}`,
+    );
+  }
 });
 
 Deno.test("speed: a hostile header cannot poison the estimate", () => {
@@ -4055,6 +4286,49 @@ Deno.test("plan: a card is budgeted for the whole scratch, not its share", () =>
     working[0]!.computeB > poolScratch / 2,
     "and it is the whole scratch, not half of it",
   );
+});
+
+Deno.test("plan: per-card bytes never double-count the KV cache", () => {
+  // The per-card picture drew the KV twice. `slotCostsB` includes `kvPerLayerB`
+  // so the PACKER places the cache with its layers, but `loadPerDevice` over it
+  // also fed `card.weightsB` — and the card then added its own `kvB` on top.
+  // card0 + card1 exceeded the pool's "VRAM used" for the same plan by exactly
+  // the cache, so the two views disagreed about the identical machine.
+  //
+  // The weights are now re-derived from a KV-free array, so weights and KV
+  // reconcile with the pool to the byte; only the compute overhead is
+  // deliberately more on the pool (billed per device) than on the cards (which
+  // show 0 on an idle card), and that is the safe direction.
+  const MB = 1024 ** 2;
+  const m = meta({ nLayer: 40, layers: layers(40, 900 * MB) });
+  const machine = hw({ gpus: [gpu(24, 0.5), gpu(24, 0.5)], backend: "cuda" });
+  const p = plan(m, machine, { ...defaults(), ngl: 999, ctxSize: 16384 });
+
+  const poolKv = p.vram.buckets.find((b) => b.key === "kv")?.bytes ?? 0;
+  const cardKv = p.devices.cards.reduce((a, c) => a + c.kvB, 0);
+  assert(
+    Math.abs(poolKv - cardKv) < 1,
+    `pool KV ${poolKv} must equal the cards' ${cardKv} — they were doubled before`,
+  );
+
+  const poolWeights =
+    (p.vram.buckets.find((b) => b.key === "weights")?.bytes ?? 0) +
+    (p.vram.buckets.find((b) => b.key === "experts")?.bytes ?? 0);
+  const cardWeights = p.devices.cards.reduce((a, c) => a + c.weightsB, 0);
+  assert(
+    Math.abs(poolWeights - cardWeights) < 1,
+    `pool weights ${poolWeights} must equal the cards' ${cardWeights}`,
+  );
+
+  // And the card is not credited with more room than it has: its own free
+  // figure never exceeds its capacity minus what it is asked to hold.
+  for (const c of p.devices.cards) {
+    assert(
+      c.weightsB + c.kvB + c.computeB + c.otherB + c.reservedB + c.overB <=
+        c.capacityB + 1,
+      `${c.name} claims more than it holds`,
+    );
+  }
 });
 
 Deno.test("plan: a hand-typed -ts is the placement, not a suggestion", () => {
@@ -5000,6 +5274,88 @@ Deno.test("plan: a running placement is described, not re-litigated", () => {
   assertEquals(running.vram.usedB, proposed.vram.usedB);
   assertEquals(running.ram.usedB, proposed.ram.usedB);
   assertEquals(running.kvTotalB, proposed.kvTotalB);
+});
+
+/**
+ * The per-card picture of a LIVE run is a measurement, not the packer's guess.
+ *
+ * The report, from the machine this app is developed on: two cards holding
+ * 11.6 and 12.2 GB by nvidia-smi, and the panel drawing every byte of the model
+ * on GPU 0 and nothing at all on GPU 1. `packSlots` is first-fit, and with
+ * `--n-cpu-moe 42` every offloaded slot but one is attention-only — the whole
+ * 9.2 GB fits inside card 0, so it answered `[44, 0]`. Nothing was wrong with
+ * that as a PROPOSAL; it was never issued as one. No `-ts` is emitted when the
+ * packer needs none, so llama.cpp divided the layers by its own free-VRAM rule
+ * and used both cards. The panel was describing a placement that did not happen
+ * — and filing our own 12 GB on card 1 as somebody else's memory.
+ */
+Deno.test("plan: a live run's per-card bytes come from the measurement", () => {
+  const MB = 1024 * 1024;
+  const m = meta({
+    nLayer: 43,
+    nExpert: 256,
+    nExpertUsed: 8,
+    layers: layers(43, 40 * MB + 2500 * MB, 2500 * MB),
+  });
+  const s = { ...defaults(), ngl: 999, nCpuMoe: 42, ctxSize: 8192 };
+  // Both cards hold 12 GB of the 24 they have. llama.cpp put half the layers on
+  // each; the packer, left to itself, would have put all of them on card 0.
+  const machine = hw({ gpus: [gpu(24, 12), gpu(24, 12)], backend: "cuda" });
+  // Free per card when this run was spawned: 23.5 GB each, so we took 11.5.
+  const atStart = [23.5 * 1024 ** 3, 23.5 * 1024 ** 3];
+
+  const guessed = plan(m, machine, s, "running");
+  assertEquals(
+    guessed.devices.bytesB[1],
+    0,
+    "without the baseline this is the packer's first fit — card 1 gets nothing",
+  );
+
+  const measured = plan(m, machine, s, "running", atStart);
+  assert(
+    (measured.devices.bytesB[1] ?? 0) > 0,
+    `card 1 holds bytes and the plan must say so: ${
+      JSON.stringify(measured.devices.bytesB)
+    }`,
+  );
+  const c1 = measured.devices.cards[1]!;
+  assert(
+    c1.weightsB + c1.kvB + c1.computeB > 0,
+    "and they are drawn as ours, in the map's own bands",
+  );
+  // The whole point: our bytes stop being counted as another process's.
+  assert(
+    c1.otherB < guessed.devices.cards[1]!.otherB,
+    `our own memory must leave "in use elsewhere": ${c1.otherB} vs ${
+      guessed.devices.cards[1]!.otherB
+    }`,
+  );
+  // Each card's total is the measurement, to the byte — the bands inside it are
+  // apportioned, the card total is not.
+  assertEquals(
+    measured.devices.bytesB.map(Math.round),
+    [11.5 * 1024 ** 3, 11.5 * 1024 ** 3],
+    "free-at-spawn minus free-now, per card",
+  );
+});
+
+/** The baseline is only trusted when it can be lined up with the cards. A list
+ *  that names a different number of them is an index mismatch — this machine
+ *  has an AMD iGPU that a CUDA build filters out — and attributing card 2's
+ *  memory to card 1 would be worse than the guess it replaces. */
+Deno.test("plan: a per-card baseline of the wrong length is ignored", () => {
+  const MB = 1024 * 1024;
+  const m = meta({ nLayer: 32, layers: layers(32, 300 * MB) });
+  const s = { ...defaults(), ngl: 999, ctxSize: 4096 };
+  const machine = hw({ gpus: [gpu(24, 8), gpu(24, 8)], backend: "cuda" });
+  const short = plan(m, machine, s, "running", [23 * 1024 ** 3]);
+  const none = plan(m, machine, s, "running");
+  assertEquals(short.devices.bytesB, none.devices.bytesB);
+  assertEquals(short.vram.usedB, none.vram.usedB);
+  // And a baseline that recorded nothing (an adopted server) is not a machine
+  // with an empty model on it.
+  const zeroes = plan(m, machine, s, "running", [0, 0]);
+  assertEquals(zeroes.devices.bytesB, none.devices.bytesB);
 });
 
 /** And real pressure on a live run still lands: when the MEASUREMENT says the
