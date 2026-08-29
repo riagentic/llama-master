@@ -1,7 +1,7 @@
 {
   "name": "llama-master-client",
   "title": "llama.master client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": "./src/app.ts",
   "nodeModulesDir": "auto",
   "compilerOptions": {

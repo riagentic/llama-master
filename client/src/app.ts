@@ -13,7 +13,6 @@ import { ui } from "./cell/ui.ts";
 
 await aio.run({
   appId: "llama-master-client",
-  appVersion: "0.1.0",
   cells: [conn, chat, ui],
   // Boot fails loudly if a cell was defined but not listed — a cell that is
   // imported and unregistered dispatches into the void.
@@ -26,8 +25,6 @@ await aio.run({
       "conn:discover": { effect: 60_000, timeout: 120_000 },
       // Four small GETs against a machine that may be busy generating.
       "conn:poll": { effect: 8_000, timeout: 15_000 },
-      // A reply is as long as the model needs; that is the product.
-      "chat:send": { effect: 600_000, timeout: 1_800_000 },
     },
   },
   ui: {

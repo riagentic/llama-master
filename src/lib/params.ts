@@ -54,6 +54,26 @@ export const PARAMS: readonly Param[] = [
       "Keep the routed-expert tensors of the first N layers in system RAM while attention stays on the GPU. On a mixture-of-experts model this is usually far faster than dropping whole layers: attention is bandwidth-bound and tiny, the experts are huge and only a few fire per token.",
   },
   {
+    key: "fit",
+    flag: "--fit",
+    label: "llama.cpp auto-fit",
+    kind: "enum",
+    group: "offload",
+    scope: "both",
+    def: "off",
+    // Upstream defaults to ON (common.h: fit_params = true): llama-server
+    // quietly adjusts whatever the command line left unset to fit device
+    // memory. This app IS that fitter — the plan, the packer and the fit
+    // ladder — and its promise is that the command shown is the command that
+    // runs, so the flag is always emitted. Upstream's own fitter also
+    // segfaults on DeepSeek-V4-Flash, which is why the retry ladder exists.
+    llamaDef: "on",
+    options: ["off", "on"],
+    advanced: true,
+    tip:
+      "Let llama.cpp resize unset options to fit free device memory. Off (recommended): this app already plans the placement, and what you see is what runs. On: llama.cpp may silently change settings the command does not pin.",
+  },
+  {
     key: "splitMode",
     flag: "-sm",
     label: "Split mode",

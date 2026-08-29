@@ -167,6 +167,12 @@ function cacheBytes(type: string): number {
  * it keeps its cache. Qwen3.8-27B: 65 declared layers, 17 with a KV cache —
  * billing all 65 said "128k does not fit in 48 GB of VRAM" about a model that
  * runs there at its full 262,144.
+ *
+ * qwen4exp (Qwen3.8-Flash-Next) follows the same rule — trunk layer i is full
+ * attention iff (i + 1) % interval == 0, `models/qwen4exp.cpp` — with the
+ * interval defaulted to 4 by the READER when the header omits it, because for
+ * that architecture llama.cpp hardcodes the default (`rust/src/gguf.rs`).
+ * Verified against the real 111 GB model: 48 layers, 12 with a KV cache.
  */
 export function kvLayers(meta: ModelMeta): number {
   const nLayer = whole(meta.nLayer);
@@ -185,6 +191,12 @@ export function kvLayers(meta: ModelMeta): number {
  * element, per recurrent layer, per server slot. Does not grow with the
  * context and is never quantised by `-ctk` — which is why it is its own term
  * rather than part of the per-token rate. ~157 MB on Qwen3.8-27B at one slot.
+ *
+ * qwen4exp's single PLE layer keeps one extra conv-history row per sequence
+ * (`ple_conv_state`, llama-hparams.cpp) that is NOT billed here: on
+ * Qwen3.8-Flash-Next it is (4−1) × 3 × 4 × 2560 × 4 B ≈ 0.35 MB — under the
+ * rounding of every figure this feeds. Worth revisiting only if an arch with
+ * many PLE layers appears; llama.cpp itself asserts exactly one today.
  */
 export function recurrentStateB(meta: ModelMeta, seqs = 1): number {
   const nLayer = whole(meta.nLayer);
@@ -341,6 +353,8 @@ export const NO_MODEL: ModelMeta = {
   ssmNGroup: 0,
   nextnLayers: 0,
   nExpert: 0,
+  nFf: 0,
+  nFfExp: 0,
   nExpertUsed: 0,
   ropeFreqBase: 0,
   nTensors: 0,
@@ -543,6 +557,23 @@ export function plan(
   // panel said one (`params.ts:parallel`, `types.ts:Param.llamaDef`).
   const slots = Math.max(1, num(s, "parallel"));
   const activation = ubatch * whole(meta.nEmbd) * 4;
+  // The widest matmul in the prefill graph is the FFN, not the embedding: a
+  // gate and an up projection at `n_ff` wide (the fired experts' combined
+  // width on a MoE), f32. At `-ub 512` this is noise next to the flat backend
+  // cost; at `-ub 4096` it dominates, and an estimate built on `n_embd` alone
+  // under-billed it ~4x — which matters now that the tuner may SPEND headroom
+  // on a bigger micro-batch (`tune.ts`). Gated off for sparse-attention
+  // models: their scratch is measured end to end (`computeScratch`),
+  // micro-batch term included, and stacking an estimate on a measurement
+  // would refuse placements the machine runs.
+  const declaredFf = Math.max(
+    whole(meta.nFf),
+    whole(meta.nFfExp) * whole(meta.nExpertUsed),
+  );
+  const ffWidth = declaredFf > 0 ? declaredFf : whole(meta.nEmbd) * 4;
+  const ffActivation = whole(meta.indexerTopK) > 0
+    ? 0
+    : ubatch * ffWidth * 4 * 2;
   const usingGpu = off.count > 0 && hw.gpus.length > 0;
 
   // Speculative decoding with the model's own MTP block costs a SECOND context —
@@ -564,7 +595,7 @@ export function plan(
   // is how a plan came to say "fits" on one line and "nowhere to go" on the
   // next. Per-device costs times the devices, plus the scratch once.
   const gpuCompute = usingGpu
-    ? (activation * 4 + BACKEND_CONTEXT_B + scratchFloor(meta)) *
+    ? (activation * 4 + ffActivation + BACKEND_CONTEXT_B + scratchFloor(meta)) *
         Math.max(1, hw.gpus.length) +
       mtpDraftB + computeScratch(meta, ubatch, ctx, slots)
     : 0;
@@ -572,7 +603,9 @@ export function plan(
   // half — it lands in RAM, where a tight MTP run is exactly the case that
   // cannot afford an unbilled block of KV.
   const cpuCompute =
-    (layersOnGpu < nLayer || !usingGpu ? activation * 2 : 32 * MB) +
+    (layersOnGpu < nLayer || !usingGpu
+      ? activation * 2 + ffActivation / 2
+      : 32 * MB) +
     (usingGpu ? 0 : mtpKvB);
 
   // Where each slot actually lands. The aggregate above says whether the model
@@ -601,7 +634,7 @@ export function plan(
   // is safe to promise is all of it.
   const scratchB = computeScratch(meta, ubatch, ctx, slots);
   const fixedPerDeviceB = usingGpu
-    ? BACKEND_CONTEXT_B + activation * 4 + scratchFloor(meta)
+    ? BACKEND_CONTEXT_B + activation * 4 + ffActivation + scratchFloor(meta)
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
 

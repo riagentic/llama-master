@@ -77,6 +77,13 @@ export type ModelMeta = {
   nextnLayers: number;
   nExpert: number;
   nExpertUsed: number;
+  /** Dense / per-expert feed-forward width (`feed_forward_length`,
+   *  `expert_feed_forward_length`). The prefill activations scale with the
+   *  widest matmul in the graph — the FFN, not the embedding — so the
+   *  compute-buffer estimate needs these before a large `-ub` can be billed
+   *  honestly (`plan.ts`). 0 = not declared. */
+  nFf: number;
+  nFfExp: number;
   ropeFreqBase: number;
   nTensors: number;
   tensorBytes: number;

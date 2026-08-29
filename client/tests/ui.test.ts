@@ -298,3 +298,79 @@ testUI(App, "every finished message can be copied on its own", async (ui_) => {
     await stub.close();
   }
 });
+
+testUI(
+  App,
+  "a message typed mid-reply becomes a chip, and the box stays open",
+  async (ui_) => {
+    // The far end streams slowly, which is the only state this feature is
+    // about: before it, the box was disabled for the whole reply and the
+    // follow-up had to be held in the user's head until the tokens stopped.
+    const stub = stubServer({
+      // Long enough that the mid-reply window is not a race: the test has to
+      // connect, type and click INSIDE it, and a reply that lands first turns
+      // the queue assertion below into a coin toss.
+      delayMs: 250,
+      reply: Array.from({ length: 12 }, (_, i) => ` word${i}`),
+    });
+    try {
+      await ui_.settle();
+      await conn.forget();
+      await chat.stop();
+      await chat.clear();
+      await chat.clearQueue();
+
+      ui_.App.host.setValue(stub.url);
+      ui_.App.connect.click();
+      await ui_.expectCell(conn, (s) => s.status === "connected");
+      await conn.poll();
+      await ui_.settle();
+
+      ui_.App.message.setValue("first");
+      await ui_.expectCell(chat, (s) => s.input === "first");
+      ui_.App.send.click();
+      await ui_.expectCell(chat, (s) => s.streaming);
+
+      // The box is still usable WHILE the reply streams — the whole feature.
+      assertEquals(
+        ui_.App.message.disabled,
+        false,
+        "the input is closed during a reply — that is the bug this fixes",
+      );
+      ui_.App.message.setValue("second, while it is busy");
+      await ui_.expectCell(chat, (s) => s.input === "second, while it is busy");
+      ui_.App.send.click();
+      await ui_.expectCell(chat, (s) => s.queue.length === 1);
+
+      const html = ui_.html();
+      assertStringIncludes(html, "second, while it is busy", "drawn as a chip");
+      assertStringIncludes(html, "1 message", "and counted");
+      assertStringIncludes(
+        html,
+        "this reply finishes",
+        "with what will collect it — a queue nothing is coming for reads stuck",
+      );
+      assertEquals(chat.input, "", "and the box is ready for the next thought");
+
+      // Then it sends itself, in order, with no further gesture. Two whole
+      // turns of a deliberately slow stream, so the wait is given a ceiling
+      // that matches what is actually being awaited.
+      await ui_.waitFor(
+        () => !chat.streaming && chat.queue.length === 0,
+        {
+          timeoutMs: 30_000,
+          msg: "the queue should drain itself once the first reply lands",
+        },
+      );
+      assertEquals(chat.messages.length, 4, "both turns completed");
+      assertEquals(chat.messages[0]?.content, "first");
+      assertEquals(chat.messages[2]?.content, "second, while it is busy");
+    } finally {
+      await chat.stop();
+      await chat.clearQueue();
+      await chat.clear();
+      await conn.forget();
+      await stub.close();
+    }
+  },
+);

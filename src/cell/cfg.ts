@@ -208,6 +208,12 @@ export const cfg = cell("cfg", {
       s.settings = defaults();
       s.reasons = [];
       s.touched = [];
+      // The pin is a setting the user typed, and it was just wiped out of
+      // `settings` with everything else — kept here it would survive as a
+      // hidden instruction, silently capping the next tune after a Reset that
+      // promised a clean slate.
+      s.ctxOverride = 0;
+      s.ctxOverrideFor = "";
     },
     resetOne(s, key: string) {
       const p = param(key);

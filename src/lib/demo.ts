@@ -91,6 +91,8 @@ function meta(over: Partial<ModelMeta>): ModelMeta {
     ssmDState: 0,
     ssmNGroup: 0,
     nextnLayers: 0,
+    nFf: 0,
+    nFfExp: 0,
     nExpert: 0,
     nExpertUsed: 0,
     ropeFreqBase: 500000,

@@ -13,7 +13,7 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.0-alpha55`**, vendored at `dep/aio` → symlink to
+- **Deno 2.9+ + aio `1.0.0-alpha71`**, vendored at `dep/aio` → symlink to
   `../../aio`. Never `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs
   index: `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must
   name the version the symlink actually resolves to — `deno task aiol` says so
@@ -114,10 +114,22 @@ Data flow worth knowing:
 - **GitHub's API is 60 requests/hour anonymous, and it WILL run out.** Every API
   call goes through `fetchJson`, which turns a quota 403 into a `RateLimited`
   error naming the reset time and `GITHUB_TOKEN`; `builds.server.ts` then falls
-  back to plain github.com pages (`/releases/latest` redirect for the tag,
-  `/releases/expanded_assets/<tag>` for the asset list, `releases.atom` for
-  tags) which are not rate limited. Downloads never were. Verified against a
-  genuinely exhausted quota (`src/lib/github.ts`).
+  back to plain github.com pages (`releases.atom` for tags,
+  `/releases/expanded_assets/<tag>` for the asset list) which are not rate
+  limited. Downloads never were. Verified against a genuinely exhausted quota
+  (`src/lib/github.ts`).
+- **Neither `/tags` nor `/releases/latest` names a llama.cpp build any more.**
+  In August 2026 upstream started tagging semver milestones (`v0.3.0`) and
+  per-commit `master-<sha>` snapshots, and marked the nightly `b<number>` builds
+  prerelease. `/tags` sorts by NAME, so its first hundred entries contain zero
+  builds; `/releases/latest` skips prereleases, so it answers the milestone —
+  which is days STALE and ships no binaries (one `nightly-tag.txt`), i.e. an
+  "update" that moves backwards and then cannot download. `builds.server.ts`
+  therefore reads the RELEASES list (publish-date order, prereleases included)
+  filtered to `BUILD_TAG` (`/^b\d+$/`), and the release route's "master"
+  resolves to the newest build release that actually carries assets. Measured
+  live 2026-08-29; the Linux/macOS assets also changed `.zip` → `.tar.gz` around
+  the same time, which `assets.ts`/`archive.ts` already handled.
 - **"Fix" installs prerequisites, and never silently.** `src/lib/fixplan.ts`
   returns one of three honest outcomes — `download` (the app does it itself),
   `package` (the exact command, elevated via `pkexec`, shown on the button
@@ -421,6 +433,23 @@ Data flow worth knowing:
   layers to the cards that just proved they could not hold them, while
   llama.cpp's own free-VRAM split is measured at load time on the machine as it
   actually is.
+- **Leftover VRAM becomes micro-batch, and the estimate had to learn the FFN
+  first.** After placement, residency and context are settled, the tuner grows
+  `-ub` 512 → 1024/2048/4096 through the same fit gates as the placement itself
+  (`tune.ts`) — prefill is the wait at long context, measured 150 → 364 tok/s
+  going 512 → 4096 on a MoE with experts on the host, and VRAM the placement
+  left idle buys exactly that. It never grows past what the plan can bill: the
+  compute estimate now charges two FFN-wide f32 activations per micro-batch
+  token (`plan.ts:ffActivation`, from `feed_forward_length` /
+  `expert_feed_forward_length` × `expert_used_count`, read in
+  `rust/src/gguf.rs`) — the `n_embd`-only estimate under-billed `-ub 4096` about
+  4x, which was harmless while nothing spent headroom and unsound the moment
+  something did. Gated off for sparse-attention models, whose scratch is
+  measured end to end with its own ub term. A 256 set by the placement to buy
+  layers is never grown — that would undo the trade just made — and the
+  behaviour is visible in the verdicts: Flash-Next pinned at 250k grows to 1024
+  (the ctx×ub term prices 2048 out), aimFull at 262,144 grows nothing, a small
+  dense model on a big card reaches 4096.
 - **The sparse-attention scratch is measured, and the biggest term was SLOTS.**
   llama.cpp's `-np` default is `-1 = auto`, and auto chose **four**. Each server
   slot runs its own graph, so each one costs another copy of the context-sized
@@ -445,18 +474,48 @@ Data flow worth knowing:
   - Verified end to end on the real model: the app's own answer at 1,048,576
     (`--n-cpu-moe 36 -np 1 -ts 37.5,6.5`) starts and generates at 13.1 tok/s; at
     524,288 (`--n-cpu-moe 32`) 14.9 tok/s.
-- **A catalog default is not llama.cpp's default, and assuming so shipped two
-  silent lies.** `command.ts` omits a flag whose value equals `def`, on the
-  theory that `def` IS what llama.cpp does without it. Upstream moved: `-ngl`
-  now defaults to **auto**, so "CPU only" emitted no `-ngl` and llama.cpp
-  offloaded to the GPU anyway; `-c` defaults to **0 = take it from the model**,
-  so a plan drawn for 4,096 tokens started a server at this model's declared
-  1,048,576 and could not allocate — a start that cannot succeed, with an error
-  naming none of it. `Param.llamaDef` (`types.ts`) carries llama.cpp's own
-  default when it differs, and omission is judged against THAT. The three flags
-  that decide the placement — `-ngl`, `-c`, `-np` — are always emitted, because
-  their whole job is to pin what runs. Re-check after any llama.cpp bump: the
-  failure mode is silent, and `llama-server --help` prints every default.
+- **llama-server has its own fitter now, and it defaults ON — so the command
+  always pins `--fit off`.** Upstream `fit_params = true` (`common.h`) quietly
+  adjusts whatever the command line left unset to fit device memory. This app IS
+  that fitter — the plan, the packer, the retry ladder — and its promise is that
+  the command shown is the command that runs; two fitters disagreeing about one
+  process means the settings panel describes a run that never happened. It also
+  segfaults on DeepSeek-V4-Flash, which is why `fitladder.ts` exists. The flag
+  is a catalog entry like any other (`params.ts:fit`, default off, `llamaDef`
+  on), so a user who wants upstream's behaviour flips one switch and the flag
+  honestly disappears from the command. A build too old to know `--fit` lands in
+  the existing unknown-argument signature in `serverlog.ts`, whose advice —
+  reset the setting — is exactly right.
+- **Qwen3.8-Flash-Next (qwen4exp) is ready before the llama.cpp PR merges, and
+  two of its facts live in the reader.** Verified against the real 111 GB
+  4-shard GGUF (headers through `readMeta` → `mergeShards` → `tune`, on the 24
+  GB + 110 GB rig from the field report that motivated it — the tuner's answer
+  fits at a pinned 250,000 and reaches the full 262,144 with `--n-cpu-moe 42`).
+  (1) `per_layer_token_embd` — the PLE n-gram gather table, ~27 GB, a quarter of
+  the file — is `LLM_TENSOR_LAYER_INPUT` in llama.cpp, CPU-pinned at any `-ngl`
+  like `token_embd`, so `gguf.rs` files it with the embeddings; under "output"
+  it handed a quarter of the model to the head `-ngl` offloads and every VRAM
+  plan was wrong. (2) `full_attention_interval` absent means 4 on this arch, not
+  dense — llama.cpp hardcodes that default (`models/qwen4exp.cpp`), and reading
+  absence as "every layer has a cache" is the 4x KV overestimate the hybrid
+  support exists to prevent. The official conversion writes the key; a file from
+  another tool may not. Its sparse attention (QSA) declares the same
+  `attention.indexer.top_k` DeepSeek-V4 does, so the measured scratch term and
+  the fit ladder apply unchanged; the single PLE layer's ~0.35 MB per-sequence
+  conv state is deliberately unbilled (`plan.ts:recurrentStateB` says why).
+  Support needs llama.cpp PR #27742, which the app cannot build until it merges
+  — source builds fetch tags and master, never a PR ref. `command.ts` omits a
+  flag whose value equals `def`, on the theory that `def` IS what llama.cpp does
+  without it. Upstream moved: `-ngl` now defaults to **auto**, so "CPU only"
+  emitted no `-ngl` and llama.cpp offloaded to the GPU anyway; `-c` defaults to
+  **0 = take it from the model**, so a plan drawn for 4,096 tokens started a
+  server at this model's declared 1,048,576 and could not allocate — a start
+  that cannot succeed, with an error naming none of it. `Param.llamaDef`
+  (`types.ts`) carries llama.cpp's own default when it differs, and omission is
+  judged against THAT. The three flags that decide the placement — `-ngl`, `-c`,
+  `-np` — are always emitted, because their whole job is to pin what runs.
+  Re-check after any llama.cpp bump: the failure mode is silent, and
+  `llama-server --help` prints every default.
 - **One thread per PHYSICAL core, and the priority switch is what protects the
   desktop.** `cpuBudget` used to leave two cores to the OS. Measured on the same
   DeepSeek placement: 16 threads 15.91 tok/s, 32 threads (SMT) **0.94** — two

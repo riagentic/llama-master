@@ -25,6 +25,7 @@ export const SHARED = [
   "sse.ts", // what a token event contains, and how often to publish
   "types.ts", // ChatMessage, and what richtext reads from it
   "disk.ts", // types.ts re-exports it
+  "queue.ts", // the rules for messages written while the model is busy
 ] as const;
 
 const HERE = dirname(fromFileUrl(import.meta.url));

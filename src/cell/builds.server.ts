@@ -36,14 +36,8 @@ import {
   paths,
   PLATFORM,
   RateLimited,
-  resolveRedirect,
 } from "./host.server.ts";
-import {
-  assetsFromHtml,
-  assetUrl,
-  shaFromCommitsAtom,
-  tagFromReleaseUrl,
-} from "../lib/github.ts";
+import { assetsFromHtml, assetUrl, shaFromCommitsAtom } from "../lib/github.ts";
 import { resolveCmake } from "./prereq.server.ts";
 import { DEMO_ENV, demoBuilds } from "../lib/demo.ts";
 
@@ -77,37 +71,56 @@ export class BuildFailure extends Error {
 
 // ── upstream metadata ──────────────────────────────────────────────────────
 
-type GhTag = { name: string };
 type GhCommit = { sha: string };
 type GhAsset = { name: string; browser_download_url: string; size: number };
 type GhRelease = { tag_name: string; assets: GhAsset[]; published_at: string };
 
-/** Release tags, newest first. llama.cpp tags builds as `b<number>`. */
+/** A tag that names a llama.cpp BUILD — `b<number>`. Since August 2026
+ *  upstream also tags semver milestones (`v0.3.0`) and per-commit
+ *  `master-<sha>` snapshots; neither carries binaries (the milestone ships a
+ *  single `nightly-tag.txt`), so everything below filters to build tags. */
+const BUILD_TAG = /^b\d+$/;
+
+/** Build tags from the releases atom feed, newest first — not rate limited. */
+async function buildTagsFromAtom(): Promise<string[]> {
+  const xml = await fetchText(`https://github.com/${REPO}/releases.atom`);
+  const tags = [...xml.matchAll(/\/releases\/tag\/([^"<]+)/g)]
+    .map((m) => decodeURIComponent(m[1] as string))
+    .filter((t) => BUILD_TAG.test(t));
+  return [...new Set(tags)];
+}
+
+/** Release tags, newest first. llama.cpp tags builds as `b<number>`.
+ *
+ * Sourced from the RELEASES list, not `/tags`: releases are ordered by publish
+ * date, while `/tags` orders by NAME — and once upstream started tagging
+ * `v0.3.0` milestones and `master-<sha>` snapshots, the first hundred tag
+ * names stopped containing a single build (measured 2026-08-29: zero
+ * `b<number>` entries in `/tags?per_page=100`). */
 export async function listRefs(): Promise<string[]> {
   try {
-    const tags = await fetchJson<GhTag[]>(`${API}/tags?per_page=100`);
-    return tags.map((t) => t.name);
+    const rels = await fetchJson<GhRelease[]>(`${API}/releases?per_page=100`);
+    return rels.map((r) => r.tag_name).filter((t) => BUILD_TAG.test(t));
   } catch (e) {
     if (!(e instanceof RateLimited)) throw e;
-    // The releases atom feed is not rate limited and carries the same tags.
-    const xml = await fetchText(`https://github.com/${REPO}/releases.atom`);
-    const tags = [...xml.matchAll(/\/releases\/tag\/([^"<]+)/g)]
-      .map((m) => decodeURIComponent(m[1] as string));
-    return [...new Set(tags)];
+    return await buildTagsFromAtom();
   }
 }
 
-/** The newest published release tag. Falls back to the release page when the
- *  API is rate limited, so the Update button keeps working. */
+/** The newest published BUILD tag. Falls back to the atom feed when the API is
+ *  rate limited, so the Update button keeps working.
+ *
+ * Not `/releases/latest`: that endpoint skips prereleases, the nightly builds
+ * are marked prerelease now, and the answer it gives is the assetless
+ * `v0.3.0` milestone from days earlier — an "update" that would move a build
+ * BACKWARDS and then fail to download. */
 export async function latestTag(): Promise<string> {
   try {
-    const rel = await fetchJson<GhRelease>(`${API}/releases/latest`);
-    return rel.tag_name;
+    const rels = await fetchJson<GhRelease[]>(`${API}/releases?per_page=30`);
+    return rels.map((r) => r.tag_name).find((t) => BUILD_TAG.test(t)) ?? "";
   } catch (e) {
     if (!(e instanceof RateLimited)) throw e;
-    return tagFromReleaseUrl(
-      await resolveRedirect(`https://github.com/${REPO}/releases/latest`),
-    ) ?? "";
+    return (await buildTagsFromAtom())[0] ?? "";
   }
 }
 
@@ -133,11 +146,20 @@ export async function listAssets(
   ref: string,
 ): Promise<{ tag: string; assets: Asset[] }> {
   try {
-    const rel = await fetchJson<GhRelease>(
-      ref === "master"
-        ? `${API}/releases/latest`
-        : `${API}/releases/tags/${ref}`,
-    );
+    // "master" on the release route means "the newest build" — resolved
+    // through the releases list, because `/releases/latest` now names an
+    // assetless milestone (see `latestTag`). The newest build release that
+    // actually carries assets wins; one still uploading is skipped rather
+    // than reported as "no asset for your platform".
+    const rel = ref === "master"
+      ? (await fetchJson<GhRelease[]>(`${API}/releases?per_page=30`))
+        .find((r) => BUILD_TAG.test(r.tag_name) && r.assets.length > 0)
+      : await fetchJson<GhRelease>(`${API}/releases/tags/${ref}`);
+    if (!rel) {
+      throw new Error(
+        "none of the newest thirty releases is a build with assets — GitHub may be mid-publish; retry in a minute",
+      );
+    }
     return {
       tag: rel.tag_name,
       assets: rel.assets.map((a) => ({
@@ -164,11 +186,9 @@ export async function listAssets(
 export async function listAssetsWithoutApi(
   ref: string,
 ): Promise<{ tag: string; assets: Asset[] }> {
-  const tag = ref === "master"
-    ? tagFromReleaseUrl(
-      await resolveRedirect(`https://github.com/${REPO}/releases/latest`),
-    )
-    : ref;
+  // The atom feed, not the /releases/latest redirect: that page points at the
+  // assetless milestone release now (see `latestTag`).
+  const tag = ref === "master" ? (await buildTagsFromAtom())[0] : ref;
   if (!tag) {
     throw new Error(
       "GitHub's API is rate limited and the latest release tag could not be resolved from the release page either.",

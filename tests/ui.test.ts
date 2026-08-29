@@ -32,6 +32,7 @@ import { OnePage } from "../src/ui/OnePage.tsx";
 import { TunePanel } from "../src/ui/TunePanel.tsx";
 import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
+import { ChatPanel } from "../src/ui/ChatPanel.tsx";
 import {
   CTX_BANDS,
   CTX_PRESETS,
@@ -736,10 +737,22 @@ testUI(
     await builds.setOrigin("release");
     await builds.setBackend("cuda");
     await builds.loadAssets();
+    // `setOrigin` fires its own un-awaited `loadAssets`, and the guarded call
+    // above returns at once while that one runs — so wait on the FLAG, not the
+    // call. With GitHub rate-limited the page-scrape fallback takes seconds,
+    // which is longer than settle()'s budget.
+    await ui_.waitFor(() => !builds.assetsLoading, {
+      timeoutMs: 30_000,
+      msg: "the asset list should finish loading (or failing)",
+    });
     await ui_.settle();
 
     const html = ui_.html();
-    if (builds.assets.length > 0) {
+    // ≥ 6, not > 0: a live release mid-upload carries a handful of assets and
+    // the app then (rightly) shows the still-uploading guidance instead —
+    // `diagnoseNoAsset`'s own threshold. Asserting "Windows only" against that
+    // state failed the suite on network weather, not on a bug.
+    if (builds.assets.length >= 6) {
       // The user's report: prerequisites all green, then the build failed with a
       // list of filenames. It must be refused HERE, with a reason and a button.
       assertStringIncludes(html, "Windows only");
@@ -768,8 +781,16 @@ testUI(App, "a workable selection says so, plainly", async (ui_) => {
   await builds.setOrigin("release");
   await builds.setBackend("cpu");
   await builds.loadAssets();
+  // Wait on the flag, not the call — see the test above.
+  await ui_.waitFor(() => !builds.assetsLoading, {
+    timeoutMs: 30_000,
+    msg: "the asset list should finish loading (or failing)",
+  });
   await ui_.settle();
-  if (builds.assets.length > 0) {
+  // ≥ 6 for the same reason as the test above: below `diagnoseNoAsset`'s
+  // threshold the release is still uploading and the CPU asset may genuinely
+  // be absent, so "Ready" would be the wrong answer.
+  if (builds.assets.length >= 6) {
     assertStringIncludes(ui_.html(), "Ready");
     assertEquals(ui_.App["get-llama"].disabled, false);
   }
@@ -3099,5 +3120,107 @@ testUI(
           `${expected.totalB} vs ${stale.totalB}`,
       );
     });
+  },
+);
+
+testUI(
+  ChatPanel,
+  "a message typed mid-reply appears as a chip, not as a lost keystroke",
+  async (ui_) => {
+    // The panel is mounted directly rather than reached through the rail:
+    // `ui.tab` rehydrates asynchronously and a navigation issued before it
+    // lands is silently reverted (see the note on the other panel tests).
+    //
+    // Two servers, because the two facts under test come from different places.
+    // The stub build makes `srv.status` READY, which is the only thing that
+    // closes the composer; the hanging one holds a reply open, which is the
+    // state this whole feature is about and which a fast stub cannot produce.
+    await ui_.settle();
+    const bin = await installStubBuild();
+    const enc = new TextEncoder();
+    const ac = new AbortController();
+    const slow = Deno.serve(
+      { port: 0, signal: ac.signal, onListen: () => {} },
+      () =>
+        new Response(
+          new ReadableStream({
+            async start(c) {
+              c.enqueue(enc.encode(
+                `data: ${
+                  JSON.stringify({ choices: [{ delta: { content: "…" } }] })
+                }\n\n`,
+              ));
+              await new Promise((r) => setTimeout(r, 10_000));
+              c.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    const slowUrl = `http://127.0.0.1:${(slow.addr as Deno.NetAddr).port}`;
+
+    try {
+      await srv.stop(); // known slate — see the note in the lifecycle test
+      await srv.poll();
+      const port = freePort();
+      await srv.start(
+        [bin, "--port", String(port)],
+        `http://127.0.0.1:${port}`,
+      );
+      await untilReady(ui_);
+
+      await chat.stop();
+      await chat.clear();
+      await chat.setInput("first");
+      chat.submit(slowUrl); // streams, and stays streaming
+      await ui_.waitFor(() => chat.streaming, "the first reply is live");
+
+      await chat.setInput("second, while it is busy");
+      await chat.submit(slowUrl);
+      // NOT `settle()`: the first submit is deliberately still in flight — a
+      // held-open stream IS the state under test — and settle demands
+      // quiescence, so it would give up here every time. Wait on the state.
+      await ui_.waitFor(
+        () => chat.queue.length === 1 && chat.input === "",
+        "the second message is held while the first still streams",
+      );
+
+      assertEquals(chat.queue.length, 1, "held rather than sent");
+      assertEquals(chat.input, "", "and the box is ready for the next thought");
+
+      const html = ui_.html();
+      assertStringIncludes(
+        html,
+        "second, while it is busy",
+        "the chip is drawn",
+      );
+      assertStringIncludes(html, "1 message", "and counted");
+      assertStringIncludes(
+        html,
+        "this reply finishes",
+        "with what will collect it — a queue nothing is coming for reads as stuck",
+      );
+      // The composer stays OPEN with the server ready and a reply in flight.
+      // That is the feature: before this, the box was disabled for the whole
+      // reply and the follow-up had to be held in the user's head.
+      assert(
+        !/aria-label="Message"[^>]*\sdisabled/.test(html),
+        "the input is disabled during a reply — that is the bug this fixes",
+      );
+      assertStringIncludes(
+        html,
+        "Stop",
+        "and the reply can still be cancelled",
+      );
+      assertStringIncludes(html, "Queue", "the button says what Enter will do");
+    } finally {
+      await chat.stop();
+      await chat.clearQueue();
+      await chat.clear();
+      ac.abort();
+      await slow.finished;
+      await srv.stop();
+      await removeStubBuild();
+    }
   },
 );

@@ -417,6 +417,10 @@ export const srv = cell("srv", {
             s.exitCode = null;
             s.healthy = false;
             s.proven = false;
+            // The patience `start` promises each rung ("it deserves its own"):
+            // this branch is a rung too, and inheriting the dead rung's count
+            // let a single slow probe declare the next one ready-unproven.
+            s.probeSlow = 0;
             s.rssB = 0;
             s.rssFileB = 0;
             try {
@@ -512,6 +516,10 @@ export const srv = cell("srv", {
             // ready — but unproven, so the fit is never recorded off it.
             s.proven = p.kind === "ok";
             s.status = "ready";
+            // A concluded probe spends its slow count: a reload later in this
+            // same process (ready → starting → probe) deserves fresh patience,
+            // not the leftovers of a cold page cache from minutes ago.
+            s.probeSlow = 0;
             s.healthDetail = "ready";
             s.props = await io.props(s.url);
           } finally {

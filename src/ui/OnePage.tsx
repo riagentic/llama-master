@@ -40,6 +40,7 @@ import { elapsedLabel } from "../lib/loadprogress.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { CtxControls } from "./CtxControls.tsx";
 import { ChatMessage } from "./ChatMessage.tsx";
+import { ChatComposer } from "./ChatComposer.tsx";
 import { CommandPanel } from "./CommandView.tsx";
 import { SetupPanel } from "./SetupView.tsx";
 import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
@@ -62,7 +63,6 @@ import { Guidance } from "./Guidance.tsx";
 import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
-  canSend,
   changedCount,
   chatHasContent,
   chatTranscript,
@@ -873,45 +873,7 @@ function MiniChat() {
             </>
           )}
       </div>
-      <form
-        class="chat-input"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (!ready) return;
-          chat.send(url, {
-            temp: num(cfg.settings, "temp"),
-            topP: num(cfg.settings, "topP"),
-          });
-        }}
-      >
-        <input
-          placeholder={ready ? "Message" : "Server is not running"}
-          aria-label="Quick message"
-          disabled={!ready}
-          value={chat.input}
-          onInput={(e) =>
-            chat.setInput((e.currentTarget as HTMLInputElement).value)}
-        />
-        {chat.streaming
-          ? (
-            <button
-              type="button"
-              class="btn danger"
-              onClick={() => chat.stop()}
-            >
-              Stop
-            </button>
-          )
-          : (
-            <button
-              type="submit"
-              class="btn primary"
-              disabled={!ready || !canSend()}
-            >
-              Send
-            </button>
-          )}
-      </form>
+      <ChatComposer url={url} ready={ready} />
     </>
   );
 }

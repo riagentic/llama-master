@@ -273,3 +273,94 @@ testCell(ui, "the theme flips and the text size steps, within reason", (t) => {
   t.send.zoom("lots" as any);
   t.expect.state((s) => s.fontPx === 12);
 });
+
+// ── the message queue ──────────────────────────────────────────────────────
+
+testCell(
+  chat,
+  "a message written mid-reply waits, then sends itself",
+  async (t) => {
+    // The feature, end to end, against a real SSE stream: type while the far
+    // end is answering and the message is HELD — not dropped, and not put into
+    // the live request. The drain runs inside the first send, so awaiting that
+    // covers both turns.
+    const stub = stubServer({ delayMs: 60 });
+    t.init();
+
+    t.send.setInput("first");
+    const first = t.send.send(stub.url);
+    await new Promise((r) => setTimeout(r, 80)); // mid-reply
+    t.send.setInput("second");
+    await t.send.submit(stub.url);
+    t.expect.state((s) => s.queue.length === 1, "held, not sent");
+    t.expect.state((s) => s.input === "", "and the box is cleared");
+    t.expect.state((s) => s.streaming === true);
+
+    await first;
+    t.expect.state((s) => s.queue.length === 0, "the queue emptied itself");
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.messages.length === 4, "both turns completed");
+    t.expect.state((s) => s.messages[0]?.content === "first");
+    t.expect.state((s) => s.messages[2]?.content === "second");
+    await stub.close();
+  },
+);
+
+testCell(
+  chat,
+  "Stop leaves the queue standing, and does not fire the next message",
+  async (t) => {
+    // On a LAN especially: Stop means "not this reply", and a queue thrown
+    // after it would be gone for good. Kept, and held, until the user says go.
+    const stub = stubServer({ delayMs: 3_000 });
+    t.init();
+
+    t.send.setInput("one");
+    const sent = t.send.send(stub.url);
+    await new Promise((r) => setTimeout(r, 120));
+    t.send.setInput("two");
+    await t.send.submit(stub.url);
+    t.send.stop();
+    await sent;
+
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.queue.length === 1, "kept, not thrown away");
+    t.expect.state((s) => s.queue[0] === "two");
+    await stub.close();
+  },
+);
+
+testCell(
+  chat,
+  "a far end that goes away holds the queue instead of losing it",
+  async (t) => {
+    // The commonest LAN failure: the server stops answering mid-reply. The
+    // rest of the queue must survive that — throwing it after a connection
+    // that has already gone is how a user loses everything they typed.
+    const stub = stubServer({ delayMs: 60 });
+    t.init();
+
+    t.send.setInput("one");
+    const first = t.send.send(stub.url);
+    await new Promise((r) => setTimeout(r, 80));
+    t.send.setInput("two");
+    await t.send.submit(stub.url);
+    await stub.close(); // the far end disappears mid-reply
+    await first;
+
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.queue.length === 1, "the second one is still safe");
+    t.expect.state((s) => s.queue[0] === "two");
+  },
+);
+
+testCell(chat, "an idle submit is the request itself", async (t) => {
+  const stub = stubServer();
+  t.init();
+  t.send.setInput("go");
+  await t.send.submit(stub.url);
+  t.expect.state((s) => s.input === "");
+  t.expect.state((s) => s.queue.length === 0);
+  t.expect.state((s) => s.messages[0]?.content === "go");
+  await stub.close();
+});

@@ -17,6 +17,10 @@ export type StubOptions = {
   reply?: string[];
   /** Tokens/second reported in the final event's `timings`. */
   tps?: number;
+  /** Pause between SSE events, so a test can act WHILE a reply is streaming.
+   *  Without it the whole reply lands in one tick and the mid-reply window —
+   *  the only state the message queue is about — never exists. */
+  delayMs?: number;
   model?: string;
 };
 
@@ -90,9 +94,24 @@ export function stubServer(opts: StubOptions = {}): Stub {
           }\n\n`,
         );
         events.push("data: [DONE]\n\n");
-        return new Response(events.join(""), {
-          headers: { "content-type": "text/event-stream" },
-        });
+        if (!opts.delayMs) {
+          return new Response(events.join(""), {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        const enc = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            async start(c) {
+              for (const e of events) {
+                await new Promise((r) => setTimeout(r, opts.delayMs));
+                c.enqueue(enc.encode(e));
+              }
+              c.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
       }
       return new Response("not found", { status: 404 });
     },

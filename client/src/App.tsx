@@ -33,6 +33,7 @@ import {
   Waiting,
 } from "./ui/kit.tsx";
 import { Message } from "./ui/Message.tsx";
+import { Composer } from "./ui/Composer.tsx";
 
 const STATUS: Record<
   string,
@@ -344,49 +345,7 @@ function Chat() {
           )}
       </div>
 
-      <form
-        class="chat-input"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (!ready) return;
-          void chat.send(conn.url);
-        }}
-      >
-        <input
-          t="message"
-          placeholder={ready
-            ? "Message"
-            : conn.url
-            ? "The server is not ready to answer yet"
-            : "Not connected"}
-          aria-label="Message"
-          disabled={!ready}
-          value={chat.input}
-          onInput={(e) =>
-            chat.setInput((e.currentTarget as HTMLInputElement).value)}
-        />
-        {chat.streaming
-          ? (
-            <button
-              type="button"
-              class="btn danger"
-              t="stop"
-              onClick={() => chat.stop()}
-            >
-              Stop
-            </button>
-          )
-          : (
-            <button
-              type="submit"
-              class="btn primary"
-              t="send"
-              disabled={!ready || !chat.canSend()}
-            >
-              Send
-            </button>
-          )}
-      </form>
+      <Composer url={conn.url} ready={ready} />
     </section>
   );
 }

@@ -14,6 +14,15 @@ import {
 } from "@std/assert";
 
 import {
+  advances,
+  QUEUE_MAX,
+  queueAdd,
+  queueLabel,
+  queueNote,
+  queueRemove,
+  submitKind,
+} from "../src/lib/queue.ts";
+import {
   argv,
   commandBlock,
   commandLine,
@@ -316,6 +325,28 @@ Deno.test("command: a flag is omitted only when llama.cpp would agree", () => {
   for (const flag of ["-fa", "-ts", "--mlock", "--no-mmap", "-ctk", "-ctv"]) {
     assertEquals(cmd.includes(flag), false, `${flag} should be absent`);
   }
+});
+
+Deno.test("command: --fit off is always emitted, because upstream's fitter defaults on", () => {
+  // llama-server defaults to fit_params = true (common.h): it silently adjusts
+  // whatever the command line left unset to fit device memory. This app is that
+  // fitter — the plan, the packer, the fit ladder — and its promise is that the
+  // command shown is the command that runs, so the flag is pinned like -ngl,
+  // -c and -np. (Upstream's fitter also segfaults on DeepSeek-V4-Flash.)
+  const cmd = argv("server", {
+    bin: "llama-server",
+    model: "/m/x.gguf",
+    settings: defaults(),
+  });
+  assertEquals(cmd[cmd.indexOf("--fit") + 1], "off");
+  // Choosing "on" means llama.cpp's own default — the honest spelling of which
+  // is no flag at all.
+  const on = argv("server", {
+    bin: "llama-server",
+    model: "/m/x.gguf",
+    settings: { ...defaults(), fit: "on" },
+  });
+  assertEquals(on.includes("--fit"), false);
 });
 
 Deno.test("command: only changed values appear, in catalog order", () => {
@@ -710,6 +741,62 @@ Deno.test("tune: a model that fits goes entirely on the GPU, at full context", (
   assertEquals(t.optimalCtx, 8192);
   assert(t.reasons.length >= 2, "every decision is explained");
   assert(t.summary.includes("full"), `summary should say so: ${t.summary}`);
+});
+
+Deno.test("tune: leftover VRAM is spent on the micro-batch, and the plan pays for it", () => {
+  // Prefill is the wait at long context: 512 → 4096 measured 150 → 364 tok/s
+  // prompt ingestion on a MoE with experts on the host. A small model on a big
+  // card leaves tens of GB idle; the tuner turns some of it into `-ub`.
+  const m = meta({ nCtxTrain: 8192 });
+  const roomy = hw({ gpus: [gpu(48)] });
+  const t = tune(m, roomy, defaults(), "vram");
+  assertEquals(t.settings.ubatchSize, 4096);
+  assertEquals(t.settings.batchSize, 4096);
+  // The growth is billed, not assumed: the grown settings still fit with the
+  // safety margins intact.
+  assert(plan(m, roomy, t.settings).fits, "grown plan must still fit");
+  assert(
+    t.reasons.some((r) => r.includes("Micro-batch")),
+    `the spend is explained: ${t.reasons.join(" | ")}`,
+  );
+});
+
+Deno.test("tune: a starved placement keeps its small micro-batch", () => {
+  // When the placement itself cut `-ub` to 256 to buy layers, growth would
+  // undo that trade — and on a card with no headroom there is nothing to
+  // spend anyway.
+  const mb = 1024 ** 2;
+  const m = meta({
+    nLayer: 60,
+    layers: layers(60, 512 * mb),
+    nCtxTrain: 32768,
+  });
+  const tight = hw({ gpus: [gpu(8)] });
+  const t = tune(m, tight, defaults(), "hybrid");
+  if (t.possible) {
+    assert(
+      num(t.settings, "ubatchSize") <= 512,
+      `no growth on a starved card: ${t.settings.ubatchSize}`,
+    );
+    assert(plan(m, tight, t.settings).fits);
+  }
+});
+
+Deno.test("plan: the compute buffer charges the FFN width for a large micro-batch", () => {
+  // Prefill activations scale with the widest matmul — the FFN. An estimate
+  // built on n_embd alone under-billed `-ub 4096` about 4x, which would let
+  // the tuner spend VRAM that is not there.
+  const m = meta({ nFf: 25600 });
+  const machine = hw({ gpus: [gpu(48)] });
+  const at = (ub: number) =>
+    plan(m, machine, { ...defaults(), ngl: 999, ubatchSize: ub }).vram.buckets
+      .find((b) => b.key === "compute")!.bytes;
+  const grown = at(4096) - at(512);
+  // Two FFN-wide f32 tensors over the extra 3,584 tokens, at least.
+  assert(
+    grown >= (4096 - 512) * 25600 * 4 * 2,
+    `compute must grow with ub x n_ff: +${grown}`,
+  );
 });
 
 Deno.test("tune: the context aimed at is the model's trained maximum", () => {
@@ -5623,4 +5710,79 @@ Deno.test("priority: the nice value is read out of a hostile /proc line", () => 
     0,
   );
   assertEquals(niceFromProcStat("nonsense"), null);
+});
+
+// ── the message queue ──────────────────────────────────────────────────────
+
+Deno.test("queue: only a reply that ended on its own moves the queue on", () => {
+  // The whole feature turns on this. A cancelled reply means the user said
+  // "not like that", and an error means the next send fails identically — six
+  // queued messages against a dead server is six identical errors.
+  assert(advances("done"));
+  assert(!advances("cancelled"), "Stop must not fire the next message");
+  assert(!advances("error"), "a dead server must not eat the queue");
+});
+
+Deno.test("queue: adding refuses blanks and the cap, visibly", () => {
+  assertEquals(queueAdd([], "  hi  "), ["hi"], "and it is trimmed");
+  assertEquals(queueAdd(["a"], "   "), ["a"], "whitespace is not a message");
+  const full = Array.from({ length: QUEUE_MAX }, (_, i) => `m${i}`);
+  assertEquals(
+    queueAdd(full, "one more").length,
+    QUEUE_MAX,
+    "the cap holds, and the caller can SEE it held (length unchanged)",
+  );
+});
+
+Deno.test("queue: removing one leaves the order of the rest", () => {
+  assertEquals(queueRemove(["a", "b", "c"], 1), ["a", "c"]);
+  assertEquals(queueRemove(["a"], 5), ["a"], "out of range changes nothing");
+  assertEquals(queueRemove(["a"], -1), ["a"]);
+});
+
+Deno.test("queue: what Enter means, in every state it can be pressed", () => {
+  assertEquals(submitKind("hi", 0, false), "send", "idle: it IS the request");
+  assertEquals(submitKind("hi", 0, true), "queue", "busy: hold it");
+  assertEquals(submitKind("hi", 3, false), "send", "drains the queue first");
+  // The gesture left after a Stop: the queue is holding and nothing is coming
+  // to collect it, so an empty box still has something to do.
+  assertEquals(submitKind("", 2, false), "send");
+  assertEquals(submitKind("", 2, true), null, "the drain will do it");
+  assertEquals(submitKind("", 0, false), null, "nothing to do");
+  assertEquals(
+    submitKind("hi", QUEUE_MAX, true),
+    "full",
+    "named, so the message is never silently dropped",
+  );
+});
+
+Deno.test("queue: the note separates 'waiting on the model' from 'waiting on you'", () => {
+  // Two states that look identical on screen, and only one of them empties
+  // itself. Describing the second as the first is a user watching a spinner
+  // that will never stop.
+  assertEquals(queueNote(0, false), "", "nothing waiting, nothing said");
+  assertStringIncludes(queueNote(1, true), "1 message");
+  assertStringIncludes(queueNote(2, true), "2 messages");
+  assertStringIncludes(queueNote(2, true), "this reply finishes");
+  assertStringIncludes(queueNote(2, false), "press Send");
+  assertStringIncludes(queueNote(QUEUE_MAX, true), "full");
+});
+
+Deno.test("queue: a chip label elides on a word and keeps the whole text elsewhere", () => {
+  assertEquals(queueLabel("short one"), "short one");
+  assertEquals(
+    queueLabel("now  write\nthe  tests"),
+    "now write the tests",
+    "newlines and runs collapse — a chip is one line",
+  );
+  const source = "refactor the parser and then explain every choice";
+  const long = queueLabel(source);
+  assert(long.endsWith("…"));
+  assert(long.length <= 43);
+  // The cut lands ON a word boundary: what is shown is a prefix of the source,
+  // and the character that follows it there is a space — never a half word,
+  // which reads as corruption rather than as elision.
+  const shown = long.slice(0, -1);
+  assert(source.startsWith(shown), shown);
+  assertEquals(source[shown.length], " ", `cut mid-word: ${shown}`);
 });

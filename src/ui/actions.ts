@@ -11,12 +11,13 @@
 
 import { builds } from "../cell/builds.ts";
 import { cfg } from "../cell/cfg.ts";
+import { chat } from "../cell/chat.ts";
 import { hw } from "../cell/hw.ts";
 import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
 import { argv, serverUrl } from "../lib/command.ts";
-import { str } from "../lib/params.ts";
+import { num, str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
 import type { Backend, ModelMeta } from "../lib/types.ts";
@@ -110,6 +111,26 @@ export function cliBin(): string {
 
 export function endpoint(): string {
   return serverUrl(cfg.settings);
+}
+
+/**
+ * Submit whatever is in the chat box: send it, or hold it until the model is
+ * free.
+ *
+ * A gesture that spans two cells — the sampling comes from `cfg`, the decision
+ * and the text from `chat` — which is what this module is for. Both chat
+ * surfaces call it, so "what Enter does" is defined once.
+ *
+ * The branch itself is NOT here: `chat.submit` makes it against the cell's own
+ * state in a single dispatch. Deciding it here would mean reading
+ * `chat.streaming` from a browser replica that can be one round trip stale, and
+ * the cost of getting it wrong is a second request into a live stream.
+ */
+export function submitChat(url: string): void {
+  chat.submit(url, {
+    temp: num(cfg.settings, "temp"),
+    topP: num(cfg.settings, "topP"),
+  });
 }
 
 /**
@@ -410,7 +431,20 @@ export async function restartTuned(): Promise<void> {
     model: model.path,
     settings,
     freeAtStart: freeNowB(),
+    // The same run context `startServer` records, for the same reasons — this
+    // is the restart most likely to meet a machine that just changed, so it
+    // needs the fit ladder's weights rung (`shape`) and the per-card baseline
+    // (`cardFreeB`) MORE than a plain start does, not less. Without them a
+    // weights overflow fell through to the context rung, which cannot move a
+    // single model byte, and the live memory map lost its measured per-card
+    // attribution. The ladder stays reserved for settings the APP chose: only
+    // when the re-tune actually produced them, and never over a typed pin.
+    autoFit: r !== null && !ctxOverride(),
     lowPriority: cfg.lowPriority,
+    shape: modelShape(model.meta ?? null),
+    cardFreeB: hwSnapshot().gpus.map((g) =>
+      Math.max(0, g.vramTotalB - g.vramUsedB)
+    ),
   });
 }
 
@@ -428,9 +462,21 @@ export async function updateNow(): Promise<void> {
   const urlBefore = srv.url;
   // Carry the run's identity across the restart: without it the memory view
   // stops describing the live process the moment an update brings it back up.
+  // The model's shape rides along for the fit ladder's weights rung — captured
+  // HERE because `srv.stop` clears `runModel` and the update takes minutes.
   const runBefore = srv.runSettings
     ? { model: srv.runModel, settings: srv.runSettings }
     : undefined;
+  const shapeBefore = modelShape(
+    models.items.find((m) => m.path === srv.runModel)?.meta ?? null,
+  );
+  // The run's own ladder policy and priority, not re-derived: the run being
+  // resumed already settled whether its settings were app-chosen (ladder
+  // allowed) or typed, and which priority it was started at. Omitting
+  // `lowPriority` here silently defaulted the resumed run to low even when the
+  // run it replaces had the switch off.
+  const autoFitBefore = srv.autoFit;
+  const lowPriorityBefore = srv.runLowPriority;
 
   if (wasRunning) await srv.stop();
   // The RETURN value, not `builds.job`: a state read straight after an await
@@ -443,10 +489,23 @@ export async function updateNow(): Promise<void> {
     const bin = serverBin();
     if (bin && argvBefore.length > 0) {
       // The binary path changes with the ref; everything after it does not.
+      // The run context is as complete as `startServer`'s: without `shape` and
+      // `cardFreeB` a weights overflow on the way back up fell through to the
+      // context rung, and the memory map lost its per-card measurement. Free
+      // memory is read NOW — the update took minutes, and the machine moved.
       srv.start(
         [bin, ...argvBefore.slice(1)],
         urlBefore || endpoint(),
-        runBefore && { ...runBefore, freeAtStart: freeNowB() },
+        runBefore && {
+          ...runBefore,
+          freeAtStart: freeNowB(),
+          autoFit: autoFitBefore,
+          lowPriority: lowPriorityBefore,
+          shape: shapeBefore,
+          cardFreeB: hwSnapshot().gpus.map((g) =>
+            Math.max(0, g.vramTotalB - g.vramUsedB)
+          ),
+        },
       );
     }
   }

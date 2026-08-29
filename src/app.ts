@@ -11,7 +11,6 @@
 // do. Each one that legitimately takes minutes says so by name.
 
 import { aio } from "aio";
-import { ABOUT } from "./lib/about.ts";
 import { builds } from "./cell/builds.ts";
 import { cfg } from "./cell/cfg.ts";
 import { chat } from "./cell/chat.ts";
@@ -26,7 +25,6 @@ import { seedBackend } from "./ui/actions.ts";
 
 await aio.run({
   appId: "llama-master",
-  appVersion: ABOUT.version,
   cells: [ui, hw, prereq, builds, models, cfg, srv, chat],
   // Boot fails loudly if a cell was defined but not listed above — a cell that
   // is imported and unregistered dispatches into the void.
@@ -66,8 +64,6 @@ await aio.run({
       "srv:poll": { effect: 2_000, timeout: 10_000 },
       "srv:scanOrphans": { effect: 2_000, timeout: 10_000 },
       "srv:freeMemory": { effect: 30_000, timeout: 60_000 },
-      // Streams a completion for as long as the model takes.
-      "chat:send": { effect: 600_000, timeout: 1_800_000 },
     },
   },
   ui: {

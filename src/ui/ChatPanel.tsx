@@ -5,14 +5,13 @@
 // tokens/second, and it says plainly when the server is not up.
 
 import { chat } from "../cell/chat.ts";
-import { cfg } from "../cell/cfg.ts";
 import { srv } from "../cell/srv.ts";
-import { num } from "../lib/params.ts";
 import { tps } from "../lib/format.ts";
 import { endpoint } from "./actions.ts";
 import { CopyButton, Empty, ErrorNote, Panel, Pill, Waiting } from "./kit.tsx";
 import { ChatMessage } from "./ChatMessage.tsx";
-import { canSend, chatHasContent, chatTranscript } from "./derive.ts";
+import { ChatComposer } from "./ChatComposer.tsx";
+import { chatHasContent, chatTranscript } from "./derive.ts";
 import { useStickyBottom } from "./sticky.ts";
 
 export function ChatPanel() {
@@ -99,45 +98,7 @@ export function ChatPanel() {
               </>
             )}
         </div>
-        <form
-          class="chat-input"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!ready) return;
-            chat.send(url, {
-              temp: num(cfg.settings, "temp"),
-              topP: num(cfg.settings, "topP"),
-            });
-          }}
-        >
-          <input
-            placeholder={ready ? "Message" : "Server is not running"}
-            aria-label="Message"
-            disabled={!ready}
-            value={chat.input}
-            onInput={(e) =>
-              chat.setInput((e.currentTarget as HTMLInputElement).value)}
-          />
-          {chat.streaming
-            ? (
-              <button
-                type="button"
-                class="btn danger"
-                onClick={() => chat.stop()}
-              >
-                Stop
-              </button>
-            )
-            : (
-              <button
-                type="submit"
-                class="btn primary"
-                disabled={!ready || !canSend()}
-              >
-                Send
-              </button>
-            )}
-        </form>
+        <ChatComposer url={url} ready={ready} />
       </Panel>
     </div>
   );

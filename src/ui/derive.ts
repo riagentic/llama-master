@@ -47,6 +47,7 @@ import type { Plan } from "../lib/plan.ts";
 import { setupRows } from "../lib/setup.ts";
 import type { SetupRow } from "../lib/setup.ts";
 import { num, str } from "../lib/params.ts";
+import { queueNote, submitKind } from "../lib/queue.ts";
 import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
 import type { UpdateCheck } from "../lib/update.ts";
@@ -358,7 +359,18 @@ export function ourUsageB(): { vramB: number; ramB: number } {
   // RSS is measured; the VRAM figure is this app's own exact accounting for the
   // command that is running, which is the best available — the telemetry does
   // not attribute VRAM per process.
-  return { vramB: p.vram.usedB, ramB: srv.rssB || p.ram.usedB };
+  //
+  // Only the ANONYMOUS share of the RSS. The file-backed share (`rssFileB` —
+  // a mapped model's weights, 138 GB of the 139 on the run that motivated
+  // this) is reclaimable page cache that `MemAvailable` already counts as
+  // free, so handing it to `withoutOurUsage` adds those bytes to a figure
+  // that already contains them — and the clamp to `totalB` then declared the
+  // whole of RAM free, everyone else's memory included. The tuner planned
+  // against that.
+  return {
+    vramB: p.vram.usedB,
+    ramB: Math.max(0, srv.rssB - srv.rssFileB) || p.ram.usedB,
+  };
 }
 
 /**
@@ -626,8 +638,41 @@ export function serverRunning(): boolean {
   return srv.status === "starting" || srv.status === "ready";
 }
 
-export function canSend(): boolean {
-  return chat.input.trim().length > 0 && !chat.streaming;
+/**
+ * What the composer's submit button says — and "" when it can do nothing.
+ *
+ * The word has to change, because the two gestures have different
+ * consequences: "Send" starts a request, "Queue" writes a note for later. A
+ * button that said Send while the model was mid-reply would be promising
+ * something it cannot deliver for another thirty seconds.
+ *
+ * `submitKind` (pure, `src/lib/queue.ts`) decides; this only names the answer,
+ * so both surfaces and the tests agree on when the button is live.
+ */
+export function submitLabel(): string {
+  switch (submitKind(chat.input, chat.queue.length, chat.streaming)) {
+    case "queue":
+      return "Queue";
+    case "send":
+      return "Send";
+    // Full is a live button that would drop the message, which is worse than a
+    // dead one — the note above the input carries the reason.
+    case "full":
+    case null:
+      return "";
+  }
+}
+
+/** The messages waiting, oldest first. `.slice()` — never a spread — because
+ *  this array is written by a live async method. */
+export function chatQueue(): string[] {
+  return chat.queue.slice();
+}
+
+/** The sentence above the input: how many are waiting, and whether anything is
+ *  coming to collect them. */
+export function chatQueueNote(): string {
+  return queueNote(chat.queue.length, chat.streaming);
 }
 
 /**

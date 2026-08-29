@@ -797,6 +797,42 @@ export function tune(
   const placed = place(meta, hw, s, placement, ctx);
   const settings = placed?.settings ?? { ...s, ctxSize: ctx };
   if (placed?.note) reasons.push(`${label}: ${placed.note}.`);
+
+  // Spend what is still free on the micro-batch — prefill is the wait.
+  //
+  // Everything above placed the model at `-ub 512` and optimised residency and
+  // context; whatever VRAM is left after that would otherwise sit idle. A
+  // larger micro-batch converts it into prompt-ingestion speed: measured on a
+  // 125B MoE with experts on the host, 512 → 4096 took prefill from ~150 to
+  // ~364 tok/s — the difference between three minutes and eighty seconds on
+  // the 28k-token prompt that a long-context model exists to be given.
+  //
+  // Growth is checked against the same fit gates as the placement itself, with
+  // the FINAL settings — cache type, tensor split and context included — so
+  // the compute-buffer term (`plan.ts:ffActivation`, and the measured
+  // context×ub term on a sparse-attention model) pays for every step or the
+  // step is not taken. Only ever grows from the untouched default: a 256 was
+  // set above to BUY layers, and taking those bytes back here would undo the
+  // trade the placement just made.
+  if (usesGpu && num(settings, "ubatchSize") === 512) {
+    let grown = 0;
+    for (const ub of [1024, 2048, 4096]) {
+      const cand: Settings = {
+        ...settings,
+        ubatchSize: ub,
+        batchSize: Math.max(2048, ub),
+      };
+      if (!fitsVram(meta, hw, cand) || !fitsRam(meta, hw, cand)) break;
+      grown = ub;
+    }
+    if (grown > 0) {
+      settings.ubatchSize = grown;
+      settings.batchSize = Math.max(2048, grown);
+      reasons.push(
+        `Micro-batch raised to ${grown.toLocaleString()} — the placement left VRAM free, and a bigger micro-batch turns it into prompt-ingestion speed (measured 150 → 364 tok/s prefill going 512 → 4096 on a MoE with experts on the host). Generation speed is untouched.`,
+      );
+    }
+  }
   if (aimFull) {
     reasons.push(
       "Context first, by request: the search was allowed to move weights into system RAM to buy length, which the automatic path never does. The projected speed shows the price.",

@@ -371,3 +371,23 @@ Deno.test("guard: every per-method perf budget names a method that exists", asyn
   const dead = declared.filter((k) => !real.has(k));
   assertEquals(dead, [], "these budgets name a method that does not exist");
 });
+
+Deno.test("guard: no chat surface builds its own input row", async () => {
+  // The sibling of the two rules above, and the same lesson a third time: the
+  // Chat tab and the all-in-one page each had their own copy of the input row,
+  // and adding the queue to both would have made four places for "what Enter
+  // does" to drift. `ChatComposer` is the one implementation — a surface that
+  // wants a chat box takes it, or it will quietly ship a box that cannot queue.
+  const files = await filesUnder(join(ROOT, "src", "ui"), [".tsx"]);
+  const offenders: string[] = [];
+  for (const f of files) {
+    if (f.endsWith("ChatComposer.tsx")) continue;
+    const src = await read(f);
+    if (src.includes('class="chat-input"')) offenders.push(relative(ROOT, f));
+  }
+  assertEquals(
+    offenders,
+    [],
+    "these hand-roll the chat input row instead of using <ChatComposer />",
+  );
+});

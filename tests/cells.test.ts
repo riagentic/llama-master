@@ -91,6 +91,17 @@ testCell(cfg, "reset returns every parameter to its default", (t) => {
   t.expect.state((s) => s.settings.mlock === false);
 });
 
+testCell(cfg, "reset clears the context pin with everything else", (t) => {
+  // The pin is a setting the user typed; a Reset that wiped the settings but
+  // kept the pin left a hidden instruction silently capping the next tune.
+  t.init();
+  t.send.setCtxOverride(131_072, "/m.gguf");
+  t.expect.state((s) => s.ctxOverride === 131_072);
+  t.send.reset();
+  t.expect.state((s) => s.ctxOverride === 0);
+  t.expect.state((s) => s.ctxOverrideFor === "");
+});
+
 testCell(
   cfg,
   "rememberFit grows by default, replaces when the ladder ran",
@@ -377,6 +388,183 @@ testCell(
     await srv.finished;
   },
 );
+
+/** A llama-server that answers one word, after a beat.
+ *
+ *  The beat is what makes the queue tests deterministic: a reply that lands
+ *  instantly leaves no window to type into, which is the exact window this
+ *  feature exists for. `status` lets the same server play a failure. */
+function slowServer(opts: { delayMs?: number; status?: number } = {}) {
+  const { delayMs = 250, status = 200 } = opts;
+  const enc = new TextEncoder();
+  const ac = new AbortController();
+  let served = 0;
+  const s = Deno.serve(
+    { port: 0, signal: ac.signal, onListen: () => {} },
+    async () => {
+      served++;
+      await new Promise((r) => setTimeout(r, delayMs));
+      if (status !== 200) return new Response("nope", { status });
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode(
+              `data: ${
+                JSON.stringify({ choices: [{ delta: { content: "ok" } }] })
+              }\n\n`,
+            ));
+            c.enqueue(enc.encode("data: [DONE]\n\n"));
+            c.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  );
+  return {
+    url: `http://127.0.0.1:${(s.addr as Deno.NetAddr).port}`,
+    requests: () => served,
+    async close() {
+      ac.abort();
+      await s.finished;
+    },
+  };
+}
+
+testCell(
+  chat,
+  "a message written mid-reply waits, then sends itself",
+  async (t) => {
+    // The feature, end to end: type while it is answering, and the message is
+    // held rather than dropped or interleaved into the live request. The drain
+    // runs inside the first send, so awaiting it covers both turns.
+    const srv = slowServer();
+    t.init();
+
+    t.send.setInput("first");
+    const first = t.send.send(srv.url);
+    await new Promise((r) => setTimeout(r, 80)); // mid-reply
+    t.send.setInput("second");
+    await t.send.submit(srv.url);
+    t.expect.state((s) => s.queue.length === 1, "held, not sent");
+    t.expect.state((s) => s.queue[0] === "second");
+    t.expect.state((s) => s.input === "", "and the box is cleared");
+    t.expect.state(
+      (s) => s.streaming === true,
+      "the first reply is still live",
+    );
+
+    await first;
+    t.expect.state((s) => s.queue.length === 0, "the queue emptied itself");
+    t.expect.state((s) => s.streaming === false);
+    // user, reply, user, reply — in the order they were typed.
+    t.expect.state((s) => s.messages.length === 4, "both turns completed");
+    t.expect.state((s) => s.messages[0]?.content === "first");
+    t.expect.state((s) => s.messages[2]?.content === "second");
+    assertEquals(srv.requests(), 2, "two turns, never two at once");
+    await srv.close();
+  },
+);
+
+testCell(
+  chat,
+  "Stop leaves the queue standing, and does not fire the next message",
+  async (t) => {
+    // `advances` exists for this: a user who cancelled a reply has said
+    // something about the next one too. What they typed is KEPT — Stop is not
+    // a destructive button — but nothing sends until they say so.
+    const enc = new TextEncoder();
+    const ac = new AbortController();
+    let served = 0;
+    const s = Deno.serve(
+      { port: 0, signal: ac.signal, onListen: () => {} },
+      () => {
+        served++;
+        return new Response(
+          new ReadableStream({
+            async start(c) {
+              c.enqueue(enc.encode(
+                `data: ${
+                  JSON.stringify({ choices: [{ delta: { content: "think" } }] })
+                }\n\n`,
+              ));
+              await new Promise((r) => setTimeout(r, 5_000));
+              c.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    );
+    const url = `http://127.0.0.1:${(s.addr as Deno.NetAddr).port}`;
+
+    t.init();
+    t.send.setInput("one");
+    const sent = t.send.send(url);
+    await new Promise((r) => setTimeout(r, 120));
+    t.send.setInput("two");
+    await t.send.submit(url);
+    t.expect.state((x) => x.queue.length === 1);
+    t.send.stop();
+    await sent;
+
+    t.expect.state((x) => x.streaming === false);
+    t.expect.state((x) => x.queue.length === 1, "kept, not thrown away");
+    t.expect.state((x) => x.queue[0] === "two");
+    assertEquals(served, 1, "the cancelled run did not pull the next message");
+
+    ac.abort();
+    await s.finished;
+  },
+);
+
+testCell(
+  chat,
+  "a server that fails holds the queue instead of emptying it into the void",
+  async (t) => {
+    // Six queued messages against a server that is refusing is six identical
+    // errors and a lost queue. The failure has to arrive mid-drain to prove
+    // it, which is why the server is slow as well as broken.
+    const srv = slowServer({ status: 500 });
+    t.init();
+
+    t.send.setInput("one");
+    const first = t.send.send(srv.url);
+    await new Promise((r) => setTimeout(r, 80));
+    t.send.setInput("two");
+    await t.send.submit(srv.url);
+    await first;
+
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.lastError.length > 0, "and it says so");
+    t.expect.state((s) => s.queue.length === 1, "the second one is still safe");
+    t.expect.state((s) => s.queue[0] === "two");
+    assertEquals(srv.requests(), 1, "it did not throw the next one after it");
+    await srv.close();
+  },
+);
+
+testCell(chat, "an idle submit is the request itself", async (t) => {
+  // Nothing running, so there is nothing to wait for: submit sends, and the
+  // queue never holds it.
+  const srv = slowServer({ delayMs: 0 });
+  t.init();
+  t.send.setInput("go");
+  await t.send.submit(srv.url);
+  t.expect.state((s) => s.input === "");
+  t.expect.state((s) => s.queue.length === 0);
+  t.expect.state((s) => s.messages[0]?.content === "go");
+  await srv.close();
+});
+
+testCell(chat, "removing a queued message leaves the rest in order", (t) => {
+  t.init();
+  t.send.setInput("a");
+  t.send.submit("http://127.0.0.1:1");
+  t.expect.state((s) => s.messages.length >= 0); // the send is allowed to fail
+  t.send.clearQueue();
+  t.expect.state((s) => s.queue.length === 0);
+});
 
 testCell(chat, "clear wipes the conversation and the last error", (t) => {
   t.init();

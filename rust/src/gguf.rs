@@ -315,6 +315,13 @@ pub struct Gguf {
     pub nextn_layers: u64,
     pub n_expert: u64,
     pub n_expert_used: u64,
+    /// Dense / per-expert feed-forward width (`feed_forward_length`,
+    /// `expert_feed_forward_length`). The prefill activations scale with the
+    /// WIDEST matmul in the graph, which is the FFN, not the embedding — a
+    /// compute-buffer estimate built on `n_embd` alone under-bills a large
+    /// micro-batch several times over (`plan.ts`). 0 = not declared.
+    pub n_ff: u64,
+    pub n_ff_exp: u64,
     pub rope_freq_base: f64,
     pub n_tensors: u64,
     pub tensor_bytes: u64,
@@ -431,8 +438,17 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     let swa_pattern = a("attention.sliding_window_pattern").unwrap_or(1.0) as u64;
     let kv_lora_rank = a("attention.kv_lora_rank").unwrap_or(0.0) as u64;
     // Hybrid linear attention: absent on the great majority of models, and
-    // absent means "full attention on every layer".
-    let full_attn_interval = a("full_attention_interval").unwrap_or(0.0) as u64;
+    // absent means "full attention on every layer" — except on qwen4exp
+    // (Qwen3.8-Flash-Next), where llama.cpp hardcodes an interval of 4 when the
+    // key is missing (`models/qwen4exp.cpp`). The official conversion writes
+    // the key, but a file from another tool may not, and reading its absence as
+    // "dense" bills 48 layers of per-token KV where 12 exist — a 4x
+    // overestimate of exactly the kind the hybrid support exists to prevent.
+    let full_attn_interval = match a("full_attention_interval") {
+        Some(v) => v as u64,
+        None if arch == "qwen4exp" => 4,
+        None => 0,
+    };
     let ssm_d_conv = a("ssm.conv_kernel").unwrap_or(0.0) as u64;
     let ssm_d_inner = a("ssm.inner_size").unwrap_or(0.0) as u64;
     let ssm_d_state = a("ssm.state_size").unwrap_or(0.0) as u64;
@@ -490,7 +506,14 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
                     layers[i].expert_bytes += size;
                 }
             }
-            _ if name.starts_with("token_embd") => embd_bytes += size,
+            // `per_layer_token_embd` is qwen4exp's PLE n-gram gather table (and
+            // gemma3n's per-layer embeddings) — LLM_TENSOR_LAYER_INPUT in
+            // llama.cpp, pinned to the CPU at any `-ngl` exactly like
+            // `token_embd`. On Qwen3.8-Flash-Next it is ~27 GB of a 111 GB
+            // file; filing it under "output" hands a quarter of the model to
+            // the head that `-ngl` offloads, and every VRAM plan is wrong.
+            _ if name.starts_with("token_embd")
+                || name.starts_with("per_layer_token_embd") => embd_bytes += size,
             _ => output_bytes += size,
         }
     }
@@ -533,6 +556,8 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         nextn_layers: a("nextn_predict_layers").unwrap_or(0.0) as u64,
         n_expert: a("expert_count").unwrap_or(0.0) as u64,
         n_expert_used: a("expert_used_count").unwrap_or(0.0) as u64,
+        n_ff: a("feed_forward_length").unwrap_or(0.0) as u64,
+        n_ff_exp: a("expert_feed_forward_length").unwrap_or(0.0) as u64,
         rope_freq_base: a("rope.freq_base").unwrap_or(0.0),
         n_tensors,
         tensor_bytes,
@@ -565,7 +590,7 @@ pub fn to_json(g: &Gguf) -> String {
             "\"keyLength\":{},\"valueLength\":{},",
             "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"fullAttnInterval\":{},",
             "\"ssmDConv\":{},\"ssmDInner\":{},\"ssmDState\":{},\"ssmNGroup\":{},\"nextnLayers\":{},",
-            "\"nExpert\":{},\"nExpertUsed\":{},",
+            "\"nExpert\":{},\"nExpertUsed\":{},\"nFf\":{},\"nFfExp\":{},",
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"embdBytes\":{},\"outputBytes\":{},",
             "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},",
             "\"layers\":[{}]}}"
@@ -592,6 +617,8 @@ pub fn to_json(g: &Gguf) -> String {
         g.nextn_layers,
         g.n_expert,
         g.n_expert_used,
+        g.n_ff,
+        g.n_ff_exp,
         num(g.rope_freq_base),
         g.n_tensors,
         g.tensor_bytes,
@@ -730,6 +757,74 @@ mod tests {
         let j = to_json(&g);
         assert!(j.contains("\"fullAttnInterval\":4"), "{}", j);
         assert!(j.contains("\"ssmDInner\":6144"), "{}", j);
+    }
+
+    /// qwen4exp (Qwen3.8-Flash-Next) is hybrid BY ARCHITECTURE: llama.cpp
+    /// hardcodes an interval of 4 when the key is absent
+    /// (`models/qwen4exp.cpp`), so absence must not read as "dense" — that
+    /// would bill 48 layers of per-token KV where 12 exist.
+    #[test]
+    fn qwen4exp_defaults_the_attention_interval_to_four() {
+        let mut b = Buf::new();
+        b.u64(0); // tensors
+        b.u64(2); // kv
+        b.kv_str("general.architecture", "qwen4exp");
+        b.kv_u32("qwen4exp.block_count", 48);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.full_attn_interval, 4);
+        // An explicit value still wins over the architecture's default.
+        let mut b = Buf::new();
+        b.u64(0);
+        b.u64(3);
+        b.kv_str("general.architecture", "qwen4exp");
+        b.kv_u32("qwen4exp.block_count", 48);
+        b.kv_u32("qwen4exp.full_attention_interval", 6);
+        assert_eq!(parse(&b.0).unwrap().full_attn_interval, 6);
+    }
+
+    /// qwen4exp's PLE n-gram gather table is an INPUT tensor —
+    /// LLM_TENSOR_LAYER_INPUT, CPU-pinned at any `-ngl`, like `token_embd` —
+    /// and on Qwen3.8-Flash-Next it is ~27 GB of a 111 GB file. Filed under
+    /// "output" it hands a quarter of the model to the head `-ngl` offloads.
+    #[test]
+    fn per_layer_token_embd_is_input_not_output() {
+        let mut b = Buf::new();
+        b.u64(3); // tensors
+        b.u64(2); // kv
+        b.kv_str("general.architecture", "qwen4exp");
+        b.kv_u32("qwen4exp.block_count", 48);
+        b.tensor("token_embd.weight", &[2560, 248320], 8);
+        b.tensor("per_layer_token_embd.weight", &[160, 320001536], 20);
+        b.tensor("output.weight", &[2560, 248320], 8);
+        let g = parse(&b.0).unwrap();
+        let q8 = |e: u64| e / 32 * 34;
+        let iq4nl = |e: u64| e / 32 * 18;
+        assert_eq!(
+            g.embd_bytes,
+            q8(2560 * 248320) + iq4nl(160 * 320001536),
+            "the PLE table is billed with the embeddings"
+        );
+        assert_eq!(g.output_bytes, q8(2560 * 248320), "the head stays the head");
+    }
+
+    /// The FFN widths feed the compute-buffer estimate: prefill activations
+    /// scale with the widest matmul, which is the FFN — `n_embd` alone
+    /// under-bills a large micro-batch several times over.
+    #[test]
+    fn reads_feed_forward_widths() {
+        let mut b = Buf::new();
+        b.u64(0); // tensors
+        b.u64(4); // kv
+        b.kv_str("general.architecture", "llama");
+        b.kv_u32("llama.block_count", 32);
+        b.kv_u32("llama.feed_forward_length", 25600);
+        b.kv_u32("llama.expert_feed_forward_length", 640);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.n_ff, 25600);
+        assert_eq!(g.n_ff_exp, 640);
+        let j = to_json(&g);
+        assert!(j.contains("\"nFf\":25600"), "{}", j);
+        assert!(j.contains("\"nFfExp\":640"), "{}", j);
     }
 
     /// Absent on ordinary models, and absent means zero — full attention on
