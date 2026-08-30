@@ -137,6 +137,40 @@ const SIGNATURES: Sig[] = [
     ],
   },
   {
+    // BEFORE the generic load failure, which would otherwise blame a truncated
+    // download for a file that is perfectly intact. `unknown model
+    // architecture` means the FILE is fine and the BUILD is old: llama.cpp
+    // reads `general.architecture` from the header and looks it up in a table
+    // compiled into the binary (`llama-arch.cpp`), so a model published before
+    // its support merged upstream cannot load however many times it is
+    // re-downloaded. Measured on GLM-5.3-Flash (`glm5next`) against a master
+    // build from the same day: three open PRs, nothing merged, and the app
+    // told the user to re-scan their models.
+    match: /unknown model architecture:?\s*'([^']+)'/i,
+    reason: (m) =>
+      `This llama.cpp build does not know the architecture “${
+        m[1]
+      }”. The file is fine — the build is older than the model. Support for an architecture is compiled into llama-server, so no re-download or different quantisation can change this answer.`,
+    steps: (m) => [
+      {
+        text:
+          "Build “master” from source on the Build tab — if support has merged upstream since this build was made, that is the whole fix.",
+        action: { kind: "open-tab", tab: "build" },
+      },
+      {
+        text: `If a fresh master build says the same thing, support for “${
+          m[1]
+        }” has not merged yet and the model cannot run on any official build. Check upstream for the pull request that adds it.`,
+        action: {
+          kind: "open-url",
+          url: `https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr+${
+            encodeURIComponent(m[1] ?? "")
+          }`,
+        },
+      },
+    ],
+  },
+  {
     match: /failed to load model|error loading model|no such file/i,
     reason: (m) =>
       /no such file/i.test(m[0])
@@ -182,6 +216,32 @@ const SIGNATURES: Sig[] = [
         text:
           "Or lower the context or “GPU layers” by hand on the Tune tab, and watch the VRAM bar while generating.",
         action: { kind: "open-tab", tab: "dashboard" },
+      },
+    ],
+  },
+  {
+    // A "not implemented yet" assert is llama.cpp naming a gap in ITSELF, and
+    // it is the one assert with a setting behind it. The ladder already drops
+    // the flag and starts again (`fitladder.ts:unsupportedFeature`), so this is
+    // what the user reads when the retries are exhausted or auto-fit is off —
+    // and it must not read as a crash in their model. Captured on
+    // GLM-5.3-Flash: the header declares an MTP block, the loader had not
+    // implemented the graph, and the trace pointed at `graph_reserve` with
+    // nothing on screen naming the flag that asked for it.
+    match: /GGML_ASSERT\([^)]*not implemented[^)]*\)/i,
+    reason: (m) =>
+      `This llama.cpp build does not implement something the settings asked for, and said so itself: ${
+        /"([^"]+)"/.exec(m[0])?.[1] ?? "a feature it has not written yet"
+      }. The model is fine and the memory was fine \u2014 one setting is ahead of the build.`,
+    steps: [
+      {
+        text:
+          "With \u201cOptimal automatically\u201d on, the app drops that setting and starts again by itself, then remembers it for this build so the next start does not pay for the discovery twice.",
+      },
+      {
+        text:
+          "Otherwise turn off the setting the message names \u2014 speculative decoding is the usual one \u2014 on the Tune tab.",
+        action: { kind: "open-tab", tab: "settings" },
       },
     ],
   },

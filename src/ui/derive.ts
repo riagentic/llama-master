@@ -87,6 +87,20 @@ export function activeBuild(): Build | null {
   return builds.installed.find((b) => b.id === builds.activeId) ?? null;
 }
 
+/**
+ * What the ACTIVE build has already proven it cannot do for the SELECTED model.
+ *
+ * Keyed on the pair, because that is what the fact is about: a newer build is a
+ * different key and starts with a clean sheet, so "not implemented yet" cannot
+ * outlive the build that said it (`cfg.unsupported`).
+ */
+export function unsupportedHere(): readonly string[] {
+  const b = builds.activeId;
+  const m = models.selected;
+  if (!b || !m) return [];
+  return cfg.unsupported[`${b}\n${m}`] ?? [];
+}
+
 export function buildBusy(): boolean {
   return builds.job?.status === "running";
 }

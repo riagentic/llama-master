@@ -78,10 +78,13 @@ import {
   nCpuMoeOf,
   openingCtx,
   requestedB,
+  unsupportedFeature,
+  vetoUnsupported,
   withCtx,
   withNCpuMoe,
+  withoutFlag,
 } from "../src/lib/fitladder.ts";
-import type { Hw, ModelMeta } from "../src/lib/types.ts";
+import type { Hw, ModelMeta, Settings } from "../src/lib/types.ts";
 import {
   drift,
   HEADROOM_FRACTION,
@@ -2508,6 +2511,117 @@ Deno.test("serverlog: a generation-time OOM is memory advice, not a driver misma
     "0.00.100.000 E CUDA error: forward compatibility was attempted on non supported HW",
   ]);
   assertStringIncludes(drv.reason, "driver");
+});
+
+Deno.test("fitladder: a feature the build lacks is dropped, not retried smaller", () => {
+  // Verbatim from GLM-5.3-Flash on the first build that knew the architecture.
+  // The header declares one NextN block, so the tuner turned MTP on — right by
+  // every fact a header can carry — and the loader aborted because the graph
+  // was not written yet. Both memory rungs are useless here: the ladder would
+  // have reloaded 157 GB six times, halving a context that was never the
+  // problem, and hit the same assert at every size.
+  const lines = [
+    "1.03.849.154 I common_speculative_init_result: creating MTP draft context against the target model",
+    '/src/models/glm5next.cpp:712: GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "glm5next NextN graph not implemented yet") failed',
+    "[llama.master] llama-server exited with code 134",
+  ];
+  const found = unsupportedFeature(lines);
+  assertEquals(found?.setting, "specType");
+  assertEquals(found?.flag, "--spec-type");
+
+  const d = fitDecision({ lines, ctx: 124416, tries: 0, auto: true });
+  assertEquals(d.kind, "drop");
+  if (d.kind !== "drop") throw new Error("unreachable");
+  assertStringIncludes(d.note, "--spec-type");
+
+  // And the argv it produces is the one that ran, minus that flag and its value.
+  const argv = [
+    "/b/llama-server",
+    "-m",
+    "/m/glm.gguf",
+    "--spec-type",
+    "draft-mtp",
+    "-c",
+    "124416",
+  ];
+  assertEquals(withoutFlag(argv, "--spec-type", 1), [
+    "/b/llama-server",
+    "-m",
+    "/m/glm.gguf",
+    "-c",
+    "124416",
+  ]);
+
+  // An abort with no setting behind it is a crash, not a rung: nothing is
+  // stripped and the ordinary path explains it.
+  assertEquals(
+    unsupportedFeature([
+      "/src/ggml.c:1: GGML_ASSERT(ne0 == ne1) failed",
+    ]),
+    null,
+  );
+  // And the words alone, with no abort, must never strip a flag from a run that
+  // merely mentioned the feature.
+  assertEquals(
+    unsupportedFeature(["I srv: LLM_GRAPH_TYPE_DECODER_MTP enabled"]),
+    null,
+  );
+});
+
+Deno.test("fitladder: a refused feature is taken back out of the tuner's answer", () => {
+  const base = { specType: "draft-mtp", ctxSize: 4096 } as unknown as Settings;
+  const veto = vetoUnsupported(base, ["specType"]);
+  assertEquals(veto.settings.specType, "");
+  assertEquals(veto.settings.ctxSize, 4096, "nothing else moves");
+  assertStringIncludes(veto.reasons[0] ?? "", "not implemented yet");
+  // Untouched when nothing has been refused — the tuner's answer stands, and
+  // the object is returned as-is rather than rebuilt.
+  assertEquals(vetoUnsupported(base, []).settings, base);
+  assertEquals(vetoUnsupported(base, []).reasons.length, 0);
+});
+
+Deno.test("serverlog: an unknown architecture blames the build, not the file", () => {
+  // Verbatim from GLM-5.3-Flash (unsloth IQ4_XS, 157 GB across 5 shards) on a
+  // master build made the same morning: the load failed in 58 ms and the app
+  // said "a truncated download or an unsupported quantisation are the usual
+  // ones" and offered a re-scan. Both wrong. The file was intact — this app's
+  // own reader had already parsed 1,412 tensors out of it — and re-downloading
+  // 157 GB would have changed nothing, because `glm5next` had three OPEN pull
+  // requests upstream and nothing merged.
+  const lines = [
+    "0.00.518.604 I srv    load_model: loading model '/m/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf'",
+    "0.00.576.055 E llama_model_load: error loading model: unknown model architecture: 'glm5next'",
+    "0.00.576.067 E llama_model_load_from_file_impl: failed to load model",
+    "0.00.576.081 E srv    load_model: failed to load model, '/m/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf'",
+  ];
+  const d = diagnoseServerExit(1, lines);
+  assertStringIncludes(d.reason, "glm5next");
+  assertStringIncludes(d.reason, "does not know the architecture");
+  assertStringIncludes(d.reason, "The file is fine");
+  assert(
+    !/truncated/i.test(d.reason),
+    `the download is not the suspect: ${d.reason}`,
+  );
+  assert(
+    !d.steps.some((s2) => /Re-scan/i.test(s2.text)),
+    "re-scanning the model list cannot teach a build a new architecture",
+  );
+  assert(
+    d.steps.some((s2) => s2.action?.kind === "open-tab"),
+    "the first move is a newer build",
+  );
+  assertStringIncludes(
+    d.steps.map((s2) => s2.action?.kind === "open-url" ? s2.action.url : "")
+      .join(""),
+    "glm5next",
+    "and the second names where support would come from",
+  );
+
+  // A genuinely broken file still gets the ordinary answer.
+  const plain = diagnoseServerExit(1, [
+    "0.00.100.000 E error loading model: tensor 'blk.0.attn_q.weight' data is not within the file bounds",
+  ]);
+  assertStringIncludes(plain.reason, "could not load this model file");
 });
 
 Deno.test("serverlog: a scheduler-limit assert is named, not blamed on memory", () => {

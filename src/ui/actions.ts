@@ -22,6 +22,7 @@ import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
 import type { Backend, ModelMeta } from "../lib/types.ts";
 import { bestPlacement, PLACEMENTS, tune } from "../lib/tune.ts";
+import { vetoUnsupported } from "../lib/fitladder.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
 import type { Stability } from "../lib/stability.ts";
@@ -37,6 +38,7 @@ import {
   planningHw,
   reserveCost,
   serverRunning,
+  unsupportedHere,
 } from "./derive.ts";
 
 // Re-exported so panels have one import for "the current thing".
@@ -253,7 +255,14 @@ function tunedForStart(): { tuning: Tuning; reasons: string[] } | null {
     }
   }
   const tuning = all[chosen];
-  return { tuning, reasons: [...extra, ...tuning.reasons] };
+  // Anything this build has already refused for this model comes back out
+  // before the settings are applied — otherwise auto-optimal proposes it on
+  // every start and the ladder pays a whole reload to drop it again.
+  const veto = vetoUnsupported(tuning.settings, unsupportedHere());
+  return {
+    tuning: { ...tuning, settings: veto.settings },
+    reasons: [...extra, ...tuning.reasons, ...veto.reasons],
+  };
 }
 
 /** Apply the tuner for the selected placement (falling back if it cannot run). */

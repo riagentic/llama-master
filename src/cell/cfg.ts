@@ -51,6 +51,20 @@ export type CfgState = {
    *  of walking the ladder again (`src/lib/fitladder.ts`). A ceiling, never a
    *  target: the tuner still has to fit it in the memory that is free now. */
   fitCtx: Record<string, number>;
+  /** Settings a given build has PROVEN it cannot honour for a given model.
+   *
+   *  Keyed `<build id>\n<model path>`, because it is a fact about the pair and
+   *  about neither alone: the header genuinely declares the feature (so every
+   *  other model of that architecture is unaffected), and the build genuinely
+   *  lacks it (so the same model works the moment support lands, and must not
+   *  be held back by something this app wrote down in August).
+   *
+   *  Learned the only way it can be — by asking. GLM-5.3-Flash ships a NextN
+   *  block, so the tuner turned multi-token prediction on; the loader for that
+   *  architecture aborted with "NextN graph not implemented yet". The ladder
+   *  drops the flag and the run continues, and this is what stops the next
+   *  start paying a 157 GB reload to discover it again. */
+  unsupported: Record<string, string[]>;
   /** This machine's measured effective memory bandwidth, bytes/second, learned
    *  from real generation (`src/lib/speed.ts:calibrate`). 0 = never measured, in
    *  which case a labelled default is used instead. */
@@ -98,6 +112,7 @@ export const cfg = cell("cfg", {
     ctxOverrideFor: "",
     autoOptimal: true,
     fitCtx: {} as Record<string, number>,
+    unsupported: {} as Record<string, string[]>,
     gpuBps: 0,
     ramBps: 0,
     reservePerGpuVramB: DEFAULT_RESERVE_PER_GPU_VRAM_B,
@@ -157,6 +172,26 @@ export const cfg = cell("cfg", {
       if (!at.model || at.ctx <= 0) return;
       if (!at.exact && (s.fitCtx[at.model] ?? 0) >= at.ctx) return;
       s.fitCtx[at.model] = at.ctx;
+    },
+
+    /**
+     * Write down a capability this build does not have for this model.
+     *
+     * Grow-only within its key, and the key carries the build id — so this can
+     * never outlive the build that earned it. A newer llama.cpp is a different
+     * id and starts with a clean sheet, which is the whole point: "not
+     * implemented yet" is a statement with an expiry date.
+     */
+    rememberUnsupported(
+      s,
+      at: { build: string; model: string; settings: readonly string[] },
+    ) {
+      if (!at.build || !at.model || at.settings.length === 0) return;
+      const key = `${at.build}\n${at.model}`;
+      const had = s.unsupported[key] ?? [];
+      const next = at.settings.filter((k) => !had.includes(k));
+      if (next.length === 0) return;
+      s.unsupported[key] = [...had, ...next];
     },
 
     /** Forget it, when a start fails for want of memory at that very size. */

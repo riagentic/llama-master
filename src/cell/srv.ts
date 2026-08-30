@@ -16,6 +16,7 @@ import {
   nCpuMoeOf,
   withCtx,
   withNCpuMoe,
+  withoutFlag,
 } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
@@ -100,6 +101,15 @@ export type SrvState = {
   autoFit: boolean;
   /** What the last automatic step-down did, in words, for the panel. */
   fitNote: string;
+  /** Settings this RUN proved the build cannot honour — dropped from the argv
+   *  by the ladder's capability rung after llama.cpp aborted naming a feature
+   *  it has not implemented (`fitladder.ts:unsupportedFeature`).
+   *
+   *  A fact about the BUILD, so it is worth writing down: the header that asked
+   *  for it will say the same thing on every start, and re-learning it costs a
+   *  whole reload of the model. `OnePage` commits it to `cfg.unsupported` the
+   *  way it commits a proven context to `cfg.fitCtx`. */
+  unsupported: string[];
   /** Probes that timed out on this run. A timeout is a slow machine, not a
    *  dead process — counting it as death left a working server "starting"
    *  forever (see the probe branch in `poll`). */
@@ -185,6 +195,7 @@ export const srv = cell("srv", {
     runCardFreeB: [] as number[],
     autoFit: false,
     fitNote: "",
+    unsupported: [] as string[],
   } as SrvState,
   methods: {
     /** Spawn llama-server with the exact command shown in the UI.
@@ -232,6 +243,7 @@ export const srv = cell("srv", {
       if (!run?.retry) {
         s.fitTries = 0;
         s.fitNote = "";
+        s.unsupported = [];
         s.autoFit = run?.autoFit ?? false;
       }
       s.lastError = "";
@@ -392,6 +404,12 @@ export const srv = cell("srv", {
             // retry.
             const next = decision.kind === "retry"
               ? withCtx(s.argv, decision.ctx)
+              : decision.kind === "drop"
+              ? withoutFlag(
+                s.argv,
+                decision.unsupported.flag,
+                decision.unsupported.arity,
+              )
               : withNCpuMoe(s.argv, decision.nCpuMoe);
             s.fitTries += 1;
             s.fitNote = decision.note;
@@ -399,6 +417,19 @@ export const srv = cell("srv", {
             if (s.runSettings) {
               if (decision.kind === "retry") {
                 s.runSettings.ctxSize = decision.ctx;
+              } else if (decision.kind === "drop") {
+                // The settings must stop claiming a feature the argv no longer
+                // asks for, or the Setup pills and the process disagree about
+                // what is running.
+                s.runSettings.specType = "";
+                // And the next start must not ask again: this is a fact about
+                // the build, learned by asking, and the header it contradicts
+                // will say the same thing every time.
+                s.unsupported = s.unsupported.includes(
+                    decision.unsupported.setting,
+                  )
+                  ? s.unsupported
+                  : [...s.unsupported, decision.unsupported.setting];
               } else {
                 s.runSettings.nCpuMoe = decision.nCpuMoe;
                 // The split went with the placement that just failed, and

@@ -24,6 +24,7 @@
 // Pure: log lines and numbers in, a decision out.
 
 import { MIN_CTX } from "./tune.ts";
+import type { Settings } from "./types.ts";
 
 /**
  * How many times a start may be retried at a smaller context before the app
@@ -174,10 +175,109 @@ export function movedLayers(shortB: number, perLayerB: number): number {
 }
 
 /** What the app should do about a run that has just ended. */
+/**
+ * A capability the run asked for and this build cannot provide.
+ *
+ * Not a memory failure, and the ladder's other two rungs are useless against
+ * it — but it has the same shape as one: the run told us something specific
+ * that no reading of the header could have, and the answer is one flag away.
+ *
+ * Found the expensive way on GLM-5.3-Flash. The header declares one NextN
+ * block, so the tuner turned multi-token prediction on — correctly, by every
+ * fact available to it: the weights ARE in the file, and llama.cpp asserts the
+ * other way (`n_layer_nextn > 0`) for a model without them. But the loader for
+ * this architecture had not implemented the graph yet:
+ *
+ *   glm5next.cpp:712: GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP
+ *   && "glm5next NextN graph not implemented yet") failed
+ *
+ * That is a fact about the BUILD, not the model, and it can only be learned by
+ * asking. So the ladder asks once, drops the flag, and the run continues
+ * without the optimisation instead of aborting with a stack trace.
+ *
+ * The table is deliberately tiny: only asserts that name a feature a SETTING
+ * turns off belong here. An assert with no flag behind it is a crash, and
+ * `serverlog.ts` explains it rather than this file retrying it.
+ */
+export type Unsupported = {
+  /** The `Settings` key to clear, so the next start does not ask again. */
+  setting: "specType";
+  /** The flag to strip from the argv, and how many words it takes with it. */
+  flag: string;
+  arity: number;
+  /** What the user loses, in their terms. */
+  feature: string;
+};
+
+const UNSUPPORTED: { match: RegExp; found: Unsupported }[] = [
+  {
+    // llama.cpp's own words, and the quoted half is what makes this safe to
+    // act on: "not implemented yet" is a promise about the BUILD, not a
+    // complaint about the model or the machine.
+    match: /GRAPH_TYPE_DECODER_MTP|NextN graph not implemented/i,
+    found: {
+      setting: "specType",
+      flag: "--spec-type",
+      arity: 1,
+      feature: "speculative decoding off the model's own MTP block",
+    },
+  },
+];
+
+/**
+ * Did this run die because the build cannot do something it was asked to?
+ *
+ * Requires the abort as well as the signature: llama.cpp prints the assert text
+ * on the way down, and matching the text alone would strip a flag from a run
+ * that merely MENTIONED it.
+ */
+export function unsupportedFeature(
+  lines: readonly string[],
+): Unsupported | null {
+  const text = lines.join("\n");
+  if (!/GGML_ASSERT|ggml_abort/.test(text)) return null;
+  return UNSUPPORTED.find((u) => u.match.test(text))?.found ?? null;
+}
+
+/**
+ * The tuner's answer, with anything this build has already refused taken back
+ * out — and a sentence saying so.
+ *
+ * The tuner is right to propose it: `meta.nextnLayers > 0` means the weights
+ * are in the file, and that is every fact a header can offer. What it cannot
+ * know is whether the loader implements the graph, which is why this is applied
+ * AFTER tuning rather than folded into it — the rule is not "this model has no
+ * MTP block", it is "this build could not use the one it has".
+ *
+ * The reason is worth printing because the alternative is a silent difference
+ * between what the tuner said and what the command shows.
+ */
+export function vetoUnsupported(
+  settings: Settings,
+  unsupported: readonly string[],
+): { settings: Settings; reasons: string[] } {
+  if (unsupported.length === 0) return { settings, reasons: [] };
+  const out = { ...settings };
+  const reasons: string[] = [];
+  if (unsupported.includes("specType") && out.specType) {
+    out.specType = "";
+    reasons.push(
+      "Speculative decoding off — this llama.cpp build aborted on this model's multi-token-prediction block, saying the graph is not implemented yet. The model still runs; only the speed differs. A newer build starts with a clean sheet.",
+    );
+  }
+  return { settings: out, reasons };
+}
+
 export type FitDecision =
   | { kind: "none" }
   | { kind: "retry"; ctx: number; attempt: number; note: string }
-  | { kind: "offload"; nCpuMoe: number; attempt: number; note: string };
+  | { kind: "offload"; nCpuMoe: number; attempt: number; note: string }
+  | {
+    kind: "drop";
+    unsupported: Unsupported;
+    attempt: number;
+    note: string;
+  };
 
 /**
  * Should the app try again, and with what changed?
@@ -210,6 +310,22 @@ export function fitDecision(args: {
   deviceFreeB?: readonly number[];
 }): FitDecision {
   if (!args.auto || args.tries >= MAX_FIT_RETRIES) return { kind: "none" };
+
+  // BEFORE the memory rungs, because an abort is not an allocation failure and
+  // neither of them would move it: the run would shrink its context five times
+  // and hit the same assert at every size.
+  const cannot = unsupportedFeature(args.lines);
+  if (cannot) {
+    return {
+      kind: "drop",
+      unsupported: cannot,
+      attempt: args.tries + 1,
+      note:
+        `This llama.cpp build cannot do ${cannot.feature} for this model — it said so itself, in an assert naming the graph it has not implemented yet. ` +
+        `Retrying without ${cannot.flag}. Nothing else about the plan changes, and the answer is the same either way: only the speed differs.`,
+    };
+  }
+
   const fault = fitFault(args.lines);
   if (!fault) return { kind: "none" };
 
@@ -333,6 +449,30 @@ export function withNCpuMoe(argv: readonly string[], n: number): string[] {
  * is free right now, and a machine with less free VRAM than last time gets less.
  * Absent (0), the tuner's own estimate opens the bidding.
  */
+/**
+ * The same argv without one flag and the words it takes with it.
+ *
+ * Editing the command that RAN rather than re-composing one, for the reason
+ * every other rung does: re-composing would pick up whatever the user has
+ * changed since they pressed Start, and "what you see is what runs" would stop
+ * being true across a retry.
+ */
+export function withoutFlag(
+  argv: readonly string[],
+  flag: string,
+  arity = 1,
+): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === flag) {
+      i += arity;
+      continue;
+    }
+    out.push(argv[i] as string);
+  }
+  return out;
+}
+
 export function openingCtx(known: number, wanted: number): number {
   return known > 0 ? Math.min(known, wanted) : wanted;
 }

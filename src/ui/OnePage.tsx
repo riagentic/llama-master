@@ -311,6 +311,25 @@ function RunStrip() {
     // re-run the crash at the top of every session.
     cfg.rememberFit({ model: srv.runModel, ctx, exact: srv.fitTries > 0 });
   });
+  // Write down what the build could not do. Unlike the context above this is
+  // recorded the moment the ladder learns it rather than on `proven`: the abort
+  // IS the proof, it names the feature in llama.cpp's own words, and it holds
+  // whether or not the run that follows goes on to succeed for some other
+  // reason. Keyed on the build AND the model, so a newer llama.cpp is never
+  // held back by what an older one could not do.
+  const notedUnsupported = useRef("");
+  afterRender(() => {
+    if (srv.unsupported.length === 0 || !srv.runModel) return;
+    const build = builds.activeId;
+    const k = `${build}|${srv.runModel}|${srv.unsupported.join(",")}`;
+    if (notedUnsupported.current === k || !build) return;
+    notedUnsupported.current = k;
+    cfg.rememberUnsupported({
+      build,
+      model: srv.runModel,
+      settings: srv.unsupported.slice(),
+    });
+  });
   // Learn this machine's real bandwidth from the reply it just produced. The
   // speed estimate is bandwidth ÷ bytes-per-token, and bandwidth is the one term
   // that cannot be read off the machine — so the app ships a labelled default and
