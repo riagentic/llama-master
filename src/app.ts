@@ -35,31 +35,42 @@ await aio.run({
   // silenced one poller by blinding every tight reducer at once. Per-method
   // budgets mean a four-minute compile no longer costs the rest of the app its
   // signal. (dep/aio/docs/debugging/performance.md)
+  //
+  // Two tools, and the difference is whether a ceiling can be named honestly.
+  // `effect` (here) is the budget a breach of which is WORTH REPORTING, and it
+  // is per method for the reason above. The CALL ceiling is `long:` on the cell
+  // (`builds.start/update`, `prereq.fix/fixAll`, `models.scan`, `srv.start`) —
+  // work whose duration belongs to a compiler, a package manager, a disk or a
+  // 145 GB file, where any number here would be a guess about somebody else's
+  // machine that abandons a call still doing its job. It lives on the cell
+  // because `long:` is checked against the method list at cell() time, while
+  // these string keys are checked by nothing and no rename follows them. The
+  // timeouts that remain are real bounds on work that is quick by nature.
   perfBudget: {
     reduce: 100,
     methods: {
       // Spawns cmake/make and streams their output for minutes — and on the
       // release route downloads and extracts hundreds of MB instead.
-      "builds:start": { effect: 600_000, timeout: 3_600_000 },
+      "builds:start": { effect: 600_000 },
       // Rebuild/reinstall in place when llama.cpp moves on, then restart.
-      "builds:update": { effect: 600_000, timeout: 3_600_000 },
+      "builds:update": { effect: 600_000 },
       // Two HTTP calls to GitHub, plus the HTML fallback when the API quota is
       // gone.
       "builds:loadAssets": { effect: 30_000, timeout: 60_000 },
       "builds:loadRefs": { effect: 30_000, timeout: 60_000 },
       "builds:checkUpdates": { effect: 30_000, timeout: 60_000 },
       // Reads a 2 MB GGUF header per model across every search path.
-      "models:scan": { effect: 30_000, timeout: 120_000 },
+      "models:scan": { effect: 30_000 },
       // Shells out to nvidia-smi and reads /proc every second.
       "hw:refresh": { effect: 2_000, timeout: 10_000 },
       // Spawns `df`.
       "hw:refreshDisks": { effect: 5_000, timeout: 30_000 },
       // Detects toolchains, and may run an installer script.
       "prereq:scan": { effect: 30_000, timeout: 120_000 },
-      "prereq:fix": { effect: 600_000, timeout: 1_800_000 },
-      "prereq:fixAll": { effect: 600_000, timeout: 1_800_000 },
+      "prereq:fix": { effect: 600_000 },
+      "prereq:fixAll": { effect: 600_000 },
       // Owns a child process: spawn, health-poll, drain its pipes, SIGTERM.
-      "srv:start": { effect: 120_000, timeout: 600_000 },
+      "srv:start": { effect: 120_000 },
       "srv:stop": { effect: 30_000, timeout: 60_000 },
       "srv:poll": { effect: 2_000, timeout: 10_000 },
       "srv:scanOrphans": { effect: 2_000, timeout: 10_000 },

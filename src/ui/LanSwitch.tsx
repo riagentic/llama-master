@@ -24,11 +24,11 @@
 import { cfg } from "../cell/cfg.ts";
 import { hw } from "../cell/hw.ts";
 import { isLanExposed, lanHost, lanUrl, pickLanIp } from "../lib/lan.ts";
-import { num } from "../lib/params.ts";
+import { num, str } from "../lib/params.ts";
 import { runLocked } from "./actions.ts";
 import { serverRunning } from "./derive.ts";
 import { LOCK_REASON } from "./actions.ts";
-import { Toggle } from "./kit.tsx";
+import { Segmented, Toggle } from "./kit.tsx";
 
 export function LanSwitch(props: { t?: string }) {
   const id = props.t ?? "lan";
@@ -86,6 +86,68 @@ export function LanSwitch(props: { t?: string }) {
  * rather than pretending: lowering a priority needs no privileges, but RAISING
  * one back does, so the switch takes effect on the next start.
  */
+/**
+ * Whether a reasoning model thinks before it answers.
+ *
+ * The strongest speed control in the app for a thinking model, and it was
+ * invisible: `--reasoning` went into the catalog as an advanced server flag,
+ * filed next to Prometheus metrics, where nobody looking to make a short
+ * question fast would ever find it. Most of a reasoning model's tokens go into
+ * the think block, so turning it off does not make the model faster per token
+ * — it removes most of the tokens, which is what the user actually feels.
+ *
+ * Three states, not two, because `auto` is the honest default: the model's own
+ * template decides, and forcing `on` for a model with no reasoning mode is a
+ * request llama.cpp cannot honour. Off is a real choice a person makes for a
+ * real reason; on is for the model that would otherwise answer too quickly and
+ * too shallowly.
+ *
+ * NOT locked while a server runs, unlike the placement controls: it changes
+ * the next start, and the note says so — same rule as the priority switch
+ * beside it.
+ */
+export function ThinkSwitch(props: { t?: string }) {
+  const id = props.t ?? "think";
+  const mode = str(cfg.settings, "reasoning") || "auto";
+  const running = serverRunning();
+  return (
+    <div class="lan-switch" t={id}>
+      <span class="think-label">Thinking</span>
+      <Segmented
+        value={mode as "auto" | "on" | "off"}
+        options={[
+          {
+            id: "auto",
+            label: "Auto",
+            tip:
+              "The model's own chat template decides — the right answer for almost every model.",
+          },
+          {
+            id: "on",
+            label: "On",
+            tip:
+              "Always think first. Better answers on hard questions; several times more tokens for the same reply.",
+          },
+          {
+            id: "off",
+            label: "Off",
+            tip:
+              "Skip the thinking pass on models that allow it. The biggest speed win available on a reasoning model — most of its tokens are the thinking — at the cost of depth on hard questions.",
+          },
+        ]}
+        onChange={(v) => cfg.set("reasoning", v)}
+      />
+      {running
+        ? (
+          <span class="lan-note dim" t={`${id}-note`}>
+            takes effect on the next start
+          </span>
+        )
+        : null}
+    </div>
+  );
+}
+
 export function PrioritySwitch(props: { t?: string }) {
   const id = props.t ?? "prio";
   const on = cfg.lowPriority;

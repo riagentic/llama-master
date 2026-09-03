@@ -52,7 +52,9 @@ const ready = () => Date.now() - startedAt >= readyAfter;
 
 const sse = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`;
 
-Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
+// `async`: the completion branch reads `n_predict` off the body so a bench
+// gets back the number of tokens it asked for, the way llama.cpp does.
+Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, async (req) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/health") {
@@ -94,7 +96,25 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
       setTimeout(() => Deno.exit(134), 10);
       return new Promise<Response>(() => {});
     }
-    return Response.json({ content: " ok", tokens_predicted: 2 });
+    // llama.cpp reports its own `timings` on every completion, and that is
+    // what the speed bench reads (`src/lib/bench.ts`). `--no-timings` is the
+    // OTHER thing a bench can meet: a build old enough not to report them,
+    // which has measured nothing — and must be reported as nothing rather than
+    // as a machine running at 0 tokens a second.
+    const asked = await req.json().catch(() => ({})) as { n_predict?: number };
+    const predict = Number(asked.n_predict ?? 2) || 2;
+    return Response.json({
+      content: " ok",
+      tokens_predicted: predict,
+      ...(args.includes("--no-timings") ? {} : {
+        timings: {
+          prompt_n: 42,
+          prompt_per_second: 512.5,
+          predicted_n: predict,
+          predicted_per_second: 37.25,
+        },
+      }),
+    });
   }
 
   if (url.pathname === "/props") {

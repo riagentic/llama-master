@@ -20,6 +20,8 @@ import {
 } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
+import { benchRequest, EMPTY_BENCH, parseBench } from "../lib/bench.ts";
+import type { BenchResult } from "../lib/bench.ts";
 
 export type ServerStatus =
   | "stopped"
@@ -121,6 +123,21 @@ export type SrvState = {
   /** VRAM each card had free when this run was spawned — the denominator that
    *  turns "asked for 34.7 GB" into "short by 12.7 GB". */
   runCardFreeB: number[];
+  /** The last speed measurement, and whether one is running.
+   *
+   *  A measurement rather than an estimate is the point: everything the app
+   *  says about speed divides bytes by a bandwidth it cannot read off the
+   *  machine, and the only observation it had was whatever the user last
+   *  happened to say in the chat — an unknown prompt at an unknown length with
+   *  an unknown amount of thinking in it. `src/lib/bench.ts` holds the same
+   *  question still. Not persisted: it describes a process.
+   *
+   *  `lastBench`, not `bench`: a state key may not share a name with a method
+   *  (aio refuses the cell at `cell()` time, and it is right to — reading
+   *  `srv.bench` in a component would hand back the function). */
+  lastBench: BenchResult;
+  benching: boolean;
+  benchError: string;
 };
 
 /**
@@ -161,6 +178,17 @@ function ownProcess(
 export const srv = cell("srv", {
   // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
   transaction: false,
+  // `start` loads the weights, and the fit ladder may reload them six times:
+  // measured 73 s cold for 145 GB mapped, and every rung is another one. The
+  // old 600 s ceiling would have abandoned a ladder that was still working.
+  // `stop`, `poll` and the rest keep their bounds — they are quick by nature,
+  // so a breach is a fault worth reporting.
+  // `bench` generates 128 tokens, and on a big MoE with experts in host RAM
+  // that is a quarter of a minute; on a cold page cache the prefill in front
+  // of it can be minutes. A ceiling here would abandon a measurement that is
+  // still running and report a fault for a machine that is merely slow —
+  // which is the number the bench exists to find out.
+  long: ["start", "bench"],
   // A process cannot survive a restart of this app, so persisting its state
   // would only ever restore a lie.
   persist: "none",
@@ -196,8 +224,79 @@ export const srv = cell("srv", {
     autoFit: false,
     fitNote: "",
     unsupported: [] as string[],
+    lastBench: EMPTY_BENCH as BenchResult,
+    benching: false,
+    benchError: "",
   } as SrvState,
   methods: {
+    /**
+     * Measure this machine, on the model that is loaded right now.
+     *
+     * Everything the app projects about speed rests on effective bandwidth,
+     * which cannot be read off the hardware (`src/lib/speed.ts`). The app's
+     * only observation was `chat.lastTps` — a real number about an unknown
+     * prompt at an unknown context with an unknown amount of thinking in it.
+     * This is the same observation with the variables held still.
+     *
+     * Runs against the SERVER THAT IS UP: no reload, no second process, no
+     * extra memory, nothing at risk. Refuses when nothing is ready rather than
+     * timing out against a closed port, because "not running" is an answer and
+     * a stack trace is not.
+     */
+    async bench(s, tokens?: number) {
+      if (s.benching) return;
+      if (s.status !== "ready" || !s.url) {
+        s.benchError =
+          "Nothing is running to measure — start the server first.";
+        return;
+      }
+      s.benching = true;
+      s.benchError = "";
+      // Captured BEFORE the await: this method has `transaction: false`, so
+      // every read after the await sees whatever else committed meanwhile, and
+      // a bench must describe the run it started against or nothing at all.
+      const url = s.url;
+      const modelPath = s.runModel;
+      const ctx = Number(s.runSettings?.ctxSize ?? 0) || 0;
+      const pid = s.pid;
+      try {
+        const io = await import("./srv.server.ts");
+        const r = await io.bench(url, benchRequest(tokens));
+        // The run it measured has to still be the run on screen. A stop or a
+        // fit-ladder rung during those seconds replaces the process, and a
+        // measurement of the dead one shown beside the live one is worse than
+        // no measurement.
+        if (s.pid !== pid || s.status !== "ready") { // aiol-ok: deliberate re-read — see above
+          s.benchError =
+            "The server changed while measuring, so the result was discarded.";
+          return;
+        }
+        if (!r.ok) {
+          s.benchError = r.detail;
+          return;
+        }
+        const parsed = parseBench(r.json, {
+          latencyMs: r.latencyMs,
+          ctx,
+          modelPath,
+          at: Date.now(),
+        });
+        if (!parsed) {
+          // A build too old to report `timings`, or a model that stopped
+          // before generating. Neither is a slow machine, and writing 0 tok/s
+          // would say it was.
+          s.benchError =
+            "The server answered but reported no timings — this build is too old to measure, or the model stopped before generating.";
+          return;
+        }
+        s.lastBench = parsed;
+      } catch (e) {
+        s.benchError = String(e);
+      } finally {
+        s.benching = false;
+      }
+    },
+
     /** Spawn llama-server with the exact command shown in the UI.
      *
      *  Returns an `own` effect so the runtime disposes the process on app
@@ -255,6 +354,12 @@ export const srv = cell("srv", {
       // smaller, and it deserves its own patience.
       s.probeSlow = 0;
       s.props = null;
+      // A measurement belongs to ONE process. The settings, the placement and
+      // the context all change across a start, so carrying the old number
+      // forward would put a rate measured on a different run beside this one
+      // and call it this machine's speed.
+      s.lastBench = EMPTY_BENCH;
+      s.benchError = "";
       s.log = [];
       s.diagnosis = null;
       s.argv = argv;
@@ -369,6 +474,14 @@ export const srv = cell("srv", {
         // Read once: TypeScript narrows `s.status` through the guard above, but
         // the live proxy can change under an await, so the branch reads a copy.
         const was: ServerStatus = s.status; // aiol-ok — see the note above
+        // Processed exactly ONCE. The pid is zeroed at the end of this branch,
+        // so a later tick landing on the same dead run must not read the
+        // output again: it re-diagnosed the crash every second for as long as
+        // the app sat on it — a fresh `diagnosis` object broadcast per tick,
+        // `clearLog` undone by the next poll — and, worse, in the gap between
+        // a Start being dispatched and its spawn (status "starting", no
+        // process yet) it ran the fit ladder against the PREVIOUS run's lines.
+        if (s.pid === 0 && was !== "stopping") return;
         if (was === "stopping") {
           s.status = "stopped";
         } else {

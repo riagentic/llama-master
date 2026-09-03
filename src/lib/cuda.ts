@@ -149,6 +149,77 @@ export function cudaPlan(
   };
 }
 
+/**
+ * Which CUDA release to INSTALL so every one of these cards gets native code,
+ * or "" when the toolkit already covers them.
+ *
+ * `cudaPlan` decides what to do with the toolkit that is here; this decides
+ * whether a better one is worth fetching, which is a different question and
+ * the one the prerequisites panel asks. Deliberately the OLDEST release that
+ * covers the newest card rather than the newest release that exists: a bigger
+ * jump is a bigger download and a bigger change for no gain, and NVIDIA's own
+ * table is what says which is enough.
+ *
+ * The DRIVER is not consulted here and does not need to be — a driver runs any
+ * toolkit up to its own CUDA version, and the caller checks that separately
+ * (`driverCudaVersion`). Measured on the machine this was written for: driver
+ * 610.43 reported CUDA 13.3 while nvcc was 12.0, so the toolkit was the only
+ * thing between it and native Blackwell code.
+ */
+export function cudaUpgradeFor(
+  nvccVersion: string,
+  caps: readonly number[],
+): { need: number; have: number; newestCap: number } | null {
+  if (caps.length === 0) return null;
+  const have = parseCudaVersion(nvccVersion);
+  const max = maxArchFor(have);
+  // An unreadable version is a different problem — "the toolkit is missing" —
+  // and the existing `cuda` prerequisite already covers it.
+  if (!(have > 0) || max === 0) return null;
+  const newestCap = Math.max(...caps);
+  if (newestCap <= archToCap(max)) return null;
+  const need = cudaVersionForCap(newestCap);
+  return need === null ? null : { need, have, newestCap };
+}
+
+/**
+ * The CUDA version the installed DRIVER can run, from `nvidia-smi`.
+ *
+ * The one hard ceiling on this whole idea: a toolkit newer than the driver
+ * produces binaries the machine cannot load. Everything else about installing
+ * a toolkit into a private directory is safe and reversible; this is the check
+ * that keeps it that way, because the app must never propose a fix whose
+ * outcome is "now nothing runs".
+ *
+ * `nvidia-smi` prints it in the header ("CUDA Version: 13.3" on older drivers,
+ * "CUDA UMD Version: 13.3" on newer ones). 0 when it cannot be read, which the
+ * caller treats as "do not offer an upgrade" rather than as "any version will
+ * do".
+ */
+export function driverCudaVersion(smiText: string): number {
+  const m = /CUDA(?:\s+UMD)?\s+Version:?\s*([0-9]+\.[0-9]+)/i.exec(smiText);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * The best toolkit to offer: new enough for the cards, not newer than the
+ * driver can run, and "" when there is nothing to gain or nothing safe to do.
+ */
+export function cudaOffer(
+  nvccVersion: string,
+  caps: readonly number[],
+  driverCuda: number,
+): { need: number; have: number; newestCap: number } | null {
+  const up = cudaUpgradeFor(nvccVersion, caps);
+  if (!up) return null;
+  // A driver that cannot run what the cards need is not something a toolkit
+  // download can fix, and pretending otherwise would install two gigabytes to
+  // no effect. Silence here is the honest answer; the build still falls back
+  // to PTX and says why.
+  if (!(driverCuda > 0) || driverCuda < up.need) return null;
+  return up;
+}
+
 /** `-DCMAKE_CUDA_ARCHITECTURES=…` for a plan, or nothing when cmake should
  *  decide for itself. */
 export function cudaCmakeFlags(plan: CudaPlan): string[] {

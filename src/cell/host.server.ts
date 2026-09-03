@@ -100,7 +100,7 @@ export type Exec = { code: number; stdout: string; stderr: string };
 export async function exec(
   bin: string,
   args: string[] = [],
-  opts: { cwd?: string; env?: Record<string, string> } = {},
+  opts: { cwd?: string; env?: Record<string, string>; timeoutMs?: number } = {},
 ): Promise<Exec> {
   try {
     const out = await new Deno.Command(bin, {
@@ -109,6 +109,11 @@ export async function exec(
       env: opts.env,
       stdout: "piped",
       stderr: "piped",
+      // A ceiling for the callers on a schedule: a wedged `nvidia-smi` (the
+      // classic after a suspend) with no timeout blocked the 1 s hardware
+      // refresh forever, `refreshing` stayed true and the vitals froze with
+      // no error anywhere. Exit code 124, as `timeout(1)` reports it.
+      signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
     }).output();
     const d = new TextDecoder();
     return {
@@ -117,6 +122,13 @@ export async function exec(
       stderr: d.decode(out.stderr),
     };
   } catch (e) {
+    if (e instanceof DOMException && e.name === "TimeoutError") {
+      return {
+        code: 124,
+        stdout: "",
+        stderr: `${bin} did not finish within ${opts.timeoutMs} ms`,
+      };
+    }
     // NotFound is the common case (binary absent) — report it as an exit
     // status rather than throwing, so callers can probe without try/catch.
     return { code: 127, stdout: "", stderr: String(e) };
@@ -201,7 +213,15 @@ const UA = "llama-master/1.0 (+https://github.com/ggml-org/llama.cpp)";
 /** A token raises GitHub's limit from 60/hour to 5000. Optional by design —
  *  the app works without one (see lib/github.ts), this just makes it roomier. */
 function githubAuth(url: string): Record<string, string> {
-  if (!url.includes("github.com")) return {};
+  // The HOST, not a substring: `evil.example/?github.com` would have been
+  // handed the token.
+  let host = "";
+  try {
+    host = new URL(url).host;
+  } catch {
+    return {};
+  }
+  if (host !== "github.com" && !host.endsWith(".github.com")) return {};
   const token = Deno.env.get("GITHUB_TOKEN") ?? Deno.env.get("GH_TOKEN") ?? "";
   return token ? { authorization: `Bearer ${token}` } : {};
 }

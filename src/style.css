@@ -2010,8 +2010,12 @@ pre.cmd-body {
   gap: 6px;
 }
 
-.chat-input input {
+.chat-input textarea {
   flex: 1;
+  /* Height follows the lines typed (`draftRows`), not a drag handle. */
+  resize: none;
+  min-height: 0;
+  line-height: 1.4;
 }
 
 /* ── the queue ─────────────────────────────────────────────────────────────
@@ -3412,4 +3416,240 @@ pre.cmd-body {
   gap: 8px 20px;
   flex-wrap: wrap;
   min-width: 0;
+}
+
+/* ── speed: the measurement, and what a smaller file would do ───────────────
+ *
+ * Three new surfaces, one idea: the app stops saying what the speed should be
+ * and starts saying what it is. `.note` is the shared voice for all of them —
+ * a sentence of explanation under a number, quieter than the number.
+ */
+
+.note {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.note.warn {
+  color: var(--warn);
+}
+
+.note.dim {
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+/* The button and its last answer on one line, so it fits the all-in-one
+   column as well as the panel it was written for. */
+.speed-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.speed-figures {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.speed-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+.speed-rows {
+  display: grid;
+  gap: 4px;
+}
+
+/* Name, number, and why the number matters — the number in the middle so the
+   three of them line up down the panel and can be read as a column. */
+.speed-row {
+  display: grid;
+  grid-template-columns: 96px 130px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  font-size: var(--fs-sm);
+}
+
+.speed-k {
+  color: var(--text-dim);
+}
+
+.speed-v {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.speed-n {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  min-width: 0;
+}
+
+/* ── the quantisation table ───────────────────────────────────────────────
+ *
+ * A grid rather than a <table> because the row the user has must be able to
+ * stand out as a block, and a highlighted <tr> fights the cell borders.
+ * Scrolls inside itself: six columns of numbers do not shrink politely, and a
+ * page that scrolls sideways is worse than a panel that does.
+ */
+.quant-table {
+  display: grid;
+  gap: 2px;
+  overflow-x: auto;
+  font-size: var(--fs-sm);
+}
+
+.quant-head,
+.quant-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 1.2fr) 52px minmax(72px, 0.9fr)
+    minmax(104px, 1.1fr) minmax(76px, 0.9fr) minmax(132px, 1.4fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 6px;
+  border-radius: var(--radius);
+  min-width: 560px;
+}
+
+.quant-head {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.quant-row {
+  background: var(--bg-2);
+}
+
+/* The file that is actually here. Marked rather than merely first, because the
+   table is sorted by size and the current row can be anywhere in it. */
+.quant-row.is-current {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-2));
+  outline: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.quant-name {
+  font-family: var(--mono);
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.quant-tag {
+  font-family: var(--font);
+  font-size: var(--fs-xs);
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.quant-bits,
+.quant-size,
+.quant-ctx,
+.quant-speed {
+  font-family: var(--mono);
+  min-width: 0;
+}
+
+.quant-place {
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+/* The gain, beside the rate it belongs to. Green for faster and warm for
+   slower: a smaller file that is SLOWER is a real outcome — it happens when
+   the tuner spends the freed VRAM on context instead — and hiding it would
+   make the table an advertisement rather than a comparison. */
+.quant-gain {
+  font-family: var(--font);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  margin-left: 6px;
+}
+
+.quant-gain.up {
+  color: var(--ok);
+}
+
+.quant-gain.down {
+  color: var(--warn);
+}
+
+/* The one-line version, on the page with no room for the table. */
+.quant-line {
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* "Thinking" sits with the other run switches, and its label needs to read as
+   a label rather than as part of the segmented control. */
+.think-label {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+/* ── building a pull request ───────────────────────────────────────────────
+ *
+ * A number, what it will build, and the one thing that is easy to forget: a
+ * "master + PR" build is dated, because master moves under it.
+ */
+.pr-picker {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pr-input {
+  width: 220px;
+  font-family: var(--mono);
+}
+
+.pr-note {
+  display: grid;
+  gap: 3px;
+  justify-items: start;
+  padding: 6px 9px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  min-width: 0;
+}
+
+.pr-what {
+  color: var(--text);
+}
+
+/* The PR's own title, so the panel says WHAT is being built and not a number. */
+.pr-title {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pr-dated {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+/* A pull request that has LANDED: its ref now means an older master, which is
+   the one failure that looks like success. Warm, because nothing is broken —
+   there is simply a better thing to build. */
+.pr-merged {
+  color: var(--warn);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
 }

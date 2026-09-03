@@ -35,7 +35,6 @@ export type SendOpts = { temp?: number; topP?: number; maxTokens?: number };
 
 export type ChatState = {
   messages: ChatMessage[];
-  input: string;
   system: string;
   /** Messages written while a reply was streaming, oldest first. Drained one
    *  per completed reply — see `advances` for why only a CLEAN one. */
@@ -69,7 +68,6 @@ export const chat = cell("chat", {
   visible: { publicFields: ["lastLatencyMs"] },
   state: {
     messages: [] as ChatMessage[],
-    input: "",
     system: "",
     queue: [] as string[],
     streaming: false,
@@ -89,9 +87,6 @@ export const chat = cell("chat", {
   // it is what caught `submit` inheriting the 30-second default).
   long: ["send", "submit"],
   methods: {
-    setInput(s, input: string) {
-      s.input = input;
-    },
     setSystem(s, system: string) {
       s.system = system;
     },
@@ -122,21 +117,25 @@ export const chat = cell("chat", {
      * One dispatch rather than an enqueue followed by a send — the decision is
      * made against the cell's own state, so nothing can read `streaming` a
      * moment stale and put a second request into a live stream.
+     *
+     * The text arrives as an ARGUMENT: the draft is browser-local (see
+     * `Composer`), never a cell field — a keystroke is not shared state.
+     * Returns whether `text` was taken; `false` is the one refusal, a full
+     * queue, and the composer puts the text back rather than losing it.
      */
     async submit(
       s: ChatState & Partial<MethodDraftMeta>,
       url: string,
+      text: string,
       opts: SendOpts = {},
-    ) {
+    ): Promise<boolean> {
       const before = s.queue.length;
-      s.queue = queueAdd(s.queue, s.input);
-      // Only clear the box if the message actually landed. At QUEUE_MAX it did
-      // not, and wiping the input would be the silent loss the cap exists to
-      // avoid; the note above the input says the queue is full.
-      if (s.queue.length > before) s.input = "";
+      s.queue = queueAdd(s.queue, text);
+      if (s.queue.length === before && text.trim()) return false;
       // Idle → this becomes the request. Busy → `drain` returns at once and the
       // message stays where it was just put.
-      await drain(s, url, opts);
+      await drain(s, url, "", opts);
+      return true;
     },
 
     /** Drop one waiting message — the ✕ on a queue chip. */
@@ -159,9 +158,10 @@ export const chat = cell("chat", {
     async send(
       s: ChatState & Partial<MethodDraftMeta>,
       url: string,
+      text = "",
       opts: SendOpts = {},
     ) {
-      await drain(s, url, opts);
+      await drain(s, url, text, opts);
     },
   },
   selectors: {
@@ -182,6 +182,7 @@ export const chat = cell("chat", {
 async function drain(
   s: ChatState & Partial<MethodDraftMeta>,
   url: string,
+  text: string,
   opts: SendOpts,
 ): Promise<void> {
   // One drain at a time, and `streaming` is the flag that says so — which is
@@ -190,11 +191,13 @@ async function drain(
   // next going out, and a submit arriving in that gap would start a second
   // drain: two live streams appending to one conversation.
   if (s.streaming) return;
-  if (s.queue.length === 0 && !s.input.trim()) return;
+  if (s.queue.length === 0 && !text.trim()) return;
   s.streaming = true;
   try {
     for (;;) {
-      const outcome = await turn(s, url, opts);
+      const outcome = await turn(s, url, text, opts);
+      // The direct text is one message; every later turn is the queue's.
+      text = "";
       // `advances` is the whole policy: only a reply that ended on its own
       // pulls the next message. Stop and errors leave the queue standing —
       // and on a LAN, an error is usually the far end going away, where
@@ -211,14 +214,16 @@ async function drain(
 async function turn(
   s: ChatState & Partial<MethodDraftMeta>,
   url: string,
+  direct: string,
   opts: SendOpts,
 ): Promise<SendOutcome> {
   // The queue is the front of the line whenever it has anything in it, so a
   // turn means the same thing however it was reached — a keystroke, or the
-  // drain coming back for the next one. The input box is the fallback, which
-  // keeps every direct caller (and every test older than the queue) working.
+  // drain coming back for the next one. The text handed to `send` is the
+  // fallback, which keeps every direct caller (and every test older than the
+  // queue) working.
   const queued = s.queue.length > 0;
-  const text = (queued ? s.queue[0] ?? "" : s.input).trim();
+  const text = (queued ? s.queue[0] ?? "" : direct).trim();
   if (!text) return "error";
 
   {
@@ -232,7 +237,6 @@ async function turn(
 
     s.messages.push({ role: "user", content: text });
     if (queued) s.queue.shift();
-    else s.input = "";
     s.partial = "";
     s.partialThink = "";
     s.lastError = "";
@@ -333,10 +337,13 @@ async function turn(
       } else {
         // Never a raw error: what the user can do about it is part of it.
         const msg = String(e);
-        s.lastError = /Failed to fetch|error sending request|connection/i
-            .test(msg)
-          ? `The server stopped answering mid-reply (${msg}). It may have been stopped, or the network dropped — press Discover or Connect to check.`
-          : msg;
+        // `fetch failed` is Deno 2.9's wording for the same thing; the older
+        // `error sending request` is kept for the runtimes that still say it.
+        s.lastError =
+          /Failed to fetch|fetch failed|error sending request|connection/i
+              .test(msg)
+            ? `The server stopped answering mid-reply (${msg}). It may have been stopped, or the network dropped — press Discover or Connect to check.`
+            : msg;
       }
     } finally {
       s.partial = "";

@@ -16,6 +16,7 @@ import {
 import { Empty, ErrorNote, KV, LogView, Panel, Pill } from "./kit.tsx";
 import { Guidance } from "./Guidance.tsx";
 import { CommandPanel } from "./CommandView.tsx";
+import { SpeedPanel } from "./SpeedPanel.tsx";
 import { SetupPanel } from "./SetupView.tsx";
 import { activeBuild, currentModel, serverRunning } from "./derive.ts";
 
@@ -240,6 +241,13 @@ export function ServerPanel() {
           /* The same flags as sentences — a running server's rows describe
              what it was started with, exactly like the command above them. */
         }
+        {
+          /* Beside the process, because that is what it measures: a bench runs
+             against the server that is already up, so it belongs on the page
+             that starts and stops it rather than a tab away. */
+        }
+        <SpeedPanel />
+
         <SetupPanel t="server-setup" />
 
         <CommandPanel t="server-cmd" />

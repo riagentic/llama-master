@@ -14,11 +14,14 @@ import {
   assert,
   assertEquals,
   assertRejects,
+  assertStrictEquals,
   assertStringIncludes,
   assertThrows,
 } from "@std/assert";
 import { join } from "@std/path";
 import type { Settings } from "../src/lib/types.ts";
+import { BENCH_TOKENS } from "../src/lib/bench.ts";
+import { defaults as paramDefaults } from "../src/lib/params.ts";
 
 // Point the app home at a temp dir BEFORE anything resolves paths: `start()`
 // refuses to run a binary outside its own builds directory, and this is how the
@@ -34,6 +37,9 @@ const io = await import("../src/cell/srv.server.ts");
 const { srv } = await import("../src/cell/srv.ts");
 const { chat } = await import("../src/cell/chat.ts");
 const { bootCells } = await import("aio/testing");
+
+/** The catalog defaults, so a bench test states only the fields it cares about. */
+const DEFAULTS = paramDefaults();
 
 /** Install the stub where a real build would be, and return its path. */
 async function installStub(): Promise<string> {
@@ -115,8 +121,7 @@ Deno.test({
     );
 
     // Chat over the same socket, through the real SSE parser.
-    chat.setInput("hi");
-    await chat.send(url);
+    await chat.send(url, "hi");
     assertEquals(chat.streaming, false);
     assertEquals(chat.messages.length, 2);
     assertEquals(chat.messages[0]?.role, "user");
@@ -157,6 +162,48 @@ Deno.test({
     assertEquals(srv.exitCode, 3);
     assertStringIncludes(srv.lastError, "exited with code 3");
     assertEquals(srv.healthy, false);
+
+    // And it is processed ONCE. The poll used to re-diagnose the same dead
+    // run on every tick — a fresh diagnosis object broadcast per second for as
+    // long as the app sat on the crash, and `clearLog` undone by the next poll.
+    const first = srv.diagnosis;
+    assert(first, "a crash carries a diagnosis");
+    assertEquals(srv.pid, 0, "the dead pid is released");
+    await srv.poll();
+    assertStrictEquals(srv.diagnosis, first, "nothing was re-diagnosed");
+    srv.clearLog();
+    assertEquals(srv.diagnosis, null);
+    await srv.poll();
+    assertEquals(srv.diagnosis, null, "and clearLog stays clear");
+    assertEquals(srv.status, "crashed");
+  },
+});
+
+Deno.test({
+  name:
+    "builds: removeBuild takes a direct child of the builds root and nothing else",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const b = await import("../src/cell/builds.server.ts");
+    const root = paths().builds;
+    await Deno.mkdir(join(root, "keep-me"), { recursive: true });
+    // `join(root, "/")` is `root/` — it passed the old text test
+    // (`startsWith(root + "/")`, no `..`) and would have removed every build.
+    for (const id of ["/", "..", "../x", "keep-me/../keep-me", "a/b", ""]) {
+      await assertRejects(() => b.removeBuild(id), Error, "refusing", id);
+    }
+    const there = async (p: string) => {
+      try {
+        await Deno.stat(p);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    assert(await there(join(root, "keep-me")), "nothing was removed");
+    await b.removeBuild("keep-me");
+    assertEquals(await there(join(root, "keep-me")), false);
   },
 });
 
@@ -569,5 +616,85 @@ Deno.test({
     } finally {
       await srv.stop();
     }
+  },
+});
+
+Deno.test({
+  name: "srv: the speed bench measures the running server and refuses to guess",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv]);
+
+    // Nothing running is an ANSWER, not a timeout against a closed port.
+    await srv.bench();
+    assertStringIncludes(srv.benchError, "start the server");
+    assertEquals(srv.lastBench.at, 0, "and nothing was written down");
+
+    await srv.start([bin, "-m", "/m.gguf", "--port", String(port)], url, {
+      model: "/m.gguf",
+      settings: { ...DEFAULTS, ctxSize: 4096 },
+    });
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.status === "ready";
+    }, "the stub to come up");
+
+    await srv.bench();
+    assertEquals(srv.benchError, "", "a healthy server measures cleanly");
+    assertEquals(srv.benching, false);
+    // llama.cpp's own numbers, straight through.
+    assertEquals(srv.lastBench.genTps, 37.25);
+    assertEquals(srv.lastBench.promptTps, 512.5);
+    assertEquals(srv.lastBench.genTokens, BENCH_TOKENS, "it asked for these");
+    // And the conditions it was taken under, so it can never be shown beside a
+    // different run (`benchApplies`).
+    assertEquals(srv.lastBench.modelPath, "/m.gguf");
+    assertEquals(srv.lastBench.ctx, 4096);
+    assert(srv.lastBench.at > 0);
+    assert(srv.lastBench.latencyMs >= 0, "measured here, not by the server");
+
+    // A measurement belongs to ONE process: the settings, the placement and
+    // the context all change across a start, so carrying it forward would put
+    // a rate from another run beside this one.
+    await srv.stop();
+    await srv.start([bin, "-m", "/m.gguf", "--port", String(port)], url, {
+      model: "/m.gguf",
+      settings: { ...DEFAULTS, ctxSize: 4096 },
+    });
+    assertEquals(srv.lastBench.at, 0, "a new run starts unmeasured");
+    await srv.stop();
+  },
+});
+
+Deno.test({
+  name: "srv: a build too old to report timings has measured nothing, not zero",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // Writing 0 tok/s here would put "this machine is broken" on screen over a
+    // build's age. The app's rule is that an absent reading is not a zero.
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv]);
+    await srv.start(
+      [bin, "-m", "/m.gguf", "--port", String(port), "--no-timings"],
+      url,
+      { model: "/m.gguf", settings: { ...DEFAULTS, ctxSize: 4096 } },
+    );
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.status === "ready";
+    }, "the stub to come up");
+
+    await srv.bench();
+    assertEquals(srv.lastBench.at, 0, "nothing was written down");
+    assertStringIncludes(srv.benchError, "no timings");
+    assertStringIncludes(srv.benchError, "too old");
+    await srv.stop();
   },
 });

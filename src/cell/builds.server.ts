@@ -13,7 +13,7 @@
 // prerequisite list, downloads ~20x less, and a specific tag is exactly what a
 // user asking for "b6234" means.
 
-import { join } from "@std/path";
+import { basename, dirname, join, resolve } from "@std/path";
 import type { Asset } from "../lib/assets.ts";
 import { availableBackends, pickAsset } from "../lib/assets.ts";
 import { progressOf } from "../lib/buildlog.ts";
@@ -36,8 +36,22 @@ import {
   paths,
   PLATFORM,
   RateLimited,
+  which,
 } from "./host.server.ts";
 import { assetsFromHtml, assetUrl, shaFromCommitsAtom } from "../lib/github.ts";
+import {
+  parseRef,
+  prFetchRef,
+  prUrl,
+  refDirName,
+  refLabel,
+  refMoves,
+  refNeedsGit,
+  refNotFound,
+  refProvenance,
+  repoUrl,
+  tarballUrl,
+} from "../lib/srcref.ts";
 import { resolveCmake } from "./prereq.server.ts";
 import { DEMO_ENV, demoBuilds } from "../lib/demo.ts";
 
@@ -222,7 +236,11 @@ export function buildId(
   ref: string,
   backend: Backend,
 ): string {
-  return `${origin}-${ref}-${backend}`;
+  // Through `refDirName`, because a build id becomes a DIRECTORY under the
+  // builds root and `pr/27754` carries a slash. One path segment, always —
+  // the containment check in `removeBuild` is the last line of defence, not
+  // the first.
+  return `${origin}-${refDirName(parseRef(ref))}-${backend}`;
 }
 
 async function writeMeta(dir: string, b: Build): Promise<void> {
@@ -269,10 +287,15 @@ export async function listBuilds(): Promise<Build[]> {
 }
 
 export async function removeBuild(id: string): Promise<void> {
-  const dir = join(paths().builds, id);
-  // Refuse anything that is not a direct child of the builds root.
-  if (!dir.startsWith(paths().builds + "/") || id.includes("..")) {
-    throw new Error(`refusing to remove ${dir}`);
+  const root = resolve(paths().builds);
+  const dir = resolve(root, id);
+  // A direct child of the builds root, decided on the RESOLVED path. The text
+  // test this replaced — `startsWith(root + "/")` and no `..` — accepted
+  // `id = "/"`: `join(root, "/")` is `root/`, which passes both, and the
+  // remove below would have taken every build at once. Same class as the
+  // sandbox rule in srv.server.ts (CLAUDE.md: compare paths resolved).
+  if (dirname(dir) !== root || basename(dir) !== id) {
+    throw new Error(`refusing to remove ${dir}: not a build`);
   }
   await Deno.remove(dir, { recursive: true });
 }
@@ -387,6 +410,271 @@ const BACKEND_FLAGS: Record<Backend, string[]> = {
   metal: ["-DGGML_METAL=ON"],
 };
 
+/**
+ * A pull request's title and author, from the plain github.com page.
+ *
+ * No API call: the anonymous quota is 60/hour and it is routinely exhausted
+ * (`src/lib/github.ts`), while this page is not rate limited at all — and the
+ * `<title>` tag carries everything needed. It is decoration in the strict
+ * sense, so every failure returns "" rather than throwing: a build must not be
+ * blocked because a title could not be read.
+ */
+export async function prTitle(pr: number): Promise<string> {
+  try {
+    const html = await fetchText(prUrl(pr));
+    const raw = /<title>([^<]*)<\/title>/i.exec(html)?.[1] ?? "";
+    // "model: add GLM-5-Next by danielhanchen · Pull Request #27754 · ggml-org/llama.cpp · GitHub"
+    const cut = raw.split(" · Pull Request")[0]?.trim() ?? "";
+    return cut.length > 0 && cut.length < 300
+      ? cut.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(
+        /&quot;/g,
+        '"',
+      )
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * A pull request's state, from the plain github.com page.
+ *
+ * The trap this closes arrives on a GOOD day: GitHub keeps
+ * `refs/pull/<N>/merge` after a pull request lands, still pointing at the
+ * merge computed back then. So the day a PR merges, its ref quietly starts
+ * meaning "master as it was months ago, plus a change master already has" —
+ * the build succeeds, the name looks right, and the binary is older than plain
+ * master. Reading the state costs one un-rate-limited page.
+ *
+ * `unknown` on any failure: this decides what the panel SAYS, never whether a
+ * build may proceed, so a network hiccup must not block one.
+ */
+export async function prState(
+  pr: number,
+): Promise<"open" | "merged" | "closed" | "unknown"> {
+  try {
+    const html = await fetchText(prUrl(pr));
+    if (/"state"\s*:\s*"MERGED"/i.test(html) || />\s*Merged\s*</i.test(html)) {
+      return "merged";
+    }
+    if (/"state"\s*:\s*"CLOSED"/i.test(html) || />\s*Closed\s*</i.test(html)) {
+      return "closed";
+    }
+    if (/"state"\s*:\s*"OPEN"/i.test(html) || />\s*Open\s*</i.test(html)) {
+      return "open";
+    }
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Master with several pull requests merged into it, assembled here.
+ *
+ * The one source shape GitHub cannot hand over ready-made: it publishes each
+ * PR merged into master, never two of them merged into each other. So this is
+ * the only path that needs git, and it is asked for only when the ref is a
+ * stack (`refNeedsGit`).
+ *
+ * A shallow fetch, because the history is not wanted — only the tree. Each PR
+ * is merged in the ORDER GIVEN, and a conflict stops the whole thing and names
+ * the pull request and the files: "it did not build" is not an answer a person
+ * can act on, and a half-merged tree left on disk would be worse than none.
+ */
+async function assembleStack(
+  dir: string,
+  prs: number[],
+  say: (lines: string[]) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const git = await which("git");
+  if (!git) {
+    throw new Error(
+      "Building master with more than one pull request needs git, and it is not installed. " +
+        "Install git, or build a single pull request — that route needs nothing, because GitHub does the merge itself.",
+    );
+  }
+  // ONE clone, reused by every stack, kept out of the source trees it feeds.
+  //
+  // Two reasons it is not inside `dir`. A build directory sits in there and
+  // `git archive` gives a clean tree without one; and a clone is expensive
+  // enough that throwing it away per build would make a two-line change cost a
+  // full download. It also means a fetch that fails can fall back on what is
+  // already here, which is the difference between "GitHub is throttling you"
+  // being an inconvenience and being a dead end.
+  const repo = join(paths().sources, "_gitrepo");
+  const run = async (args: string[], what: string, cwd = repo) => {
+    const r = await exec(git, args, { cwd, env: NO_PROMPT });
+    if (r.code !== 0) {
+      throw new Error(
+        `${what} failed: ${(r.stderr || r.stdout).trim().slice(0, 400)}`,
+      );
+    }
+    return r;
+  };
+  const tried = async (args: string[], cwd = repo) =>
+    await exec(git, args, { cwd, env: NO_PROMPT });
+
+  if (!(await exists(join(repo, "HEAD")))) {
+    await ensureDir(repo);
+    await run(["init", "-q", "--bare"], "git init");
+    await run(["remote", "add", "origin", repoUrl()], "git remote add");
+  }
+
+  const refspecs = [
+    "+refs/heads/master:refs/remotes/origin/master",
+    ...prs.map((n) => `+${prFetchRef(n)}:refs/prs/${n}`),
+  ];
+  say([
+    `Fetching master and ${prs.length} pull request${
+      prs.length === 1 ? "" : "s"
+    }`,
+  ]);
+  const fetched = await tried([
+    "fetch",
+    "-q",
+    "--depth=300",
+    "origin",
+    ...refspecs,
+  ]);
+  const needed = [
+    "refs/remotes/origin/master",
+    ...prs.map((n) => `refs/prs/${n}`),
+  ];
+  const have: string[] = [];
+  for (const ref of needed) {
+    if ((await tried(["rev-parse", "--verify", "-q", ref])).code === 0) {
+      have.push(ref);
+    }
+  }
+  if (fetched.code !== 0) {
+    // A fetch can fail for reasons that have nothing to do with this request —
+    // GitHub throttles unauthenticated git with a 401, and a laptop goes
+    // offline. If everything needed is already here, the build can go ahead;
+    // what it must NOT do is go ahead quietly, because the tree may be older
+    // than the name suggests, which is the one thing this app refuses.
+    if (have.length !== needed.length) {
+      throw new Error(
+        `Could not fetch llama.cpp: ${
+          (fetched.stderr || fetched.stdout).trim().slice(0, 300)
+        }\nGitHub answers 401 to unauthenticated git when it is throttling an address; a GITHUB_TOKEN in the environment raises that limit, and waiting also works.`,
+      );
+    }
+    say([
+      "Could not reach GitHub, so this is built from the copy already on disk — it may be older than master is now.",
+    ]);
+  }
+  if (signal?.aborted) throw new Error("cancelled");
+
+  await run(
+    ["branch", "-f", "work", "refs/remotes/origin/master"],
+    "git branch",
+  );
+  for (const n of prs) {
+    if (signal?.aborted) throw new Error("cancelled");
+    // A bare repo has no working tree, so the merge is done with a temporary
+    // one; `git merge-tree` would be neater but its writable form is newer
+    // than the git on plenty of machines this has to run on.
+    const wt = join(repo, `wt-${n}`);
+    await Deno.remove(wt, { recursive: true }).catch(() => {});
+    await run(
+      ["worktree", "add", "-q", "--detach", wt, "work"],
+      "git worktree add",
+    );
+    try {
+      await exec(git, ["config", "user.email", "builds@llama.master"], {
+        cwd: wt,
+        env: NO_PROMPT,
+      });
+      await exec(git, ["config", "user.name", "llama.master"], {
+        cwd: wt,
+        env: NO_PROMPT,
+      });
+      let m = await tried(["merge", "--no-edit", "-q", `refs/prs/${n}`], wt);
+      // "refusing to merge unrelated histories" from a SHALLOW clone does not
+      // mean the branches are unrelated — it means the common ancestor is
+      // older than the history we fetched, so git cannot see it. The fix is
+      // more history, never `--allow-unrelated-histories`: that flag would
+      // cheerfully splice two genuinely unrelated trees together and hand the
+      // result to a compiler.
+      if (m.code !== 0 && /unrelated histories|no merge base/i.test(m.stderr)) {
+        say([`Fetching more history to find where #${n} branched from master`]);
+        await tried(["merge", "--abort"], wt);
+        const deep = await tried([
+          "fetch",
+          "-q",
+          "--deepen=5000",
+          "origin",
+          ...refspecs,
+        ]);
+        if (deep.code !== 0) {
+          throw new Error(
+            `Pull request #${n} branched from a commit older than the history on disk, and more could not be fetched: ${
+              (deep.stderr || deep.stdout).trim().slice(0, 200)
+            }`,
+          );
+        }
+        m = await tried(["merge", "--no-edit", "-q", `refs/prs/${n}`], wt);
+      }
+      if (m.code !== 0) {
+        // Name the pull request AND the files. A conflict is a fact about two
+        // changes touching the same lines, and the only useful report says
+        // which ones.
+        const files = await tried(
+          ["diff", "--name-only", "--diff-filter=U"],
+          wt,
+        );
+        const list = files.stdout.trim().split("\n").filter(Boolean);
+        // No conflicted files means git refused for some OTHER reason, and
+        // reporting that as a conflict sent one debugging session looking for
+        // overlapping edits that did not exist. Git's own words are better
+        // than a guess.
+        if (list.length === 0) {
+          throw new Error(
+            `Could not merge pull request #${n}: ${
+              (m.stderr || m.stdout).trim().slice(0, 300) ||
+              "git gave no reason"
+            }`,
+          );
+        }
+        throw new Error(
+          `Pull request #${n} conflicts with what is already merged.\n` +
+            `Both changed: ${list.slice(0, 8).join(", ")}${
+              list.length > 8 ? `, and ${list.length - 8} more` : ""
+            }.\n` +
+            `Drop #${n} from the list, or put it earlier — order matters when two pull requests touch the same lines.`,
+        );
+      }
+      const head = await run(["rev-parse", "HEAD"], "git rev-parse", wt);
+      await run(["branch", "-f", "work", head.stdout.trim()], "git branch");
+      say([`Merged #${n}`]);
+    } finally {
+      await Deno.remove(wt, { recursive: true }).catch(() => {});
+      await tried(["worktree", "prune"]);
+    }
+  }
+
+  // `git archive` writes the merged tree with no repository in it, which keeps
+  // the source directory the same shape a tarball produces — cmake, the build
+  // directory and nothing else.
+  await Deno.remove(dir, { recursive: true }).catch(() => {});
+  await ensureDir(dir);
+  const tar = await which("tar");
+  if (!tar) throw new Error("tar is required to unpack the assembled source");
+  const archive = join(repo, "stack.tar");
+  await run(["archive", "-o", archive, "work"], "git archive");
+  const untar = await exec(tar, ["xf", archive, "-C", dir]);
+  await Deno.remove(archive).catch(() => {});
+  if (untar.code !== 0) {
+    throw new Error(`unpacking the assembled source failed: ${untar.stderr}`);
+  }
+}
+
+/** Git must never stop for credentials on a public clone: a prompt in a
+ *  headless build is a hang with no explanation. */
+const NO_PROMPT = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "true" };
+
 /** A tarball has no git metadata, so a source build reports
  *  `version: 0 (unknown)`. When the ref is a release tag we already know the
  *  number, so hand it to cmake and let the binary tell the truth about itself. */
@@ -397,15 +685,27 @@ export function buildNumberFlags(ref: string): string[] {
 
 /** What CUDA can target here — nvcc's version against the driver's report of
  *  each GPU. Read at build time so the answer is never stale. */
-export async function detectCudaPlan(): Promise<CudaPlan> {
+export async function detectCudaPlan(): Promise<
+  CudaPlan & { nvcc: string; root: string }
+> {
+  // A toolkit this app installed WINS over whatever is on PATH. That is the
+  // whole point of installing one: the system nvcc is the thing that could not
+  // build for these cards, and leaving cmake to find it first would make the
+  // prerequisite's Fix button do nothing visible.
+  const { managedCuda } = await import("./prereq.server.ts");
+  const own = await managedCuda();
   const [nvcc, smi] = await Promise.all([
-    exec("nvcc", ["--version"]),
+    exec(own?.nvcc ?? "nvcc", ["--version"]),
     exec("nvidia-smi", ["--query-gpu=compute_cap", "--format=csv,noheader"]),
   ]);
   const caps = smi.code === 0
     ? smi.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => n > 0)
     : [];
-  return cudaPlan(nvcc.stdout || nvcc.stderr, caps);
+  return {
+    ...cudaPlan(nvcc.stdout || nvcc.stderr, caps),
+    nvcc: own?.nvcc ?? "",
+    root: own?.path ?? "",
+  };
 }
 
 export async function buildFromSource(
@@ -478,27 +778,89 @@ export async function buildFromSource(
       throw new Error(`${plan.reason} ${plan.remedy}`);
     }
     cudaFlags = cudaCmakeFlags(plan);
+    if (plan.nvcc) {
+      // Both, and `CMAKE_CUDA_HOST_COMPILER` left alone: cmake finds the
+      // toolkit through the compiler it is given, and pinning the host
+      // compiler as well is how a build starts using a gcc the system did not
+      // choose. Naming the path in the log matters — a build that quietly used
+      // a different compiler than the one on PATH has to say so.
+      cudaFlags = [
+        `-DCMAKE_CUDA_COMPILER=${plan.nvcc}`,
+        `-DCUDAToolkit_ROOT=${plan.root}`,
+        ...cudaFlags,
+      ];
+      p(0, null, [
+        `Using the CUDA toolkit llama.master installed: ${plan.root}`,
+      ]);
+    }
     p(0, null, [plan.reason, ...(plan.remedy ? [plan.remedy] : [])]);
   }
 
-  // 1 — source tarball (cached: rebuilding the same ref must not re-download).
-  const srcDir = join(paths().sources, opts.ref);
-  if (!(await exists(join(srcDir, "CMakeLists.txt")))) {
-    const url = opts.ref === "master"
-      ? `https://codeload.github.com/${REPO}/tar.gz/refs/heads/master`
-      : `https://codeload.github.com/${REPO}/tar.gz/refs/tags/${opts.ref}`;
-    p(0, 0, [`Fetching ${url}`]);
-    const bytes = await download(
-      url,
-      (received, total) => p(0, total ? received / total : null),
+  // 1 — source tarball.
+  //
+  // Cached only for a ref that CANNOT change. A tag is immutable, so its tree
+  // is reused for ever; `master` and a pull request are whatever those
+  // branches say today, and reusing them is how this app came to compile
+  // five-week-old master under the name "master" on the developer's own
+  // machine, announcing "Reusing cached source" while it did it. A build that
+  // silently compiles something other than what its name claims is the exact
+  // thing this app exists to refuse, so a moving ref is re-fetched every time
+  // — 37 MB against a compile measured in minutes.
+  const src = parseRef(opts.ref);
+  const srcDir = join(paths().sources, refDirName(src));
+  const moves = refMoves(src);
+  const cached = await exists(join(srcDir, "CMakeLists.txt"));
+  if (refNeedsGit(src) && src.kind === "stack") {
+    // Always re-assembled: master moves under it, and so may every branch in
+    // it. Same rule as every other moving ref, for the same reason.
+    await assembleStack(
+      srcDir,
+      src.prs,
+      (lines) => p(0, null, lines),
       opts.signal,
     );
+    p(0, 1, [
+      `Source assembled at ${srcDir}`,
+      refProvenance(src, Date.now()),
+    ]);
+  } else if (moves || !cached) {
+    const url = tarballUrl(src);
+    p(0, 0, [
+      cached && moves
+        ? `${refLabel(src)} moves, so it is fetched fresh rather than reused`
+        : `Fetching ${refLabel(src)}`,
+      url,
+    ]);
+    let bytes: Uint8Array;
+    try {
+      bytes = await download(
+        url,
+        (received, total) => p(0, total ? received / total : null),
+        opts.signal,
+      );
+    } catch (e) {
+      // Never a raw 404. For a pull request's merged form the status IS the
+      // verdict — GitHub publishes that ref only while the branch still
+      // applies to master — and the user needs that sentence, not the number
+      // (`src/lib/srcref.ts:refNotFound`).
+      const msg = String(e);
+      if (/→ 404\b/.test(msg)) {
+        const nf = refNotFound(src);
+        throw new Error(`${nf.reason}\n${nf.steps.join("\n")}`);
+      }
+      throw e;
+    }
     await Deno.remove(srcDir, { recursive: true }).catch(() => {});
     await ensureDir(srcDir);
     const n = await extract(bytes, srcDir, "tar.gz");
-    p(0, 1, [`${n} source files extracted to ${srcDir}`]);
+    p(0, 1, [
+      `${n} source files extracted to ${srcDir}`,
+      refProvenance(src, Date.now()),
+    ]);
   } else {
-    p(0, 1, [`Reusing cached source at ${srcDir}`]);
+    p(0, 1, [
+      `Reusing cached source at ${srcDir} — ${refLabel(src)} cannot change`,
+    ]);
   }
 
   // 2 — configure.
@@ -593,8 +955,10 @@ export async function buildFromSource(
     origin: "source",
     backend: opts.backend,
     dir: dest,
-    // A tag identifies itself; "master" does not, so record what it was.
-    sourceSha: opts.ref === "master" ? await masterSha().catch(() => "") : "",
+    // A tag identifies itself; a moving ref does not, so record what it was.
+    // For a pull request this is the master it was merged INTO, which is the
+    // half of "master + PR #27754" that the name cannot carry.
+    sourceSha: refMoves(src) ? await masterSha().catch(() => "") : "",
     // A build that behaves differently must say why.
     ...(opts.schedCap && opts.schedCap > 0 ? { schedCap: opts.schedCap } : {}),
   });

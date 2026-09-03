@@ -325,6 +325,15 @@ pub struct Gguf {
     pub rope_freq_base: f64,
     pub n_tensors: u64,
     pub tensor_bytes: u64,
+    /// Every weight in the file, counted element by element off the tensor
+    /// table. With `tensor_bytes` this is the file's EXACT bits per weight —
+    /// `tensor_bytes * 8 / params` — which is what makes "would a smaller
+    /// quantisation be faster, and by how much" arithmetic rather than a
+    /// lookup against a label. The label (`quant`) is a mix: a "Q4_K_M" file
+    /// is mostly Q4_K with some Q6_K, and two files wearing that label differ.
+    /// Counted for tensors of a type we could size, so it pairs with the bytes
+    /// beside it; `unknown_types` says when that is not the whole file.
+    pub params: u64,
     /// `token_embd.*` — the input lookup table. Split out from `output_bytes`
     /// because the two land on different devices at partial offload.
     pub embd_bytes: u64,
@@ -458,6 +467,7 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     let mut embd_bytes: u64 = 0;
     let mut output_bytes: u64 = 0;
     let mut tensor_bytes: u64 = 0;
+    let mut params: u64 = 0;
     let mut unknown_types: u64 = 0;
     let mut type_hist: Vec<(u32, u64)> = Vec::new();
 
@@ -482,6 +492,9 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
             }
         };
         tensor_bytes = tensor_bytes.saturating_add(size);
+        if size > 0 {
+            params = params.saturating_add(elems);
+        }
         match type_hist.iter_mut().find(|(ty, _)| *ty == t) {
             Some((_, n)) => *n += size,
             None => type_hist.push((t, size)),
@@ -561,6 +574,7 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         rope_freq_base: a("rope.freq_base").unwrap_or(0.0),
         n_tensors,
         tensor_bytes,
+        params,
         embd_bytes,
         output_bytes,
         unknown_types,
@@ -591,7 +605,7 @@ pub fn to_json(g: &Gguf) -> String {
             "\"swaWindow\":{},\"swaPattern\":{},\"kvLoraRank\":{},\"fullAttnInterval\":{},",
             "\"ssmDConv\":{},\"ssmDInner\":{},\"ssmDState\":{},\"ssmNGroup\":{},\"nextnLayers\":{},",
             "\"nExpert\":{},\"nExpertUsed\":{},\"nFf\":{},\"nFfExp\":{},",
-            "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"embdBytes\":{},\"outputBytes\":{},",
+            "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"params\":{},\"embdBytes\":{},\"outputBytes\":{},",
             "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},",
             "\"layers\":[{}]}}"
         ),
@@ -622,6 +636,7 @@ pub fn to_json(g: &Gguf) -> String {
         num(g.rope_freq_base),
         g.n_tensors,
         g.tensor_bytes,
+        g.params,
         g.embd_bytes,
         g.output_bytes,
         g.unknown_types,
@@ -730,6 +745,11 @@ mod tests {
         assert_eq!(g.embd_bytes, embd, "token_embd is tracked separately");
         assert_eq!(g.output_bytes, 4096 * 4, "output_norm is the output group");
         assert_eq!(g.tensor_bytes, q4k * 3 + embd + 4096 * 4);
+        // Every weight, counted element by element — the exact bits per weight
+        // is `tensor_bytes * 8 / params`, and it is what the quant advice is
+        // built on. Three Q4_K blocks of 4096x4096, the embedding table, and
+        // one F32 norm of 4096.
+        assert_eq!(g.params, 4096 * 4096 * 3 + 32000 * 4096 + 4096);
         assert_eq!(g.unknown_types, 0);
     }
 

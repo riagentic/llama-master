@@ -18,6 +18,7 @@
 // with the monitor — is the default.
 
 import { cfg } from "../cell/cfg.ts";
+import { DraftInput } from "./kit.tsx";
 import { hw } from "../cell/hw.ts";
 import {
   displayGpus,
@@ -50,21 +51,24 @@ function Field(props: {
     <label class="reserve-field" title={props.tip}>
       <span class="reserve-label">{props.label}</span>
       <span class="field-inline">
-        <input
+        <DraftInput
           type="number"
           class="reserve-num"
-          aria-label={`${props.label}, in GB`}
+          ariaLabel={`${props.label}, in GB`}
           t={props.t}
           min="0"
           max={String(MAX_RESERVE_GB)}
           step="1"
           value={String(reserveGb(props.valueB))}
-          onInput={(e) => {
-            const raw = (e.currentTarget as HTMLInputElement).value;
+          onCommit={(raw) => {
             // An empty box is mid-edit, not "reserve nothing". Writing 0 here
             // would hand the whole machine back the instant someone selected
             // the field to type a new number, and the plan would jump before
             // they had said anything. Typing an explicit 0 still means 0.
+            //
+            // Committed on `change`, not per keystroke: this value is in the
+            // auto-tune key, and typing "16" used to re-tune and persist at
+            // "1" and again at "16".
             if (raw.trim() === "") return;
             cfg.setReserve(props.pool, Number(raw));
           }}

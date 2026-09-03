@@ -459,6 +459,61 @@ export async function probe(
   }
 }
 
+/**
+ * One measured generation run against the server that is already up.
+ *
+ * The probe above asks "can it generate at all"; this asks "how fast", with
+ * the variables held still (`src/lib/bench.ts` owns the prompt, the token
+ * count and the reasons for both). Nothing is loaded, nothing is restarted and
+ * no extra memory is taken — which is what makes it safe to offer as a button
+ * beside a run that took two minutes to place.
+ *
+ * The timings come back from llama.cpp itself; the latency is measured here,
+ * because no server-side metric reports the wait a person actually feels.
+ * Returns the raw JSON for `parseBench` to read: this half owns the socket,
+ * the pure half owns the arithmetic.
+ */
+export async function bench(
+  baseUrl: string,
+  body: Record<string, unknown>,
+  timeoutMs = 600_000,
+): Promise<
+  { ok: true; json: unknown; latencyMs: number } | { ok: false; detail: string }
+> {
+  const began = performance.now();
+  try {
+    const res = await fetch(`${baseUrl}/completion`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      return { ok: false, detail: `${res.status}: ${text.slice(0, 200)}` };
+    }
+    try {
+      return {
+        ok: true,
+        json: JSON.parse(text),
+        latencyMs: performance.now() - began,
+      };
+    } catch {
+      return { ok: false, detail: `unreadable reply: ${text.slice(0, 200)}` };
+    }
+  } catch (e) {
+    const timedOut = e instanceof DOMException && e.name === "TimeoutError";
+    return {
+      ok: false,
+      detail: timedOut
+        ? `no reply in ${
+          Math.round(timeoutMs / 1000)
+        }s — the server is busy or stuck`
+        : String(e),
+    };
+  }
+}
+
 /** `/props` — what the server says it actually loaded. Worth showing, because
  *  it is the ground truth against which the settings panel is only a request. */
 export async function props(

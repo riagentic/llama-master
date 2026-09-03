@@ -346,8 +346,12 @@ input:disabled {
   gap: 6px;
 }
 
-.chat-input input {
+.chat-input textarea {
   flex: 1;
+  /* Height follows the lines typed (`draftRows`), not a drag handle. */
+  resize: none;
+  min-height: 0;
+  line-height: 1.4;
 }
 
 /* ── the queue ─────────────────────────────────────────────────────────────

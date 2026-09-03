@@ -87,6 +87,13 @@ export type ModelMeta = {
   ropeFreqBase: number;
   nTensors: number;
   tensorBytes: number;
+  /** Every weight in the file, counted off the tensor table. With
+   *  `tensorBytes` this is the file's EXACT bits per weight, which is what
+   *  turns "would a smaller quantisation be faster" into arithmetic
+   *  (`src/lib/quant.ts`). The `quant` label above is a MIX — a Q4_K_M file is
+   *  mostly Q4_K with some Q6_K — so two files wearing one label differ, and
+   *  only this number says by how much. 0 from a build older than this field. */
+  params: number;
   embdBytes: number;
   outputBytes: number;
   /** Tensors whose ggml type this build does not know — sizes exclude them. */

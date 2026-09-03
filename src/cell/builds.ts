@@ -16,6 +16,7 @@ import { SCHED_SPLIT_CAP } from "../lib/backend.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Backend, Build, Job } from "../lib/types.ts";
 import type { MethodDraftMeta } from "aio";
+import { formatRef, parseRef, prStateNote, refForPrs } from "../lib/srcref.ts";
 
 export type Origin = "source" | "release";
 
@@ -24,6 +25,13 @@ export type BuildsState = {
   refs: string[];
   refsLoading: boolean;
   ref: string;
+  /** The title of the pull request `ref` names, when it names one. Empty
+   *  otherwise, and empty when GitHub could not be read — it is a label, and
+   *  no build depends on it. */
+  prTitle: string;
+  /** Anything worth SAYING about the pull requests in `ref` — chiefly that one
+   *  has been merged, which quietly turns its ref into an older master. */
+  prNotes: string[];
   backend: Backend;
   /** True once the user has picked a backend by hand. Until then the boot seed
    *  may match `backend` to the hardware. */
@@ -77,9 +85,66 @@ const EMPTY_JOB = (label: string, steps: string[]): Job => ({
   error: null,
 });
 
+/**
+ * Look up what each pull request IS and whether it is still open.
+ *
+ * Two questions with one page each, and neither may block a build: the title
+ * is a label, and the state decides only what the panel SAYS. The merged case
+ * is the one worth the round trip — GitHub keeps a merged PR's refs pointing
+ * at the merge computed back then, so the day one lands, its ref quietly
+ * starts meaning "an older master, plus a change master already has".
+ */
+async function describePrs(
+  s: BuildsState & Partial<MethodDraftMeta>,
+  prs: readonly number[],
+): Promise<void> {
+  if (prs.length === 0) return;
+  const io = await import("./builds.server.ts");
+  const seen = formatRef(refForPrs(prs.slice()));
+  const [titles, states] = await Promise.all([
+    Promise.all(prs.map((n) => io.prTitle(n))),
+    Promise.all(prs.map((n) => io.prState(n))),
+  ]);
+  // The ref can have moved on while those were in flight; a description of the
+  // previous request beside the current one is worse than none.
+  if (s.ref !== seen) return; // aiol-ok: deliberate re-read after await
+  s.prTitle = titles.filter(Boolean).join(" · ");
+  s.prNotes = prs
+    .map((n, i) => prStateNote(n, states[i] ?? "unknown"))
+    .filter((x): x is NonNullable<typeof x> => x !== null)
+    .map((x) => x.message);
+}
+
+/**
+ * Point the panel at a source ref, and void what cannot survive the change.
+ *
+ * A plain function over the draft rather than a method, so `setRef` and
+ * `setPr` can share it without one dispatching the other: a nested same-cell
+ * call runs against committed state and cannot see the write its caller is
+ * halfway through (aiol says so, and it is right).
+ */
+function applyRef(s: BuildsState, ref: string): void {
+  s.ref = ref;
+  s.assets = [];
+  s.assetName = "";
+  s.prTitle = "";
+  s.prNotes = [];
+  // Only the source route can build a pull request — nobody publishes
+  // prebuilt binaries for unmerged code — so the route follows the ref rather
+  // than leaving the user on one that is about to refuse them.
+  if (parseRef(ref).kind === "pr") s.origin = "source";
+}
+
 export const builds = cell("builds", {
   // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
   transaction: false,
+  // A cmake build of llama.cpp takes minutes on a workstation and can take
+  // hours on a laptop, and the release route downloads hundreds of MB over
+  // whatever link the user has — neither has an honest ceiling. Declared here
+  // rather than as a `perfBudget.methods["builds:start"].timeout` number,
+  // because that key is a string in another file that no rename follows;
+  // `long:` is checked against this method list at cell() time.
+  long: ["start", "update"],
   // The chosen ref/backend and the active build are worth remembering; the
   // volatile fields are excluded so a restart never resumes a dead job.
   persist: {
@@ -98,6 +163,8 @@ export const builds = cell("builds", {
     refs: [] as string[],
     refsLoading: false,
     ref: "master",
+    prTitle: "",
+    prNotes: [] as string[],
     backend: "cpu" as Backend,
     /** Has the user picked a backend themselves? Until they have, the boot seed
      *  is free to match it to the hardware. */
@@ -126,12 +193,53 @@ export const builds = cell("builds", {
   },
   methods: {
     setRef(s, ref: string) {
-      s.ref = ref;
-      s.assets = [];
-      s.assetName = "";
+      applyRef(s, ref);
       // Readiness for the release route is unknowable without the asset list,
       // and "press List assets first" is not an experience. Fetch it.
-      if (s.origin === "release") builds.loadAssets();
+      if (s.origin === "release" && parseRef(ref).kind !== "pr") {
+        builds.loadAssets();
+      }
+    },
+
+    /**
+     * Build the source of a pull request, on top of current master.
+     *
+     * GitHub publishes every PR already merged into master as its own ref and
+     * serves a tarball of it, so this needs no git and no merge logic here —
+     * see `src/lib/srcref.ts`. `head` is the escape hatch for a PR that no
+     * longer merges: the author's branch alone, older base and all.
+     *
+     * Async, and it does the title lookup ITSELF rather than dispatching
+     * `loadPrTitle` — a nested same-cell call runs as its own transaction
+     * against COMMITTED state, so it would read the ref from before this
+     * method set it and then discard the title as belonging to another
+     * request. `applyRef` is the plain helper both entry points share, which
+     * is what aiol asks for and the right shape anyway.
+     */
+    async setPr(
+      s: BuildsState & Partial<MethodDraftMeta>,
+      pr: number,
+      mode: "merge" | "head" = "merge",
+    ) {
+      if (!(pr > 0)) return;
+      applyRef(s, formatRef({ kind: "pr", pr, mode }));
+      await describePrs(s, [pr]);
+    },
+
+    /**
+     * Build master with SEVERAL pull requests merged into it, in this order.
+     *
+     * GitHub publishes each PR merged into master and nothing merged into
+     * anything else, so this is the one shape that needs a real merge — and
+     * therefore git, which `buildFromSource` checks for and names.
+     */
+    async setPrs(
+      s: BuildsState & Partial<MethodDraftMeta>,
+      prs: number[],
+    ) {
+      const list = prs.filter((n) => n > 0);
+      applyRef(s, formatRef(refForPrs(list)));
+      await describePrs(s, list);
     },
     setBackend(s, backend: Backend) {
       s.backend = backend;

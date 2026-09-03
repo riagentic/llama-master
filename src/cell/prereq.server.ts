@@ -19,11 +19,23 @@ import {
   exists,
   extract,
   fetchJson,
+  fetchText,
+  makeExecutable,
   paths,
   PLATFORM,
   which,
 } from "./host.server.ts";
+import { cudaOffer, driverCudaVersion, parseCudaVersion } from "../lib/cuda.ts";
+import {
+  cudaDirName,
+  cudaDiskNeededB,
+  cudaFiles,
+  cudaFilesUsable,
+  cudaFixSummary,
+  manifestUrl,
+} from "../lib/cudaredist.ts";
 import { join } from "@std/path";
+import { disks } from "./hw.server.ts";
 
 /** First line of `--version` output, trimmed — every tool here prints one. */
 function firstLine(s: string): string {
@@ -66,6 +78,208 @@ async function managedCmakePath(): Promise<string | null> {
   ];
   for (const c of candidates) if (await exists(c)) return c;
   return null;
+}
+
+/** Where the app keeps a CUDA toolkit it installed itself. */
+export function cudaPrefix(version: string): string {
+  return join(paths().toolchain, cudaDirName(version));
+}
+
+/**
+ * The newest CUDA toolkit this app has installed, if any.
+ *
+ * Directories only — a half-finished install is removed before it is named, so
+ * anything here with an `nvcc` in it is complete.
+ */
+export async function managedCuda(): Promise<
+  { path: string; nvcc: string; version: string } | null
+> {
+  let best: { path: string; nvcc: string; version: string } | null = null;
+  try {
+    for await (const e of Deno.readDir(paths().toolchain)) {
+      if (!e.isDirectory || !e.name.startsWith("cuda-")) continue;
+      const path = join(paths().toolchain, e.name);
+      const nvcc = join(path, "bin", "nvcc");
+      if (!(await exists(nvcc))) continue;
+      const version = e.name.slice("cuda-".length);
+      if (!best || parseCudaVersion(version) > parseCudaVersion(best.version)) {
+        best = { path, nvcc, version };
+      }
+    }
+  } catch {
+    // No toolchain directory yet.
+  }
+  return best;
+}
+
+/**
+ * Install a CUDA toolkit into a directory this app owns.
+ *
+ * The safe half of the "your CUDA is too old for your GPU" fix, and every
+ * choice here is about that word (`src/lib/cudaredist.ts` has the long form):
+ * component tarballs from NVIDIA's redistributable manifest, each verified
+ * against the SHA-256 published with it, unpacked under `~/.llama-master`. No
+ * root, no apt repository, no driver, no kernel module, no system package —
+ * and undone completely by deleting one directory.
+ *
+ * Disk is checked first, because the machine this was written for sits at 99%
+ * full and running it to zero would be a far worse outcome than a refusal.
+ */
+export async function installCudaToolkit(
+  version: string,
+  onProgress: (received: number, total: number | null, note: string) => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  onProgress(0, null, `Reading NVIDIA's file list for CUDA ${version}`);
+  const manifest = await fetchJson<unknown>(manifestUrl(version));
+  const { files, totalB, missing } = cudaFiles(manifest);
+  if (!cudaFilesUsable(files)) {
+    throw new Error(
+      `NVIDIA's manifest for CUDA ${version} does not list a compiler for this platform, so there is nothing to install.`,
+    );
+  }
+  if (missing.length > 0) {
+    onProgress(0, null, `Not in this release, skipped: ${missing.join(", ")}`);
+  }
+
+  const tar = await which("tar");
+  if (!tar) {
+    throw new Error(
+      "Unpacking NVIDIA's CUDA archives needs `tar`, which is not installed. Every Linux and macOS ships it; install it and try again.",
+    );
+  }
+
+  const need = cudaDiskNeededB(totalB);
+  // The same `df -kP` reading the rest of the app uses, so "not enough room"
+  // means here what it means on the Storage page.
+  await ensureDir(paths().toolchain);
+  const free = (await disks([paths().toolchain]))[0]?.availB ?? 0;
+  if (free > 0 && free < need) {
+    throw new Error(
+      `Not enough room: CUDA ${version} needs about ${
+        (need / 1024 ** 3).toFixed(1)
+      } GB free while unpacking and there is ${
+        (free / 1024 ** 3).toFixed(1)
+      } GB. Free some space and try again — nothing has been downloaded.`,
+    );
+  }
+
+  // Into a temporary directory first, renamed only once every file is in.
+  // A half-unpacked toolkit that looks installed is worse than none: the next
+  // build would pick it up and fail deep inside cmake.
+  const prefix = cudaPrefix(version);
+  const staging = `${prefix}.partial`;
+  await Deno.remove(staging, { recursive: true }).catch(() => {});
+  await ensureDir(staging);
+  try {
+    let done = 0;
+    for (const f of files) {
+      if (signal?.aborted) throw new Error("cancelled");
+      const note = `Downloading ${f.key} — ${f.why}`;
+      const bytes = await download(
+        f.url,
+        (r, t) =>
+          onProgress(
+            done + r,
+            totalB || (t ? done + t : null),
+            note,
+          ),
+        signal,
+      );
+      // Checked BEFORE anything is written. NVIDIA publishes the hash beside
+      // the file; a mismatch means a corrupted download or a tampered mirror,
+      // and either way it must not reach the disk.
+      const got = await sha256Hex(bytes);
+      if (got !== f.sha256) {
+        throw new Error(
+          `${f.name} did not match the checksum NVIDIA published for it. Nothing was installed.`,
+        );
+      }
+      onProgress(done, totalB, `Unpacking ${f.key}`);
+      // System `tar`, not the app's own extractor: these archives are xz and
+      // Deno's DecompressionStream has gzip and deflate only. `tar` reads xz
+      // everywhere this app runs, and the alternative is shipping an xz
+      // decoder to save a dependency that is already present.
+      //
+      // Every archive wraps its contents in one versioned directory
+      // (`cuda_nvcc-linux-x86_64-13.3.73-archive/`), so it is stripped and the
+      // components merge into a single toolkit layout.
+      const tmp = join(staging, `.${f.key}.tar.xz`);
+      await Deno.writeFile(tmp, bytes);
+      const un = await exec(tar, [
+        "xf",
+        tmp,
+        "-C",
+        staging,
+        "--strip-components=1",
+      ]);
+      await Deno.remove(tmp).catch(() => {});
+      if (un.code !== 0) {
+        throw new Error(
+          `Could not unpack ${f.name}: ${un.stderr.trim().slice(0, 200)}`,
+        );
+      }
+      done += f.sizeB || bytes.length;
+    }
+    await Deno.remove(prefix, { recursive: true }).catch(() => {});
+    await Deno.rename(staging, prefix);
+  } catch (e) {
+    await Deno.remove(staging, { recursive: true }).catch(() => {});
+    throw e;
+  }
+
+  const nvcc = join(prefix, "bin", "nvcc");
+  if (!(await exists(nvcc))) {
+    await Deno.remove(prefix, { recursive: true }).catch(() => {});
+    throw new Error(
+      "The download finished but no compiler appeared, so it was removed rather than left half-installed.",
+    );
+  }
+  await makeExecutable(nvcc);
+  return nvcc;
+}
+
+/**
+ * The newest published release of a CUDA major.minor line, e.g. 13.0 → 13.3.1.
+ *
+ * NVIDIA's redistributable index is a directory listing of
+ * `redistrib_<version>.json`, so the available releases can be read without an
+ * API or a key. Patch releases of the same line are the same compiler
+ * generation with fixes, so taking the newest of the line the machine NEEDS is
+ * strictly better than taking the oldest — while still not jumping to a major
+ * version nobody asked for.
+ */
+export async function newestRedistFor(line: number): Promise<string | null> {
+  const prefix = `${line}`.includes(".") ? `${line}.` : `${line}.0.`;
+  try {
+    const html = await fetchText(
+      "https://developer.download.nvidia.com/compute/cuda/redist/",
+    );
+    const all = [...html.matchAll(/redistrib_(\d+\.\d+\.\d+)\.json/g)]
+      .map((m) => m[1] as string)
+      .filter((v) => v.startsWith(prefix));
+    if (all.length === 0) return null;
+    const key = (v: string) =>
+      v.split(".").map((n) => Number(n).toString().padStart(4, "0")).join(".");
+    all.sort((a, b) => key(a) < key(b) ? 1 : -1);
+    return all[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-256 of a buffer, as lowercase hex. */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const d = await crypto.subtle.digest(
+    "SHA-256",
+    bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer,
+  );
+  return Array.from(new Uint8Array(d))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /** Where the app keeps its own SPIRV-Headers install. */
@@ -217,6 +431,68 @@ export async function resolveCompiler(): Promise<
   return null;
 }
 
+/**
+ * Whether the CUDA toolkit here can build NATIVE code for the cards here.
+ *
+ * A prerequisite in its own right, separate from "is nvcc installed", because
+ * the failure is different and so is the fix: nvcc is present, cmake succeeds,
+ * the build finishes, and the binary is slower than it should be for ever.
+ * That is the shape of problem this app exists to surface before it costs
+ * somebody an afternoon.
+ *
+ * `found: true` means "nothing to do here" — either the toolkit already covers
+ * every card, or there is no NVIDIA card, or the DRIVER is too old to run a
+ * toolkit that would help. The last one matters: installing a toolkit newer
+ * than the driver produces binaries the machine cannot load, so when the
+ * driver is the limit the app says nothing rather than offering a fix that
+ * makes things worse (`cudaOffer`).
+ */
+async function resolveCudaFit(
+  nvcc: { path: string; version: string } | null,
+): Promise<
+  | { ok: true; note: string; managed: boolean; path: string; version: string }
+  | { ok: false; need: number; have: number; newestCap: number }
+> {
+  const none = {
+    ok: true as const,
+    note: "",
+    managed: false,
+    path: "",
+    version: "",
+  };
+  // A toolkit this app installed wins: it is the one the build will use.
+  const own = await managedCuda();
+  const version = own?.version ?? nvcc?.version ?? "";
+  if (!version) return none;
+
+  const smi = await exec("nvidia-smi", []);
+  if (smi.code !== 0) return none; // no NVIDIA card: nothing to fit
+  const capsOut = await exec("nvidia-smi", [
+    "--query-gpu=compute_cap",
+    "--format=csv,noheader",
+  ]);
+  const caps = capsOut.code === 0
+    ? capsOut.stdout.split("\n").map((l) => Number(l.trim())).filter((n) =>
+      n > 0
+    )
+    : [];
+  if (caps.length === 0) return none;
+
+  const offer = cudaOffer(version, caps, driverCudaVersion(smi.stdout));
+  if (!offer) {
+    return {
+      ok: true,
+      note: own
+        ? `CUDA ${own.version}, installed by llama.master`
+        : `CUDA ${parseCudaVersion(version)}`,
+      managed: Boolean(own),
+      path: own?.path ?? nvcc?.path ?? "",
+      version: own?.version ?? version,
+    };
+  }
+  return { ok: false, ...offer };
+}
+
 /** Everything the Prerequisites panel lists, in the order it lists them. */
 export async function detect(): Promise<Prereq[]> {
   const [
@@ -242,6 +518,13 @@ export async function detect(): Promise<Prereq[]> {
     resolveSpirvHeaders(),
     resolveHipDev(),
   ]);
+
+  // Is the toolkit new enough for the cards that are actually in this machine?
+  // A separate question from "is nvcc installed", and the one that costs real
+  // speed: a toolkit older than the GPU can only emit PTX, which the driver
+  // re-compiles at every load and which runs slower than native code. Measured
+  // on this machine — CUDA 12.0 against Blackwell (sm_120).
+  const cudaFit = await resolveCudaFit(nvcc);
 
   const mk = (
     id: string,
@@ -306,6 +589,21 @@ export async function detect(): Promise<Prereq[]> {
       "Required to COMPILE the CUDA backend. Prebuilt CUDA releases need only the driver.",
       nvcc,
       { systemOnly: true },
+    ),
+    mk(
+      "cuda-arch",
+      "CUDA new enough for your GPU",
+      cudaFit.ok
+        ? "The CUDA toolkit here can build native code for the cards here."
+        : `CUDA ${cudaFit.have} cannot build native code for sm_${
+          Math.round(cudaFit.newestCap * 10)
+        } — it can only emit PTX, which the driver re-compiles on every load and which runs slower. CUDA ${cudaFit.need} or newer fixes it. llama.master can install one into its own folder: no administrator rights, no driver change, nothing outside ~/.llama-master.`,
+      cudaFit.ok && cudaFit.note
+        ? { path: cudaFit.path, version: cudaFit.note }
+        : cudaFit.ok
+        ? { path: "", version: "not applicable" }
+        : null,
+      { managed: cudaFit.ok ? cudaFit.managed : false },
     ),
     mk(
       "vulkan",
@@ -505,6 +803,31 @@ export async function fix(
     if (id === "spirv") {
       const prefix = await installSpirvHeaders(report);
       return { ok: true, message: `Installed ${prefix}` };
+    }
+    if (id === "cuda-arch") {
+      // Which release to fetch is decided from the machine, not typed in: the
+      // OLDEST one that covers the newest card, capped by what the driver can
+      // run. A bigger jump is a bigger download for no gain.
+      const fit = await resolveCudaFit(await probe("nvcc"));
+      if (fit.ok) {
+        return {
+          ok: true,
+          message: "The CUDA toolkit here already covers every card.",
+        };
+      }
+      const version = await newestRedistFor(fit.need);
+      if (!version) {
+        return {
+          ok: false,
+          message:
+            `NVIDIA publishes no downloadable CUDA ${fit.need} for this platform, so there is nothing safe to install automatically.`,
+        };
+      }
+      for (const line of cudaFixSummary(version, 0, cudaPrefix(version))) {
+        onLine(line);
+      }
+      const nvcc = await installCudaToolkit(version, report);
+      return { ok: true, message: `Installed ${nvcc}` };
     }
     const bin = await installCmake(report);
     return { ok: true, message: `Installed ${bin}` };

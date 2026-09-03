@@ -113,6 +113,19 @@ export function queueNote(queueLength: number, streaming: boolean): string {
   return `${n} waiting — nothing is running, so press Send to go on.`;
 }
 
+/**
+ * How tall the box should be for what is in it, in rows.
+ *
+ * One line for a one-line message; it grows with the lines typed (or pasted —
+ * a file, a stack trace) and stops at `max`, past which the box scrolls. Grown
+ * from the text rather than measured from the DOM so both surfaces size the
+ * same way and a test can pin it.
+ */
+export function draftRows(text: string, max = 6): number {
+  const lines = text.split("\n").length;
+  return Math.max(1, Math.min(max, lines));
+}
+
 /** A queued message shortened for a chip, with the whole of it kept for the
  *  tooltip. Cut on a word where there is one nearby, because a hard cut mid-word
  *  reads as corruption rather than as elision. */

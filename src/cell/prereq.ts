@@ -28,6 +28,11 @@ export type PrereqState = {
 export const prereq = cell("prereq", {
   // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
   transaction: false,
+  // A fix runs a package manager or AMD's own ROCm install script: it downloads,
+  // it may wait on `pkexec` for a human to type a password, and it has no
+  // ceiling anyone can name. `scan` keeps its 120 s bound — detection that
+  // takes two minutes is a wedged tool, not a slow one.
+  long: ["fix", "fixAll"],
   // Tool paths and versions change outside the app (a package upgrade), so a
   // persisted list would be confidently wrong; re-detect on every boot.
   persist: "none",

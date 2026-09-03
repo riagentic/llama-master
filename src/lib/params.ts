@@ -144,13 +144,67 @@ export const PARAMS: readonly Param[] = [
     flag: "--spec-type",
     label: "Speculative decoding",
     kind: "enum",
-    options: ["", "draft-mtp"],
-    optionLabels: ["off", "MTP (model's own block)"],
+    options: [
+      "",
+      "draft-mtp",
+      "ngram-simple",
+      "ngram-map-k",
+      "ngram-map-k4v",
+      "ngram-mod",
+      "ngram-cache",
+    ],
+    optionLabels: [
+      "off",
+      "MTP (model's own block)",
+      "n-gram (simple)",
+      "n-gram map (k)",
+      "n-gram map (k4v)",
+      "n-gram (mod)",
+      "n-gram (cache)",
+    ],
     group: "performance",
     scope: "both",
     def: "",
     tip:
-      "Draft several tokens ahead and let the full model verify them. LOSSLESS — a rejected draft is discarded, so the output is exactly what the model would have produced anyway; only the speed changes. `draft-mtp` uses the multi-token-prediction block the model already ships, so it needs no second model. Only offered for models that declare one.",
+      "Draft several tokens ahead and let the full model verify them. LOSSLESS — a rejected draft is discarded, so the output is exactly what the model would have produced anyway; only the speed changes. `draft-mtp` uses the multi-token-prediction block the model already ships, so it needs no second model, and is only offered for models that declare one. The `ngram-*` kinds draft from the text already generated — no second model, no MTP block, any model — and pay off on repetitive output (code, lists, edits of earlier text). Not measured by the tuner; try `ngram-map-k4v` first.",
+  },
+  {
+    // In llama.cpp master since late August 2026, defaulting to `auto`. The
+    // `on-direct` VALUE is not: it comes from pull request #28136, which
+    // replaces demand-paging the per-layer-embedding table with explicit reads
+    // and was measured at better than twice the cold prefill on several
+    // machines. Left at `auto` the flag is not emitted at all, so a build
+    // without that pull request is completely unaffected — which is the rule
+    // every PR-only setting has to follow.
+    key: "lazyMode",
+    flag: "--lazy-mode",
+    label: "Lazy tensor reads",
+    kind: "enum",
+    group: "performance",
+    scope: "both",
+    def: "auto",
+    llamaDef: "auto",
+    options: ["auto", "on", "on-direct", "off"],
+    optionLabels: [
+      "auto (over 4 GiB)",
+      "on",
+      "on-direct (needs PR #28136)",
+      "off",
+    ],
+    advanced: true,
+    tip:
+      "Read huge lookup tensors — a per-layer embedding table, which is a quarter of Qwen3.8-Flash-Next — from disk on demand instead of holding them in memory. `auto` does this above 4 GiB and is llama.cpp's own default. `on-direct` reads the rows with explicit file reads instead of page faults, which is much faster on a cold cache; it exists only in builds carrying pull request #28136, and a build without it will refuse to start and say so.",
+  },
+  {
+    key: "draftModel",
+    flag: "-md",
+    label: "Draft model",
+    kind: "text",
+    group: "performance",
+    scope: "both",
+    def: "",
+    tip:
+      "Path to a small GGUF of the SAME family, used to draft tokens the big model then verifies. The strongest form of speculative decoding — a 0.5B drafting for a 32B is the classic pairing — and still lossless: a rejected draft is discarded, so the output is unchanged. It costs the VRAM the draft model occupies, which the memory plan does not yet bill, so leave headroom.",
   },
   {
     key: "specDraftNMax",
@@ -264,16 +318,43 @@ export const PARAMS: readonly Param[] = [
       "Concurrent requests the server will serve. The context size is divided between slots, so 4 slots at -c 32768 gives each request 8192 tokens.",
   },
   {
-    key: "noContextShift",
-    flag: "--no-context-shift",
-    label: "No context shift",
+    // Upstream's default FLIPPED: `ctx_shift = false` (common.h), and the
+    // flag pair is `--context-shift` / `--no-context-shift`. This entry used
+    // to be "No context shift", emitting `--no-context-shift` when ON — which
+    // reproduced the default — and offering no way to turn shifting on at all:
+    // a switch that did nothing in either position. Stored as
+    // `noContextShift` until cfg v3, which drops it (the old default and the
+    // new one run the same server).
+    key: "contextShift",
+    flag: "--context-shift",
+    offFlag: "--no-context-shift",
+    label: "Context shift",
     kind: "bool",
     group: "context",
     scope: "server",
     def: false,
     advanced: true,
     tip:
-      "Stop instead of silently dropping the oldest tokens when the context fills. Preferable when you need reproducible, complete conversations.",
+      "When the context fills, drop the oldest tokens and carry on instead of stopping. Off by default (llama.cpp's own default): a conversation that silently loses its beginning is worse than one that says it is full. llama.cpp refuses it anyway on models whose cache cannot shift (hybrid and recurrent architectures).",
+  },
+  {
+    key: "cacheReuse",
+    flag: "--cache-reuse",
+    label: "Cache reuse",
+    kind: "int",
+    group: "context",
+    scope: "server",
+    def: 256,
+    // llama.cpp's own default is 0 — off. Every upstream server preset sets
+    // 256, and the server disables it by itself where the cache cannot shift,
+    // so it is safe to emit for every model.
+    llamaDef: 0,
+    min: 0,
+    max: 8192,
+    unit: "tokens",
+    advanced: true,
+    tip:
+      "Minimum chunk of an earlier prompt to reuse by shifting the KV cache instead of recomputing it. Turns an edit in the middle of a conversation — a changed system prompt, a trimmed message — from a full re-prefill into a shift. 0 = off.",
   },
   {
     key: "keep",
@@ -292,21 +373,6 @@ export const PARAMS: readonly Param[] = [
     advanced: true,
     tip:
       "Tokens from the start of the prompt to preserve when the context shifts. -1 keeps all of them.",
-  },
-  {
-    key: "defragThold",
-    flag: "--defrag-thold",
-    label: "KV defrag threshold",
-    kind: "float",
-    group: "context",
-    scope: "both",
-    def: 0.1,
-    min: 0,
-    max: 1,
-    step: 0.05,
-    advanced: true,
-    tip:
-      "Compact the KV cache when this fraction of it is holes. Matters for long multi-slot server sessions.",
   },
 
   // ── performance ──────────────────────────────────────────────────────────
@@ -335,7 +401,7 @@ export const PARAMS: readonly Param[] = [
     max: 512,
     advanced: true,
     tip:
-      "Threads for prompt processing, which is compute-bound rather than bandwidth-bound — here every logical processor can help. 0 = same as -t.",
+      "Threads for prompt processing. 0 = same as -t, which is llama.cpp's default and what the tuner emits (one per physical core). Two threads on one core share its memory port, so SMT siblings rarely help here either — measure before raising it.",
   },
   {
     key: "flashAttn",
@@ -594,13 +660,49 @@ export const PARAMS: readonly Param[] = [
   {
     key: "jinja",
     flag: "--jinja",
+    // ON upstream (`use_jinja = true`, common.h). This was `def: false` with
+    // no `offFlag`, so switching it on emitted a flag that changed nothing and
+    // switching it off emitted nothing and changed nothing — the server ran
+    // Jinja either way while the panel said "off".
+    offFlag: "--no-jinja",
     label: "Jinja templates",
     kind: "bool",
     group: "server",
     scope: "server",
-    def: false,
+    def: true,
+    llamaDef: true,
     tip:
-      "Use the chat template embedded in the GGUF. Needed for correct formatting on most instruct models, and for tool calling.",
+      "Render the chat template embedded in the GGUF with the Jinja engine — llama.cpp's default, and what tool calling and reasoning models need. Off falls back to the built-in template table; the command then shows --no-jinja.",
+  },
+  {
+    key: "reasoning",
+    flag: "--reasoning",
+    label: "Reasoning",
+    kind: "enum",
+    group: "server",
+    scope: "server",
+    def: "auto",
+    llamaDef: "auto",
+    options: ["auto", "on", "off"],
+    optionLabels: ["auto (the model decides)", "on", "off"],
+    tip:
+      "Whether a thinking model thinks before it answers. `off` skips the reasoning pass on models that allow it (Qwen3, GLM) — faster, and often enough for short questions. Replaces the deprecated `--chat-template-kwargs enable_thinking`.",
+  },
+  {
+    key: "reasoningBudget",
+    flag: "--reasoning-budget",
+    label: "Reasoning budget",
+    kind: "int",
+    group: "server",
+    scope: "server",
+    def: -1,
+    llamaDef: -1,
+    min: -1,
+    max: 1_000_000,
+    unit: "tokens",
+    advanced: true,
+    tip:
+      "Cap on thinking tokens per reply; the model is nudged to answer once it is spent. -1 = unlimited, 0 = no thinking.",
   },
   {
     key: "chatTemplate",
@@ -641,14 +743,21 @@ export const PARAMS: readonly Param[] = [
   {
     key: "slots",
     flag: "--slots",
+    // ON upstream (`endpoint_slots = true`, common.h). As `def: false` with no
+    // `offFlag` the switch was inert and the endpoint was up the whole time —
+    // while its own tip warned that it leaks prompts. The LAN client reads
+    // /slots for occupancy, so it stays on; what changes is that OFF now
+    // works, and `stability.ts` says when it should be used.
+    offFlag: "--no-slots",
     label: "Expose slots",
     kind: "bool",
     group: "server",
     scope: "server",
-    def: false,
+    def: true,
+    llamaDef: true,
     advanced: true,
     tip:
-      "Expose /slots with live per-request state. Useful for debugging, leaks prompt contents.",
+      "Expose /slots with live per-request state — what the LAN client reads for occupancy. It also shows every prompt in flight, so turn it off (the command then shows --no-slots) when the server is bound to the network without an API key.",
   },
   {
     key: "noWebui",
@@ -668,13 +777,17 @@ export const PARAMS: readonly Param[] = [
     kind: "int",
     group: "server",
     scope: "server",
-    def: 600,
+    // llama.cpp's own 3600. It was 600 here, which is shorter than a long
+    // prompt takes to prefill: 250k tokens at the measured 364 tok/s is ~690 s
+    // with nothing on the wire, and the server cut the request off.
+    def: 3600,
     llamaDef: 3600,
     min: 1,
     max: 86400,
     unit: "s",
     advanced: true,
-    tip: "Seconds the server waits on a stalled request before giving up.",
+    tip:
+      "Seconds the server waits on a stalled request before giving up. A long prompt sends nothing while it prefills, so keep this above the prefill time of your biggest context.",
   },
   {
     key: "verbose",

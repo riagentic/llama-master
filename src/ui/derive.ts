@@ -15,6 +15,7 @@
 // this number come from" has one answer — and one convention beats two that both
 // work. `tests/guards.test.ts` still enforces it, and says the same thing.
 
+import { computed } from "aio/air";
 import { builds } from "../cell/builds.ts";
 import { cfg } from "../cell/cfg.ts";
 import { chat } from "../cell/chat.ts";
@@ -45,6 +46,10 @@ import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
 import { setupRows } from "../lib/setup.ts";
+import { bandwidthNote, benchApplies, benchIsSound } from "../lib/bench.ts";
+import type { BandwidthNote, BenchResult } from "../lib/bench.ts";
+import { quantAdvice, quantOptions } from "../lib/quant.ts";
+import type { QuantOption } from "../lib/quant.ts";
 import type { SetupRow } from "../lib/setup.ts";
 import { num, str } from "../lib/params.ts";
 import { queueNote, submitKind } from "../lib/queue.ts";
@@ -321,6 +326,22 @@ export function memoryIsLive(): boolean {
   return srv.runSettings !== null && serverRunning();
 }
 
+// ── The planner chain is MEMOISED ─────────────────────────────────────────
+//
+// Everything from here to `projectedSpeed` is `computed()`: cached until a cell
+// it read changes, and read through a plain function so call sites stay
+// property reads (`tests/guards.test.ts`). It was not, and the all-in-one page
+// root — which reads chat, hw and srv — re-ran `tuneAll` three times per render
+// (placements → projectedSettings → projectedStatePlan, then perTokenBytes did
+// it all again), at ~14 ms each on a 94-layer MoE: ~100 ms of JS on every
+// streamed-token flush (2-16/s), every hw tick and every srv tick. That is what
+// made typing lag while a reply was streaming. A chat flush now touches none
+// of these, and a 1 s hw tick recomputes each once.
+//
+// `computed`, not a hand-rolled cache: a cache hit that skips the read skips
+// the subscription (dep/aio/docs/ui/reactivity-tracking.md), and a computed
+// replays it.
+
 /**
  * The machine as it is RIGHT NOW.
  *
@@ -329,7 +350,7 @@ export function memoryIsLive(): boolean {
  * else's; when nothing is running every llama.cpp bucket is zero and the pools
  * show only what other processes hold and what is free. Same `plan` either way.
  */
-export function currentStatePlan(): Plan {
+const currentStatePlanC = computed(() => {
   const m = shownModel()?.meta;
   if (memoryIsLive() && m && srv.runSettings) {
     // `plan` reads "in use" from device-wide telemetry — the driver's VRAM
@@ -363,6 +384,9 @@ export function currentStatePlan(): Plan {
     return computePlan(m, base, srv.runSettings, "running", cardFreeB);
   }
   return computePlan(NO_MODEL, hwSnapshot(), { ...cfg.settings, ngl: 0 });
+});
+export function currentStatePlan(): Plan {
+  return currentStatePlanC.value;
 }
 
 /** What llama.master itself is holding right now, so a projection can take it
@@ -406,7 +430,7 @@ export function ourUsageB(): { vramB: number; ramB: number } {
  * we start if we swapped what is loaded now for this. One model runs at a time,
  * so that is always the right question.
  */
-export function planningHw(): Hw {
+const planningHwC = computed(() => {
   const ours = ourUsageB();
   const base = ours.vramB === 0 && ours.ramB === 0
     ? hwSnapshot()
@@ -421,6 +445,9 @@ export function planningHw(): Hw {
   // current-state view must keep reporting real free memory. Reserved bytes are
   // free until something takes them; what they must never be is SPENDABLE.
   return { ...base, reserve: reserveNow() };
+});
+export function planningHw(): Hw {
+  return planningHwC.value;
 }
 
 /** What the user has told the app to keep for themselves. */
@@ -449,7 +476,7 @@ export function reserveNow(): Reserve {
  * confident guess this app refuses everywhere else. Null when the reserve costs
  * nothing, which is the common case and should say nothing at all.
  */
-export function reserveCost():
+export type ReserveCost =
   | {
     blocks: true;
     layers?: undefined;
@@ -457,7 +484,9 @@ export function reserveCost():
     ctxWith?: undefined;
   }
   | { blocks?: false; layers: number; ctxLost: number; ctxWith: number }
-  | null {
+  | null;
+
+const reserveCostC = computed((): ReserveCost => {
   const m = currentModel();
   const r = reserveNow();
   if (!m?.meta) return null;
@@ -481,13 +510,16 @@ export function reserveCost():
   const ctxLost = Math.max(0, without.ctx - withReserve.ctx);
   if (layers === 0 && ctxLost === 0) return null;
   return { layers, ctxLost, ctxWith: withReserve.ctx };
+});
+export function reserveCost(): ReserveCost {
+  return reserveCostC.value;
 }
 
 /**
  * Every placement for the current model, so the UI can compare them without
  * three separate calls. Null when no model with a readable header is selected.
  */
-export function placements(): Record<Placement, Tuning> | null {
+const placementsC = computed(() => {
   const m = currentModel();
   if (!m?.meta) return null;
   return tuneAll(
@@ -505,6 +537,30 @@ export function placements(): Record<Placement, Tuning> | null {
     ctxOverride() || undefined,
     measuredCtx(m.path) || undefined,
   );
+});
+export function placements(): Record<Placement, Tuning> | null {
+  return placementsC.value;
+}
+
+/**
+ * The largest context each of the two GPU placements can hold, hunted to the
+ * model's advertised maximum — the "Max·VRAM" / "Max·Hybrid" buttons. Two
+ * full hunts (~15 ms each on a big model), memoised for the same reason as the
+ * chain above: `CtxControls` computed them in its body on every render.
+ */
+const maxTuningsC = computed(
+  (): { vram: Tuning | null; hybrid: Tuning | null } => {
+    const m = currentModel();
+    if (!m?.meta) return { vram: null, hybrid: null };
+    const meta = m.meta;
+    const h = planningHw();
+    const hunt = (pl: Placement) =>
+      tune(meta, h, cfg.settings, pl, undefined, undefined, true);
+    return { vram: hunt("vram"), hybrid: hunt("hybrid") };
+  },
+);
+export function maxTunings(): { vram: Tuning | null; hybrid: Tuning | null } {
+  return maxTuningsC.value;
 }
 
 /** The largest context this model has been observed to actually start at on
@@ -530,7 +586,7 @@ export function measuredCtx(path: string): number {
  * are what gets projected — including a pinned context, which the tuner would
  * otherwise be the only thing writing in.
  */
-export function projectedSettings(): Settings {
+const projectedSettingsC = computed(() => {
   const m = currentModel()?.meta;
   const pin = m ? ctxOverride() : 0;
   // The clamp is the pin's own (`pinnedCtx`), so the number projected is the
@@ -550,6 +606,9 @@ export function projectedSettings(): Settings {
     ? cfg.placement
     : bestPlacement(all);
   return all[chosen].possible ? all[chosen].settings : own;
+});
+export function projectedSettings(): Settings {
+  return projectedSettingsC.value;
 }
 
 /**
@@ -560,10 +619,13 @@ export function projectedSettings(): Settings {
  * stops a running model being counted twice. Null when no model with a readable
  * header is selected.
  */
-export function projectedStatePlan(): Plan | null {
+const projectedStatePlanC = computed(() => {
   const m = currentModel()?.meta;
   if (!m) return null;
   return computePlan(m, planningHw(), projectedSettings());
+});
+export function projectedStatePlan(): Plan | null {
+  return projectedStatePlanC.value;
 }
 
 /**
@@ -573,7 +635,7 @@ export function projectedStatePlan(): Plan | null {
  * pessimistic end, because a conversation gets slower as it fills and the number
  * that matters to someone choosing settings is what it degrades to.
  */
-export function perTokenBytes(): { gpuB: number; ramB: number } | null {
+const perTokenBytesC = computed(() => {
   const m = currentModel()?.meta;
   if (!m) return null;
   const p = projectedStatePlan();
@@ -587,10 +649,13 @@ export function perTokenBytes(): { gpuB: number; ramB: number } | null {
   // slower speed than the placement actually shown would reach. Same bug the
   // speed.ts fix addresses — plan and speed must describe one placement.
   return bytesPerToken(m, p, projectedSettings(), p.ctx);
+});
+export function perTokenBytes(): { gpuB: number; ramB: number } | null {
+  return perTokenBytesC.value;
 }
 
 /** Tokens per second these settings should reach, and whether it is measured. */
-export function projectedSpeed(): { tps: number; measured: boolean } | null {
+const projectedSpeedC = computed(() => {
   const b = perTokenBytes();
   if (!b) return null;
   // "Measured" only when the pools carrying this projection's time are the
@@ -606,23 +671,95 @@ export function projectedSpeed(): { tps: number; measured: boolean } | null {
     }),
     measured,
   };
+});
+export function projectedSpeed(): { tps: number; measured: boolean } | null {
+  return projectedSpeedC.value;
 }
 
 /**
- * What this machine actually achieved on the last reply, if that reply can teach
- * us anything about bandwidth.
+ * What this machine actually achieved, if the observation can teach us anything
+ * about bandwidth.
  *
  * Only meaningful while the server that produced it is still up — the bytes have
  * to be the ones that were running, not whatever the form now holds.
+ *
+ * The BENCH wins over the chat whenever there is one. Both are real rates, but
+ * a chat reply is a rate about an unknown prompt at an unknown fill with an
+ * unknown amount of thinking in it, and a bench is the same measurement with
+ * every one of those held still (`src/lib/bench.ts`). Preferring the noisier
+ * number because it arrived later would throw away the only reason to run a
+ * bench at all.
  */
 export function speedCalFromLastReply(): { gpuBps?: number; ramBps?: number } {
-  if (!memoryIsLive() || chat.lastTps <= 0) return {};
+  if (!memoryIsLive()) return {};
   const m = shownModel()?.meta;
   const run = srv.runSettings;
   if (!m || !run) return {};
+  const b = srv.lastBench;
+  const useBench = benchApplies(b, srv.runModel, Number(run.ctxSize ?? 0)) &&
+    benchIsSound(b, m);
+  const tps = useBench ? b.genTps : chat.lastTps;
+  if (tps <= 0) return {};
+  const p = currentStatePlan();
+  // The context ACTUALLY filled, not the configured maximum. A bench runs at a
+  // near-empty cache, so billing it for a 262,144-token cache it never read
+  // would attribute those phantom bytes to the machine and calibrate a
+  // bandwidth several times too high.
+  const filled = useBench ? Math.max(1, b.promptTokens + b.genTokens) : p.ctx;
+  const bytes = bytesPerToken(m, p, run, filled);
+  return calibrate(tps, bytes);
+}
+
+/** The last speed measurement, when it describes the run on screen. */
+export function benchNow(): BenchResult | null {
+  const run = srv.runSettings;
+  if (!run) return null;
+  const b = srv.lastBench;
+  return benchApplies(b, srv.runModel, Number(run.ctxSize ?? 0)) ? b : null;
+}
+
+/**
+ * What to say about this machine's memory bandwidth, or null for nothing.
+ *
+ * Only when the running placement actually reads host RAM per token — on a
+ * VRAM-only run the figure is true and irrelevant, and the commonest cause of
+ * a low one (a BIOS memory profile left off) would be advice about nothing.
+ */
+export function bandwidthNow(): BandwidthNote | null {
+  if (!memoryIsLive()) return null;
+  const m = shownModel()?.meta;
+  const run = srv.runSettings;
+  if (!m || !run) return null;
   const p = currentStatePlan();
   const b = bytesPerToken(m, p, run, p.ctx);
-  return calibrate(chat.lastTps, b);
+  // "Reads host RAM" means enough of it to matter: a rounding-error share is
+  // not what makes a model slow, and warning about it would be noise.
+  const readsHostRam = b.totalB > 0 && b.ramB / b.totalB > 0.05;
+  return bandwidthNote(cfg.ramBps, readsHostRam);
+}
+
+/**
+ * Every quantisation of this model worth comparing, as it would run here.
+ *
+ * Memoised with the rest of the planner chain because it is the most expensive
+ * thing in the app: one `tune` per placement per candidate, so up to eighteen
+ * on a model with six offers. It is only ever read by a panel the user opened.
+ */
+const quantRowsC = computed((): QuantOption[] => {
+  const m = currentModel()?.meta;
+  if (!m) return [];
+  return quantOptions(m, planningHw(), cfg.settings, {
+    gpuBps: cfg.gpuBps,
+    ramBps: cfg.ramBps,
+  });
+});
+export function quantRows(): QuantOption[] {
+  return quantRowsC.value;
+}
+
+/** The one line worth showing about a smaller quantisation, or "". */
+export function quantAdviceNow(): string {
+  return quantAdvice(quantRows());
 }
 
 /**
@@ -661,10 +798,11 @@ export function serverRunning(): boolean {
  * something it cannot deliver for another thirty seconds.
  *
  * `submitKind` (pure, `src/lib/queue.ts`) decides; this only names the answer,
- * so both surfaces and the tests agree on when the button is live.
+ * so both surfaces and the tests agree on when the button is live. `draft` is
+ * the text in the box — browser-local, so it is an argument, not a cell read.
  */
-export function submitLabel(): string {
-  switch (submitKind(chat.input, chat.queue.length, chat.streaming)) {
+export function submitLabel(draft: string): string {
+  switch (submitKind(draft, chat.queue.length, chat.streaming)) {
     case "queue":
       return "Queue";
     case "send":

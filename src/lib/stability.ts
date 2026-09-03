@@ -9,7 +9,7 @@
 // from and cannot disagree with them.
 
 import { plan } from "./plan.ts";
-import { bool, num } from "./params.ts";
+import { bool, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
 
 export type Severity = "risk" | "caution";
@@ -165,6 +165,19 @@ export function stability(
     }
   }
 
+  // A draft model is a second set of weights in VRAM and the memory plan does
+  // not know about it: `plan.ts` sizes the model at `-m`, and nothing reads
+  // `-md`. Left unsaid, the bars would show room that the run is about to
+  // spend, which is the one thing this app's memory picture must never do.
+  if (str(s, "draftModel")) {
+    warnings.push({
+      severity: "caution",
+      key: "draftModel",
+      message:
+        "A draft model loads its own weights into VRAM, and the memory plan below does not count them — leave headroom for the size of that file, or the run fails to allocate.",
+    });
+  }
+
   if (num(s, "ubatchSize") > num(s, "batchSize")) {
     warnings.push({
       severity: "risk",
@@ -188,12 +201,24 @@ export function stability(
   }
 
   const host = String(s.host ?? "");
-  if ((host === "0.0.0.0" || host === "::") && !String(s.apiKey ?? "")) {
+  const open = (host === "0.0.0.0" || host === "::") && !String(s.apiKey ?? "");
+  if (open) {
     warnings.push({
       severity: "risk",
       key: "host",
       message:
         "Bound to every interface with no API key: anyone on the network can use this model, and read every prompt.",
+    });
+  }
+  // /slots is on by default upstream and shows every prompt in flight — on a
+  // private bind that is a debugging aid, on an open one it is a second copy
+  // of the risk above with its own switch.
+  if (open && s.slots !== false) {
+    warnings.push({
+      severity: "caution",
+      key: "slots",
+      message:
+        "The /slots endpoint is on, and it shows every prompt in flight to anyone who can reach the server. Turn Expose slots off, or set an API key.",
     });
   }
 

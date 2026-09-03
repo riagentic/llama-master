@@ -16,15 +16,31 @@
 // The queue sits ABOVE the input rather than inside the log: nothing in it has
 // been said to the server yet, and drawing it among the messages would claim
 // otherwise.
+//
+// The text being typed lives HERE, in a browser-local signal, never on the
+// wire. As a cell field (one dispatch per keystroke) the box was a controlled
+// input over a replicated value: every key was a round trip, and each `partial`
+// flush of a streaming reply re-rendered it with the copy the server had last
+// acknowledged, wiping keys still in flight. A draft is per-window state no
+// other client or restart needs.
 
+import { signal } from "aio/air";
 import { chat } from "../cell/chat.ts";
-import { queueLabel, queueNote, submitKind } from "../shared/queue.ts";
+import {
+  draftRows,
+  queueLabel,
+  queueNote,
+  submitKind,
+} from "../shared/queue.ts";
+
+/** The draft, per window. */
+const draft = signal("");
 
 /** What the submit button says — "" when there is nothing it can do. The word
  *  has to change, because the two gestures have different consequences: Send
  *  starts a request, Queue writes a note for later. */
-function submitLabel(): string {
-  switch (submitKind(chat.input, chat.queue.length, chat.streaming)) {
+function submitLabel(text: string): string {
+  switch (submitKind(text, chat.queue.length, chat.streaming)) {
     case "queue":
       return "Queue";
     case "send":
@@ -39,8 +55,23 @@ function submitLabel(): string {
 
 export function Composer(props: { url: string; ready: boolean }) {
   const { url, ready } = props;
-  const label = submitLabel();
+  const text = draft.value;
+  const label = submitLabel(text);
   const queue = chat.queue.slice(); // `.slice()` — a live async state array
+
+  /** Enter and the button share this. The box is cleared before the dispatch
+   *  resolves — `submit` runs the whole reply when it is the request — and put
+   *  back only if the far end refused the text (a full queue, which the note
+   *  above names). */
+  const submit = () => {
+    if (!ready) return;
+    const t = draft.peek();
+    if (submitKind(t, chat.queue.length, chat.streaming) === null) return;
+    draft.set("");
+    void chat.submit(url, t).then((taken) => {
+      if (!taken && draft.peek() === "") draft.set(t);
+    });
+  };
 
   return (
     <>
@@ -86,27 +117,36 @@ export function Composer(props: { url: string; ready: boolean }) {
         class="chat-input"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!ready) return;
-          void chat.submit(url);
+          submit();
         }}
       >
-        <input
+        <textarea
           t="message"
           // NOT disabled while streaming — that is the whole feature. The only
           // thing that closes this box is a far end that cannot take the
           // message at all.
+          // A textarea: what gets pasted into a chat with a model that writes
+          // code is code. Enter sends, Shift+Enter breaks a line.
           placeholder={ready
             ? (chat.streaming
               ? "Message — waits until this reply finishes"
-              : "Message")
+              : "Message  (Shift+Enter for a new line)")
             : props.url
             ? "The server is not ready to answer yet"
             : "Not connected"}
           aria-label="Message"
           disabled={!ready}
-          value={chat.input}
+          rows={draftRows(text)}
+          value={text}
           onInput={(e) =>
-            chat.setInput((e.currentTarget as HTMLInputElement).value)}
+            draft.set((e.currentTarget as HTMLTextAreaElement).value)}
+          onKeyDown={(e) => {
+            const k = e as KeyboardEvent;
+            // An IME confirming a character with Enter is not a send.
+            if (k.key !== "Enter" || k.shiftKey || k.isComposing) return;
+            k.preventDefault();
+            submit();
+          }}
         />
         <button
           type="submit"

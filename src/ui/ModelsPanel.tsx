@@ -6,6 +6,7 @@
 // name is only a rumour about them.
 
 import { models } from "../cell/models.ts";
+import { QuantAdvice } from "./QuantAdvice.tsx";
 import { cfg } from "../cell/cfg.ts";
 import { plan as computePlan } from "../lib/plan.ts";
 import { bytes, shortPath, stamp } from "../lib/format.ts";
@@ -261,6 +262,7 @@ export function ModelsPanel() {
             )}
         </Panel>
         <Details />
+        <QuantAdvice />
         <Dirs />
       </div>
     </div>

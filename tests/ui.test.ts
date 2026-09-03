@@ -30,6 +30,7 @@ Deno.env.set("LLAMA_MASTER_HOME", HOME);
 import App from "../src/App.tsx";
 import { OnePage } from "../src/ui/OnePage.tsx";
 import { TunePanel } from "../src/ui/TunePanel.tsx";
+import { BuildPanel } from "../src/ui/BuildPanel.tsx";
 import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
 import { ChatPanel } from "../src/ui/ChatPanel.tsx";
@@ -1238,12 +1239,8 @@ testUI(
       // precondition rather than on `settle()` removes the ordering dependency.
       await chat.stop();
       await chat.clear();
-      await chat.setInput("hi");
-      await ui_.waitFor(
-        () => chat.input === "hi" && !chat.streaming,
-        "chat is idle with the message typed",
-      );
-      await chat.send(url);
+      await ui_.waitFor(() => !chat.streaming, "chat is idle");
+      await chat.send(url, "hi");
       await ui_.settle();
 
       assertEquals(chat.streaming, false);
@@ -1490,12 +1487,8 @@ testUI(
     try {
       await chat.stop();
       await chat.clear();
-      await chat.setInput("hi");
-      await ui_.waitFor(
-        () => chat.input === "hi" && !chat.streaming,
-        "chat is idle with the message typed",
-      );
-      await chat.send(`http://127.0.0.1:${port}`);
+      await ui_.waitFor(() => !chat.streaming, "chat is idle");
+      await chat.send(`http://127.0.0.1:${port}`, "hi");
       await ui_.waitFor(
         () => ui_.html().includes("a stale answer"),
         "the reply is on the page",
@@ -1547,12 +1540,8 @@ testUI(
     try {
       await chat.stop();
       await chat.clear();
-      await chat.setInput("fix it");
-      await ui_.waitFor(
-        () => chat.input === "fix it" && !chat.streaming,
-        "chat is idle with the message typed",
-      );
-      await chat.send(`http://127.0.0.1:${port}`);
+      await ui_.waitFor(() => !chat.streaming, "chat is idle");
+      await chat.send(`http://127.0.0.1:${port}`, "fix it");
       await ui_.waitFor(
         () => ui_.html().includes("const a = 1;"),
         "the reply renders",
@@ -1902,8 +1891,7 @@ testUI(
     );
     try {
       await chat.clear();
-      await chat.setInput("hi");
-      const sending = chat.send(`http://127.0.0.1:${port}`);
+      const sending = chat.send(`http://127.0.0.1:${port}`, "hi");
       await ui_.waitFor(
         () => chat.streaming && ui_.html().includes("chat-wait"),
         "the waiting indicator is on screen while nothing has arrived",
@@ -2467,7 +2455,9 @@ testUI(
         );
         assertExists(page["one-reserve-ram"], "and RAM with them");
         await page["one-reserve-connected"].setValue("4");
+        await page["one-reserve-connected"].blur();
         await page["one-reserve-ram"].setValue("16");
+        await page["one-reserve-ram"].blur();
         await ui_.expectCell(
           cfg,
           (s) =>
@@ -2494,6 +2484,7 @@ testUI(
         assertEquals(held.devices.cards[1]?.reservedB, 0);
         // The per-GPU figure is the other claim, and it IS charged to both.
         await page["one-reserve-gpu"].setValue("2");
+        await page["one-reserve-gpu"].blur();
         await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 2 * GiB);
         await ui_.settle();
         const both = projectedStatePlan();
@@ -2502,6 +2493,7 @@ testUI(
         assertEquals(both.devices.cards[1]?.reservedB, 2 * GiB, "2 there");
         assertEquals(both.vram.reservedB, 8 * GiB, "8 GB of machine in total");
         await page["one-reserve-gpu"].setValue("0");
+        await page["one-reserve-gpu"].blur();
         await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 0);
         await ui_.settle();
         // The machine itself has not changed size, and the page still says so.
@@ -2565,6 +2557,7 @@ testUI(
         // has to name its own price, in the tuner's units.
         // Reserved to the point where it bites: 23 GB of each 24 GB card.
         await page["one-reserve-gpu"].setValue("23");
+        await page["one-reserve-gpu"].blur();
         await ui_.expectCell(cfg, (s) => s.reservePerGpuVramB === 23 * GiB);
         await ui_.settle();
         const cost = reserveCost();
@@ -2584,8 +2577,11 @@ testUI(
         // And it says nothing at all when it costs nothing, which is the
         // common case: a line that always appears is a line nobody reads.
         await page["one-reserve-gpu"].setValue("0");
+        await page["one-reserve-gpu"].blur();
         await page["one-reserve-connected"].setValue("0");
+        await page["one-reserve-connected"].blur();
         await page["one-reserve-ram"].setValue("0");
+        await page["one-reserve-ram"].blur();
         await ui_.expectCell(
           cfg,
           (s) =>
@@ -2631,6 +2627,7 @@ testUI(
     // swallowed: every placement is about to report that it does not fit, and a
     // refusal with no visible cause is the worst message this app can produce.
     await panel["tune-reserve-connected"].setValue("999");
+    await panel["tune-reserve-connected"].blur();
     await ui_.expectCell(
       cfg,
       (s) => s.reserveConnectedVramB === 999 * 1024 ** 3,
@@ -3171,22 +3168,47 @@ testUI(
 
       await chat.stop();
       await chat.clear();
-      await chat.setInput("first");
-      chat.submit(slowUrl); // streams, and stays streaming
+      chat.submit(slowUrl, "first"); // streams, and stays streaming
       await ui_.waitFor(() => chat.streaming, "the first reply is live");
 
-      await chat.setInput("second, while it is busy");
-      await chat.submit(slowUrl);
+      // Typed into the box itself — the draft is browser-local now, and the
+      // gesture under test is the user's, not a cell write.
+      ui_["chat-message"].setValue("second, while it is busy");
+      assertEquals(
+        ui_["chat-submit"].text,
+        "Queue",
+        "the button says what Enter will do, from the text in the box",
+      );
+      await chat.submit(slowUrl, "second, while it is busy");
       // NOT `settle()`: the first submit is deliberately still in flight — a
       // held-open stream IS the state under test — and settle demands
       // quiescence, so it would give up here every time. Wait on the state.
       await ui_.waitFor(
-        () => chat.queue.length === 1 && chat.input === "",
+        () => chat.queue.length === 1,
         "the second message is held while the first still streams",
       );
 
       assertEquals(chat.queue.length, 1, "held rather than sent");
-      assertEquals(chat.input, "", "and the box is ready for the next thought");
+
+      // THE bug this pins: text typed while a reply streams must survive the
+      // next chat-cell re-render. The draft was a cell field once, and every
+      // `partial` flush re-rendered the box with the server's stale copy —
+      // keys still in flight were wiped, only while the model was answering.
+      ui_["chat-message"].setValue("typed while it streams");
+      await chat.clearQueue(); // a chat-cell write → the composer re-renders
+      await ui_.waitFor(() => chat.queue.length === 0, "the queue was cleared");
+      assertEquals(
+        ui_["chat-message"].value,
+        "typed while it streams",
+        "a chat-cell write must not touch what is being typed",
+      );
+      assert(
+        !("input" in chat),
+        "the draft is not a cell field — a keystroke never crosses the wire",
+      );
+      ui_["chat-message"].setValue("");
+      await chat.submit(slowUrl, "second, while it is busy");
+      await ui_.waitFor(() => chat.queue.length === 1, "queued again");
 
       const html = ui_.html();
       assertStringIncludes(
@@ -3222,5 +3244,136 @@ testUI(
       await srv.stop();
       await removeStubBuild();
     }
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "the Tune page compares quantisations, and marks which one is the file you have",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The largest speed lever the app has, and the one it used to be silent
+    // about: a model that FITS was never told a smaller file would be faster.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m, "the fixture model must parse");
+      models.select(m.path);
+      await ui_.settle();
+
+      const table = ui_.find("quant-table");
+      assertExists(table, "the comparison is on the page");
+      const html = ui_.html();
+      // The file you have is a row, marked as such — the table is sorted by
+      // size, so it can be anywhere in it.
+      assertStringIncludes(html, m.meta!.quant, "the current quant is named");
+      assertStringIncludes(html, "have", "and marked as the one on disk");
+      // Bits per weight is a FACT about this file, read off its tensor table
+      // rather than looked up from its label.
+      assertStringIncludes(html, "bits/weight");
+      // Smaller quants are offered against it.
+      assertStringIncludes(html, "Q4_K_M");
+      // And the honesty is on screen, not in a comment: one row is measured,
+      // the rest are estimates of files that are not here.
+      assert(
+        /measured from\s+this file|measured from this file/.test(html),
+        "the table says which half is measured",
+      );
+    });
+  },
+);
+
+testUI(
+  ServerPanel as never,
+  "the Server page offers a speed measurement, and says it has none until it runs",
+  async (ui_) => {
+    // Every speed the app shows divides bytes by a bandwidth it cannot read off
+    // the machine. The button is how that stops being an assumption.
+    await ui_.settle();
+    const btn = ui_["speed-run"];
+    assertExists(btn, "the measure button is on the page");
+    assertEquals(
+      btn.disabled,
+      true,
+      "and it is closed while nothing is running — there is nothing to measure",
+    );
+    const html = ui_.html();
+    assertStringIncludes(html, "not measured");
+    assertStringIncludes(
+      html,
+      "estimate",
+      "and the page says what the other numbers are until then",
+    );
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "thinking is a visible control, not an advanced server flag",
+  async (ui_) => {
+    // `--reasoning off` is the strongest speed control in the app for a
+    // reasoning model — most of its tokens are the thinking — and it shipped
+    // filed next to Prometheus metrics, where nobody would find it.
+    await ui_.settle();
+    const sw = ui_.find("tune-think");
+    assertExists(sw, "the switch is beside the other run switches");
+    const html = ui_.html();
+    assertStringIncludes(html, "Thinking");
+    // Three states, because `auto` is the honest default: the model's own
+    // template decides, and forcing `on` for a model without a reasoning mode
+    // is a request llama.cpp cannot honour.
+    for (const label of ["Auto", "On", "Off"]) {
+      assertStringIncludes(html, label);
+    }
+    assertEquals(cfg.settings.reasoning ?? "auto", "auto");
+  },
+);
+
+testUI(
+  BuildPanel as never,
+  "the Build page can build a pull request on top of master",
+  async (ui_) => {
+    // The interesting models arrive as pull requests months before they merge.
+    // Until now the only way to run one was to drop its tarball into the source
+    // cache by hand, which works once and then rots under a name that no longer
+    // describes it.
+    await ui_.settle();
+    const box = ui_["pr-number"];
+    assertExists(box, "a pull request can be named");
+    const use = ui_["pr-use"];
+    assertExists(use);
+    assertEquals(use.disabled, true, "nothing typed, nothing to do");
+
+    // A pasted URL is the commonest input, because people arrive from a browser.
+    box.setValue("https://github.com/ggml-org/llama.cpp/pull/27754");
+    await ui_.settle();
+    assertEquals(ui_["pr-use"].disabled, false, "the number was understood");
+    ui_["pr-use"].click();
+    await ui_.expectCell(builds, (s) => s.ref === "pr/27754");
+
+    // Only source can build one — nobody publishes binaries for unmerged code —
+    // so the route follows rather than leaving the user on one about to refuse.
+    assertEquals(builds.origin, "source");
+
+    const html = ui_.html();
+    assertStringIncludes(html, "27754");
+    assertStringIncludes(html, "merged into it", "it says what it will build");
+    // And that the result is dated, because master moves under it.
+    assertStringIncludes(html, "dated");
+    assertStringIncludes(
+      html,
+      "nothing you already have is lost",
+      "existing builds are kept — the whole worry this answers",
+    );
+
+    // The escape hatch for a pull request that has stopped merging.
+    assertExists(ui_["pr-head"], "the author's branch alone is offered");
+    ui_["pr-head"].click();
+    await ui_.expectCell(builds, (s) => s.ref === "pr/27754@head");
+    assertStringIncludes(ui_.html(), "on its own");
+
+    await builds.setRef("master");
   },
 );

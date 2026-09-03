@@ -15,17 +15,48 @@
 // The queue is ABOVE the input rather than below the log, because it is not
 // part of the conversation — nothing in it has been said to the model yet, and
 // drawing it among the messages would claim otherwise.
+//
+// The text being typed lives HERE, in a browser-local signal, and nowhere on
+// the wire. It was a cell field once (`chat.input`, one `setInput` dispatch per
+// keystroke), which made the box a controlled input over a replicated server
+// value: every key was a round trip, and while a reply streamed the 60–500 ms
+// `partial` flushes re-rendered the box with whatever the server had last
+// acknowledged — keys still in flight were wiped, and only while the model was
+// answering. A draft is per-window state that no other client and no restart
+// needs (dep/aio/docs/state/real-time.md: "if two clients or a restart never
+// need to agree on it, it does not belong in a server cell").
 
+import { signal } from "aio/air";
 import { chat } from "../cell/chat.ts";
-import { queueLabel } from "../lib/queue.ts";
+import { draftRows, queueLabel, submitKind } from "../lib/queue.ts";
 import { submitChat } from "./actions.ts";
 import { chatQueue, chatQueueNote, submitLabel } from "./derive.ts";
 
+/** The draft, per window. Module-level rather than `useLocal` so it survives a
+ *  switch between the two surfaces that mount this — both are the same
+ *  conversation, so the half-typed thought must follow. */
+const draft = signal("");
+
 export function ChatComposer(props: { url: string; ready: boolean }) {
   const { url, ready } = props;
+  const text = draft.value;
   const queue = chatQueue();
   const note = chatQueueNote();
-  const label = submitLabel();
+  const label = submitLabel(text);
+
+  /** Enter and the button do the same thing, so they share it. The box is
+   *  cleared BEFORE the dispatch resolves — `submit` runs the whole reply when
+   *  it is the request — and put back only if the server refused the text,
+   *  which it does for one reason (a full queue) that the note above names. */
+  const submit = () => {
+    if (!ready) return;
+    const t = draft.peek();
+    if (submitKind(t, chat.queue.length, chat.streaming) === null) return;
+    draft.set("");
+    void submitChat(url, t).then((taken) => {
+      if (!taken && draft.peek() === "") draft.set(t);
+    });
+  };
 
   return (
     <>
@@ -69,24 +100,38 @@ export function ChatComposer(props: { url: string; ready: boolean }) {
         class="chat-input"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!ready) return;
-          submitChat(url);
+          submit();
         }}
       >
-        <input
+        <textarea
+          t="chat-message"
           // NOT disabled while streaming — that is the whole feature. The only
           // thing that closes this box is a server that cannot take the message
           // at all.
+          //
+          // A textarea, not an <input>: what gets pasted into a chat with a
+          // model that writes code is code, and a one-line box turned every
+          // pasted file into one line. Enter sends, Shift+Enter breaks a line —
+          // the convention every chat client has taught.
           placeholder={ready
             ? (chat.streaming
               ? "Message — waits until this reply finishes"
-              : "Message")
+              : "Message  (Shift+Enter for a new line)")
             : "Server is not running"}
           aria-label="Message"
           disabled={!ready}
-          value={chat.input}
+          rows={draftRows(text)}
+          value={text}
           onInput={(e) =>
-            chat.setInput((e.currentTarget as HTMLInputElement).value)}
+            draft.set((e.currentTarget as HTMLTextAreaElement).value)}
+          onKeyDown={(e) => {
+            const k = e as KeyboardEvent;
+            // `isComposing`: an IME confirming a character with Enter is not a
+            // send, and treating it as one submits half a word.
+            if (k.key !== "Enter" || k.shiftKey || k.isComposing) return;
+            k.preventDefault();
+            submit();
+          }}
         />
         <button
           type="submit"

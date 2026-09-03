@@ -17,6 +17,7 @@
 // Pure data: no I/O, so it is safe to import anywhere.
 
 import type { Build, Cpu, Disk, Gpu, Mem, ModelMeta } from "./types.ts";
+import { typicalBpw } from "./quant.ts";
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
@@ -98,6 +99,7 @@ function meta(over: Partial<ModelMeta>): ModelMeta {
     ropeFreqBase: 500000,
     nTensors: 291,
     tensorBytes: 0,
+    params: 0,
     embdBytes: 0,
     outputBytes: 0,
     unknownTypes: 0,
@@ -127,13 +129,26 @@ export function demoModels(): {
     file: string,
     sizeB: number,
     m: Partial<ModelMeta>,
-  ) => ({
-    path: `/models/${file}`,
-    file,
-    sizeB,
-    source: "file" as const,
-    meta: meta({ ...m, name: file.replace(/-[^-]*\.gguf$/, "") }),
-  });
+  ) => {
+    const built = meta({ ...m, name: file.replace(/-[^-]*\.gguf$/, "") });
+    // The demo's weights and its weight COUNT have to agree, or the quant
+    // comparison (`src/lib/quant.ts`, which divides one by the other to get
+    // this file's real bits per weight) reads a fictional model as a corrupt
+    // one. Derived from the label rather than typed in, so the two can never
+    // drift apart.
+    const bpw = typicalBpw(built.quant) || 4.85;
+    return {
+      path: `/models/${file}`,
+      file,
+      sizeB,
+      source: "file" as const,
+      meta: {
+        ...built,
+        tensorBytes: built.tensorBytes || sizeB,
+        params: built.params || Math.round((sizeB * 8) / bpw),
+      },
+    };
+  };
 
   return [
     mk("example-8b-instruct-Q4_K_M.gguf", 4.9 * GB, {

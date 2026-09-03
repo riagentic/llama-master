@@ -447,6 +447,57 @@ export function CopyButton(props: {
   );
 }
 
+/**
+ * A text or number box that is the user's while they type.
+ *
+ * Bound straight to a cell (`onInput → cell.set`), a box is a controlled input
+ * over a REPLICATED value: every keystroke is a dispatch, every dispatch
+ * re-renders whatever reads that cell — on the all-in-one page that was the
+ * whole memory planner — and any re-render from elsewhere (a 1 s poll, a
+ * streamed token) writes the cell's last-acknowledged value back over keys
+ * still in flight. The chat box shipped exactly that bug. So the draft lives
+ * here until the box is left — `change`: blur, Enter, a spinner click — and
+ * the cell sees ONE write, with the finished value.
+ */
+export function DraftInput(props: {
+  type: "text" | "number";
+  value: string;
+  onCommit: (value: string) => void;
+  ariaLabel: string;
+  class?: string;
+  placeholder?: string;
+  min?: number | string;
+  max?: number | string;
+  step?: number | string;
+  disabled?: boolean;
+  title?: string;
+  t?: string;
+}) {
+  // null = not editing: show the cell's value. A string = the user's, verbatim.
+  const [draft, setDraft] = useLocal<string | null>(null);
+  return (
+    <input
+      type={props.type}
+      class={props.class}
+      aria-label={props.ariaLabel}
+      placeholder={props.placeholder}
+      min={props.min}
+      max={props.max}
+      step={props.step}
+      disabled={props.disabled}
+      title={props.title}
+      t={props.t}
+      value={draft ?? props.value}
+      onInput={(e) => setDraft((e.currentTarget as HTMLInputElement).value)}
+      onChange={(e) => {
+        const v = (e.currentTarget as HTMLInputElement).value;
+        setDraft(null);
+        if (v !== props.value) props.onCommit(v);
+      }}
+    />
+  );
+}
+
 export function LogView(props: { lines: string[]; t?: string; rows?: number }) {
   // Newest at the bottom, and the app's diagnoses all end with "the log below" —
   // so a new line must not land out of sight.

@@ -359,6 +359,7 @@ export const NO_MODEL: ModelMeta = {
   ropeFreqBase: 0,
   nTensors: 0,
   tensorBytes: 0,
+  params: 0,
   embdBytes: 0,
   outputBytes: 0,
   unknownTypes: 0,

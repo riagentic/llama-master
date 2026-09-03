@@ -8,7 +8,15 @@ import { chat } from "../cell/chat.ts";
 import { srv } from "../cell/srv.ts";
 import { tps } from "../lib/format.ts";
 import { endpoint } from "./actions.ts";
-import { CopyButton, Empty, ErrorNote, Panel, Pill, Waiting } from "./kit.tsx";
+import {
+  CopyButton,
+  DraftInput,
+  Empty,
+  ErrorNote,
+  Panel,
+  Pill,
+  Waiting,
+} from "./kit.tsx";
 import { ChatMessage } from "./ChatMessage.tsx";
 import { ChatComposer } from "./ChatComposer.tsx";
 import { chatHasContent, chatTranscript } from "./derive.ts";
@@ -52,13 +60,19 @@ export function ChatPanel() {
         }
       >
         <ErrorNote message={chat.lastError} />
-        <input
+        {
+          /* Committed when the box is left, not per keystroke: bound to the
+             cell directly, every `partial` flush of a streaming reply re-rendered
+             this with the server's copy and wiped keys still in flight — the
+             same bug the message box had. */
+        }
+        <DraftInput
+          type="text"
           class="system"
           placeholder="System prompt (optional)"
-          aria-label="System prompt"
+          ariaLabel="System prompt"
           value={chat.system}
-          onInput={(e) =>
-            chat.setSystem((e.currentTarget as HTMLInputElement).value)}
+          onCommit={(v) => chat.setSystem(v)}
         />
         <div class="chat-log" t="chat-log" ref={log}>
           {chat.messages.length === 0 && !chat.partial && !chat.streaming

@@ -139,12 +139,27 @@ export const cfg = cell("cfg", {
    * on the display card) take over — a visible control, on two pages, that says
    * what it is holding.
    */
-  version: 2,
+  version: 3,
   onMigrate(state: CfgState, from: number): CfgState {
     // Cast to delete a key that is no longer IN the type — which is the whole
     // point of a migration, and the only place in this app allowed to say it.
     if (from < 2) {
       delete (state as unknown as Record<string, unknown>).reserveVramB;
+    }
+    if (from < 3) {
+      // Two catalog entries left: `noContextShift` (replaced by `contextShift`,
+      // whose default runs the same server the old default did) and
+      // `defragThold` (deprecated upstream — the value is ignored and the flag
+      // only prints a warning). Not carried forward: a stored value for a flag
+      // that no longer exists would sit in the map forever and never be shown.
+      for (const key of ["noContextShift", "defragThold"]) {
+        delete state.settings?.[key];
+      }
+      if (Array.isArray(state.touched)) {
+        state.touched = state.touched.filter((k) =>
+          k !== "noContextShift" && k !== "defragThold"
+        );
+      }
     }
     return state;
   },

@@ -7,7 +7,10 @@
 
 import {
   assert,
+  assertAlmostEquals,
   assertEquals,
+  assertExists,
+  assertNotEquals,
   assertRejects,
   assertStringIncludes,
   assertThrows,
@@ -15,6 +18,7 @@ import {
 
 import {
   advances,
+  draftRows,
   QUEUE_MAX,
   queueAdd,
   queueLabel,
@@ -168,8 +172,11 @@ import {
 } from "../src/lib/serverlog.ts";
 import {
   cudaCmakeFlags,
+  cudaOffer,
   cudaPlan,
+  cudaUpgradeFor,
   cudaVersionForCap,
+  driverCudaVersion,
   maxArchFor,
   parseCudaVersion,
 } from "../src/lib/cuda.ts";
@@ -222,8 +229,46 @@ import {
   transcript,
 } from "../src/lib/richtext.ts";
 import { gpu, hw, layers, meta, moeMeta, NO_GPU } from "./fixtures.ts";
+import {
+  fileBpw,
+  qualityNote,
+  quantAdvice,
+  quantOptions,
+  rescale,
+} from "../src/lib/quant.ts";
+import {
+  bandwidthNote,
+  BENCH_TOKENS,
+  benchApplies,
+  benchRequest,
+  EMPTY_BENCH,
+  parseBench,
+} from "../src/lib/bench.ts";
+import {
+  formatRef,
+  parsePrInput,
+  parsePrList,
+  parseRef,
+  prStateNote,
+  refDirName,
+  refForPrs,
+  refMoves,
+  refNeedsGit,
+  refNotFound,
+  refProvenance,
+  refPrs,
+  tarballUrl,
+} from "../src/lib/srcref.ts";
+import {
+  CUDA_COMPONENTS,
+  cudaDiskNeededB,
+  cudaFiles,
+  cudaFilesUsable,
+  cudaFixSummary,
+} from "../src/lib/cudaredist.ts";
 
 const GB = 1024 ** 3;
+const MB = 1024 ** 2;
 
 // ── catalog ────────────────────────────────────────────────────────────────
 
@@ -328,6 +373,56 @@ Deno.test("command: a flag is omitted only when llama.cpp would agree", () => {
   for (const flag of ["-fa", "-ts", "--mlock", "--no-mmap", "-ctk", "-ctv"]) {
     assertEquals(cmd.includes(flag), false, `${flag} should be absent`);
   }
+});
+
+Deno.test("command: three switches that were inert now move the command", () => {
+  // Each of these was a boolean with `def: false` and no `offFlag` for a flag
+  // that is ON upstream — so "on" emitted a no-op and "off" emitted nothing,
+  // and the server ran the same either way while the panel claimed a choice.
+  // Verified against common.h: `use_jinja = true`, `endpoint_slots = true`,
+  // `ctx_shift = false`.
+  const line = (s: Record<string, string | number | boolean>) =>
+    argv("server", {
+      bin: "/b/llama-server",
+      model: "/m/x.gguf",
+      settings: { ...defaults(), ...s },
+    });
+  const base = line({});
+  for (const flag of ["--jinja", "--no-jinja", "--slots", "--no-slots"]) {
+    assertEquals(base.includes(flag), false, `${flag} at the default`);
+  }
+  assert(line({ jinja: false }).includes("--no-jinja"), "off is sayable");
+  assert(line({ slots: false }).includes("--no-slots"), "off is sayable");
+  assert(line({ contextShift: true }).includes("--context-shift"));
+  assertEquals(
+    line({ contextShift: false }).includes("--no-context-shift"),
+    false,
+    "the default is llama.cpp's own — nothing to say",
+  );
+  // Deprecated upstream (its value is ignored): gone from the catalog rather
+  // than emitted as a flag that only prints a warning.
+  assertEquals(param("defragThold"), undefined);
+  assertEquals(param("noContextShift"), undefined);
+  // `--cache-reuse`: off upstream, 256 in every upstream preset — emitted.
+  assertEquals(base[base.indexOf("--cache-reuse") + 1], "256");
+  // The read timeout is upstream's own again: 600 s was shorter than a big
+  // prompt takes to prefill, so the server cut the request off.
+  assertEquals(base.includes("-to"), false);
+  assertEquals(param("timeout")?.def, 3600);
+});
+
+Deno.test("stability: /slots on an open bind is named, with its own switch", () => {
+  const open = { ...defaults(), host: "0.0.0.0" };
+  const st = stability(meta(), hw(), open);
+  assert(st.warnings.some((w) => w.key === "slots"), "slots is on by default");
+  const closed = stability(meta(), hw(), { ...open, slots: false });
+  assertEquals(closed.warnings.some((w) => w.key === "slots"), false);
+  const local = stability(meta(), hw(), { ...defaults(), host: "127.0.0.1" });
+  assertEquals(
+    local.warnings.some((w) => w.key === "slots"),
+    false,
+    "private bind — a debugging aid, not a leak",
+  );
 });
 
 Deno.test("command: --fit off is always emitted, because upstream's fitter defaults on", () => {
@@ -2061,6 +2156,39 @@ Deno.test("fix: ROCm is only scripted where AMD documents those exact steps", ()
   }
   assertEquals(rocmPlan("linux", null).kind, "manual", "unknown distro");
   assertEquals(rocmPlan("darwin", null).kind, "manual");
+});
+
+Deno.test("fixplan: the ROCm group step names the user who pressed the button, under pkexec AND sudo", async () => {
+  // `${SUDO_USER:-$PKEXEC_UID_NAME:-$USER}` read like a fallback chain and was
+  // not one: bash parses the nested default as the literal word
+  // `$PKEXEC_UID_NAME:-$USER`, and pkexec sets no such variable (it sets
+  // PKEXEC_UID, a number). Under pkexec — the app's preferred path — the step
+  // ran `usermod -a -G render,video :-root`, and failed AFTER the driver and
+  // the repo were installed. So the expansion is checked by asking bash.
+  const plan = rocmPlan("linux", {
+    id: "ubuntu",
+    version: "24.04",
+    ubuntuCodename: "noble",
+  });
+  assert(plan.kind === "script");
+  const step = plan.steps.find((s) => s.sh.startsWith("usermod"));
+  assert(step, "the group step exists");
+  const me = new TextDecoder().decode(
+    (await new Deno.Command("id", { args: ["-un"] }).output()).stdout,
+  ).trim();
+  const uid = String(Deno.uid());
+  const run = async (env: Record<string, string>) =>
+    new TextDecoder().decode(
+      (await new Deno.Command("bash", {
+        args: ["-c", step.sh.replace(/^usermod/, "echo usermod")],
+        env,
+        clearEnv: true,
+      }).output()).stdout,
+    ).trim();
+  const want = `usermod -a -G render,video ${me}`;
+  assertEquals(await run({ PKEXEC_UID: uid, USER: "root" }), want, "pkexec");
+  assertEquals(await run({ SUDO_UID: uid, USER: "root" }), want, "sudo");
+  assertEquals(await run({ USER: "root" }), want, "neither: whoever runs it");
 });
 
 Deno.test("fix: elevation prefers the desktop's auth agent, and can refuse", () => {
@@ -5899,4 +6027,695 @@ Deno.test("queue: a chip label elides on a word and keeps the whole text elsewhe
   const shown = long.slice(0, -1);
   assert(source.startsWith(shown), shown);
   assertEquals(source[shown.length], " ", `cut mid-word: ${shown}`);
+});
+
+Deno.test("queue: the box grows with the lines typed and stops at a cap", () => {
+  assertEquals(draftRows(""), 1, "an empty box is one row");
+  assertEquals(draftRows("one line"), 1);
+  assertEquals(draftRows("a\nb\nc"), 3, "a pasted file grows the box");
+  assertEquals(draftRows("x\n".repeat(40)), 6, "past the cap it scrolls");
+  assertEquals(draftRows("x\n".repeat(40), 3), 3, "the cap is the caller's");
+});
+
+// ── quantisation and speed ─────────────────────────────────────────────────
+
+Deno.test("quant: this file's bits per weight is measured, not looked up", () => {
+  // The label is a MIX — a Q4_K_M is mostly Q4_K with some Q6_K — so two files
+  // wearing it are not the same size, and the whole comparison is a ratio
+  // against this number. `rust/src/gguf.rs` counts the weights off the tensor
+  // table so it can be exact.
+  const m = meta({ params: 8_000_000_000, layers: layers(32, 128 * MB) });
+  const got = fileBpw(m);
+  assertEquals(got.exact, true, "a counted file reports an exact figure");
+  assertAlmostEquals(got.bpw, (m.tensorBytes * 8) / 8_000_000_000, 1e-9);
+
+  // A model read by a build older than that field reports 0 weights, and the
+  // label is then the only thing there is. It says so rather than pretending.
+  const old = { ...m, params: 0 };
+  assertEquals(fileBpw(old), { bpw: 4.85, exact: false });
+
+  // A nonsense header must not scale the table. 100 bits per weight is not a
+  // quantisation, it is a truncated read.
+  const broken = { ...m, params: 1 };
+  assertEquals(fileBpw(broken).exact, false, "an absurd figure is refused");
+});
+
+Deno.test("quant: rescaling moves the weights and nothing else", () => {
+  const m = meta({ params: 8_000_000_000, layers: layers(32, 128 * MB) });
+  const from = fileBpw(m).bpw;
+  const half = rescale(m, from / 2);
+  assertAlmostEquals(half.tensorBytes / m.tensorBytes, 0.5, 1e-6);
+  assertAlmostEquals(
+    (half.layers[0]?.bytes ?? 0) / (m.layers[0]?.bytes ?? 1),
+    0.5,
+    1e-6,
+  );
+  assertAlmostEquals(half.embdBytes / m.embdBytes, 0.5, 1e-6);
+  // The geometry is the model, not the file: the KV cache, the context and the
+  // layer count are identical at every quantisation, and scaling them would
+  // make the comparison a comparison of two different models.
+  assertEquals(half.nLayer, m.nLayer);
+  assertEquals(half.nCtxTrain, m.nCtxTrain);
+  assertEquals(half.nHeadKv, m.nHeadKv);
+  assertEquals(half.keyLength, m.keyLength);
+});
+
+Deno.test("quant: a smaller file that stops spilling into RAM is worth more than its size", () => {
+  // The point of running the real tuner per candidate rather than a ratio. A
+  // model that does not fit reads most of its weights over the host bus at a
+  // tenth of the bandwidth; the quant that fits does not, and the step is
+  // worth far more than the bytes it saved.
+  const big = meta({
+    name: "Spiller",
+    nLayer: 32,
+    quant: "Q8_0",
+    layers: layers(32, 900 * MB),
+    embdBytes: 200 * MB,
+    outputBytes: 200 * MB,
+  });
+  const machine = hw({ gpus: [gpu(16)] });
+  const rows = quantOptions(big, machine, defaults());
+  const mine = rows.find((r) => r.current);
+  assertExists(mine, "the file you have is always a row");
+  assertEquals(mine.quant, "Q8_0");
+
+  const q4 = rows.find((r) => r.quant === "Q4_K_M");
+  assertExists(q4, "and a Q4 is offered against it");
+  assert(q4.bpw < mine.bpw, "which is smaller");
+  assert(
+    q4.tps > mine.tps,
+    `and faster: ${mine.tps.toFixed(1)} → ${q4.tps.toFixed(1)} tok/s`,
+  );
+  // The gain is more than the byte ratio precisely because the placement moved.
+  const byteRatio = mine.bpw / q4.bpw;
+  assert(
+    q4.speedup > byteRatio,
+    `placement, not just size: ${q4.speedup.toFixed(2)}× against a ${
+      byteRatio.toFixed(2)
+    }× byte ratio`,
+  );
+  assert(q4.layersInRam < mine.layersInRam, "fewer layers left on the host");
+});
+
+Deno.test("quant: nothing bigger than the file you already have is offered", () => {
+  // "Download a larger file and go slower" is not advice. A Q4 model offers
+  // only what is below it.
+  const m = meta({ quant: "Q4_K_M", layers: layers(32, 100 * MB) });
+  const rows = quantOptions(m, hw({ gpus: [gpu(24)] }), defaults());
+  const mine = rows.find((r) => r.current);
+  assertExists(mine);
+  for (const r of rows) {
+    assert(
+      r.current || r.bpw < mine.bpw,
+      `${r.quant} at ${r.bpw} is not smaller than ${mine.bpw}`,
+    );
+  }
+  // Sorted big to small, so the table reads in the direction the decision runs.
+  const bits = rows.map((r) => r.bpw);
+  assertEquals(bits.slice().sort((a, b) => b - a), bits);
+});
+
+Deno.test("quant: the advice line stays quiet unless the gain is worth acting on", () => {
+  // A line that appears for every model is a line nobody reads.
+  const tiny = meta({ quant: "Q4_K_M", layers: layers(32, 60 * MB) });
+  const roomy = hw({ gpus: [gpu(48)] });
+  const rows = quantOptions(tiny, roomy, defaults());
+  const advice = quantAdvice(rows);
+  // Everything fits either way here, so the only gain on offer is the byte
+  // ratio between Q4 and Q3 — under the threshold, so nothing is said.
+  assertEquals(advice, "", `expected silence, got: ${advice}`);
+
+  // And it speaks when the difference is real, naming the price in the same
+  // sentence as the gain — advice that names only the gain is half given.
+  const spiller = meta({
+    quant: "Q8_0",
+    layers: layers(32, 900 * MB),
+    embdBytes: 200 * MB,
+    outputBytes: 200 * MB,
+  });
+  const loud = quantAdvice(
+    quantOptions(spiller, hw({ gpus: [gpu(16)] }), defaults()),
+  );
+  assert(loud.length > 0, "a real gain is named");
+  assertStringIncludes(loud, "faster");
+  assert(
+    /quality|loss/i.test(loud),
+    `the price is in the same sentence: ${loud}`,
+  );
+});
+
+Deno.test("quant: the quality note follows the curve every perplexity table agrees on", () => {
+  // Flat from 8 bits to about 5, a bend through 4, a cliff below 3.
+  assertStringIncludes(qualityNote(8.5), "No practical");
+  assertStringIncludes(qualityNote(4.85), "small");
+  assert(/large/i.test(qualityNote(2.6)), "below 3 bits says so plainly");
+});
+
+// ── the bench ──────────────────────────────────────────────────────────────
+
+Deno.test("bench: a reply without timings is not a slow machine", () => {
+  // A build too old to report `timings` has measured NOTHING. Writing 0 tok/s
+  // would put "this machine is broken" on screen over a build's age.
+  const at = { latencyMs: 100, ctx: 4096, modelPath: "/m.gguf", at: 1 };
+  assertEquals(parseBench({}, at), null, "no timings block");
+  assertEquals(parseBench({ timings: {} }, at), null, "an empty one");
+  assertEquals(
+    parseBench({ timings: { predicted_n: 0, predicted_per_second: 0 } }, at),
+    null,
+    "a run that generated nothing",
+  );
+  assertEquals(parseBench(null, at), null);
+});
+
+Deno.test("bench: llama.cpp's own numbers come through, and ours are measured here", () => {
+  const r = parseBench({
+    timings: {
+      prompt_n: 42,
+      prompt_per_second: 364.5,
+      predicted_n: 128,
+      predicted_per_second: 13.1,
+    },
+  }, { latencyMs: 1234.6, ctx: 262144, modelPath: "/m.gguf", at: 99 });
+  assertExists(r);
+  assertEquals(r.promptTokens, 42);
+  assertEquals(r.promptTps, 364.5);
+  assertEquals(r.genTokens, 128);
+  assertEquals(r.genTps, 13.1);
+  // Rounded, because a sub-millisecond figure is precision the measurement
+  // does not have.
+  assertEquals(r.latencyMs, 1235);
+  assertEquals(r.ctx, 262144);
+  assertEquals(r.modelPath, "/m.gguf");
+});
+
+Deno.test("bench: a measurement belongs to one model at one context", () => {
+  const b = parseBench(
+    { timings: { predicted_n: 128, predicted_per_second: 13 } },
+    { latencyMs: 1, ctx: 4096, modelPath: "/a.gguf", at: 5 },
+  );
+  assertExists(b);
+  assertEquals(benchApplies(b, "/a.gguf", 4096), true);
+  assertEquals(benchApplies(b, "/b.gguf", 4096), false, "another model");
+  // The KV cache is read every token, so the same model at 4k and 256k are
+  // different measurements. Showing one as the other would be the app's own
+  // estimate dressed as a fact.
+  assertEquals(benchApplies(b, "/a.gguf", 262144), false, "another context");
+  assertEquals(benchApplies(EMPTY_BENCH, "/a.gguf", 4096), false, "never run");
+});
+
+Deno.test("bench: the request holds every variable still", () => {
+  const body = benchRequest();
+  // A cached prompt reports a prefill rate that is really a cache hit.
+  assertEquals(body.cache_prompt, false);
+  assertEquals(body.temperature, 0, "repeatable");
+  assertEquals(body.n_predict, BENCH_TOKENS);
+  // A reasoning model asked for 128 tokens can spend all of them thinking,
+  // which measures the right rate on the wrong work.
+  assertEquals(body.reasoning_budget, 0);
+  assertEquals(benchRequest(8).n_predict, 16, "too short to mean anything");
+});
+
+Deno.test("bench: the bandwidth note speaks only when host RAM is in the path", () => {
+  const GBs = 1024 ** 3;
+  // A VRAM-only run reads no host RAM per token: the figure is true and
+  // irrelevant, and advice about it would be advice about nothing.
+  assertEquals(bandwidthNote(20 * GBs, false), null);
+  assertEquals(bandwidthNote(0, true), null, "nothing measured yet");
+
+  const slow = bandwidthNote(18 * GBs, true);
+  assertExists(slow);
+  assertEquals(slow.tone, "caution");
+  // It names something the user can go and look at, rather than asserting what
+  // they will find — the DIMMs cannot be read without root.
+  assertStringIncludes(slow.message, "EXPO");
+
+  const fine = bandwidthNote(70 * GBs, true);
+  assertExists(fine);
+  assertEquals(fine.tone, "info");
+  assert(!/EXPO/.test(fine.message), "healthy memory gets no BIOS lecture");
+});
+
+Deno.test("stability: a draft model's VRAM is named, because the plan cannot see it", () => {
+  // `plan.ts` sizes the model at `-m`; nothing reads `-md`. Unsaid, the bars
+  // would show room the run is about to spend.
+  const withDraft = { ...defaults(), draftModel: "/models/draft-0.5b.gguf" };
+  const st = stability(meta(), hw(), withDraft);
+  assert(
+    st.warnings.some((w) => w.key === "draftModel"),
+    "the second set of weights is named",
+  );
+  assertEquals(
+    stability(meta(), hw(), defaults()).warnings.some((w) =>
+      w.key === "draftModel"
+    ),
+    false,
+    "and nothing is said when there is no draft model",
+  );
+});
+
+Deno.test("tune: a model with no MTP block is told what speculative decoding it CAN use", () => {
+  // The tuner does not switch on what it has not measured — an n-gram draft
+  // that is rejected is work thrown away, and nothing here knows what the user
+  // is about to ask for. So it names the option and points at the measurement.
+  const dense = tune(
+    meta({ nextnLayers: 0 }),
+    hw({ gpus: [gpu(24)] }),
+    defaults(),
+  );
+  assertEquals(dense.settings.specType, "", "nothing is turned on");
+  const said = dense.reasons.join(" ");
+  assertStringIncludes(said, "n-gram");
+  assertStringIncludes(said, "Speed panel");
+
+  // And a model that ships the block still gets it, unchanged.
+  const mtp = tune(
+    meta({ nextnLayers: 1 }),
+    hw({ gpus: [gpu(24)] }),
+    defaults(),
+  );
+  assertEquals(mtp.settings.specType, "draft-mtp");
+});
+
+Deno.test("quant: a file that does not fit gets a different sentence, not a 0× one", () => {
+  // The ratio has no denominator when the current file cannot run: `mine.tps`
+  // is 0, and the first version of this printed "about 0.0× faster", which
+  // reads as a bug because it is one. A refusal is not a slow run.
+  const huge = meta({
+    quant: "Q8_0",
+    nLayer: 60,
+    nExpert: 128,
+    nExpertUsed: 8,
+    layers: layers(60, 2400 * MB, 2300 * MB),
+    embdBytes: 800 * MB,
+    outputBytes: 800 * MB,
+  });
+  const rows = quantOptions(huge, hw({ gpus: [gpu(24), gpu(24)] }), defaults());
+  const mine = rows.find((r) => r.current);
+  assertExists(mine);
+  assertEquals(mine.possible, false, "the fixture is the case under test");
+  const advice = quantAdvice(rows);
+  assert(!/0\.0×/.test(advice), `no zero ratio: ${advice}`);
+  assertStringIncludes(advice, "does not fit");
+  assertStringIncludes(advice, "would");
+});
+
+Deno.test("quant: a slow rate keeps its decimal", () => {
+  // "1 → 4 tokens/s" for a fourfold difference reads as a rounding artefact.
+  const slow = meta({
+    quant: "Q8_0",
+    nLayer: 80,
+    nCtxTrain: 32768,
+    layers: layers(80, 900 * MB),
+    embdBytes: 500 * MB,
+    outputBytes: 500 * MB,
+  });
+  const advice = quantAdvice(
+    quantOptions(slow, hw({ gpus: [gpu(24)] }), defaults()),
+  );
+  assert(advice.length > 0, "this one is worth advice");
+  assert(
+    /\d\.\d tokens\/s|\d\.\d →/.test(advice),
+    `a sub-ten rate shows its decimal: ${advice}`,
+  );
+});
+
+Deno.test("quant: the advice names the quality knee, not the smallest file", () => {
+  // The fastest row is always the smallest file, so recommending it means
+  // recommending the most damaged version of the model every single time. On a
+  // 70B that read "Q3_K_M, 4.3× faster" where Q4_K_M was already 2.3× at a cost
+  // most people would not notice. Advice that always points at the bottom of
+  // the table is a slider, not advice.
+  const big = meta({
+    quant: "Q8_0",
+    nLayer: 80,
+    nCtxTrain: 32768,
+    layers: layers(80, 900 * MB),
+    embdBytes: 500 * MB,
+    outputBytes: 500 * MB,
+  });
+  const rows = quantOptions(big, hw({ gpus: [gpu(24)] }), defaults());
+  const advice = quantAdvice(rows);
+  assertStringIncludes(advice, "Q4_K_M", `got: ${advice}`);
+  assert(!advice.includes("Q3_K_M"), "the cliff is not the recommendation");
+  // The table still carries every option, so someone who wants the last 2×
+  // can read down to it and see the price on the row.
+  assert(
+    rows.some((r) => r.quant === "Q3_K_M"),
+    "and it is still offered",
+  );
+});
+
+// ── source refs: master, tags, and pull requests ───────────────────────────
+
+Deno.test("srcref: a pull request round-trips through the ref string", () => {
+  // The ref is stored in `cfg`/`builds` state and appears in a build id, so it
+  // has to survive being written down and read back.
+  for (
+    const r of [
+      { kind: "master" } as const,
+      { kind: "tag", tag: "b7421" } as const,
+      { kind: "pr", pr: 27754, mode: "merge" } as const,
+      { kind: "pr", pr: 27754, mode: "head" } as const,
+    ]
+  ) {
+    assertEquals(parseRef(formatRef(r)), r);
+  }
+  // Anything unrecognised is a tag — every ref was one before pull requests.
+  assertEquals(parseRef("b9999"), { kind: "tag", tag: "b9999" });
+  assertEquals(parseRef(""), { kind: "master" });
+});
+
+Deno.test("srcref: the number is taken from whatever the user pasted", () => {
+  // People arrive from a browser, so the URL is the commonest input.
+  assertEquals(
+    parsePrInput("https://github.com/ggml-org/llama.cpp/pull/27754"),
+    27754,
+  );
+  assertEquals(
+    parsePrInput("https://github.com/ggml-org/llama.cpp/pull/27754/files"),
+    27754,
+  );
+  assertEquals(parsePrInput("#27754"), 27754);
+  assertEquals(parsePrInput(" 27754 "), 27754);
+  // And a paste error is refused rather than turned into a 404 nobody can
+  // explain: a box that silently builds the wrong pull request is worse than
+  // one that says it did not understand.
+  assertEquals(parsePrInput(""), null);
+  assertEquals(parsePrInput("master"), null);
+  assertEquals(parsePrInput("v1.2.3"), null);
+  assertEquals(parsePrInput("0"), null);
+  assertEquals(parsePrInput("99999999999"), null);
+});
+
+Deno.test("srcref: only a tag may be cached, because only a tag cannot change", () => {
+  // THE bug behind "I don't have the latest llama.cpp updates". The source
+  // cache was keyed on the ref name and reused whenever CMakeLists.txt
+  // existed, so the first `master` build pinned that machine to that day's
+  // master for ever — measured on the developer's own cache, which held a
+  // master five weeks old while the log said "Reusing cached source".
+  assertEquals(refMoves(parseRef("master")), true);
+  assertEquals(refMoves(parseRef("pr/27754")), true, "master moves under it");
+  assertEquals(refMoves(parseRef("pr/27754@head")), true, "so can a branch");
+  assertEquals(refMoves(parseRef("b7421")), false, "a tag is immutable");
+});
+
+Deno.test("srcref: a ref becomes exactly one path segment", () => {
+  // Both the source cache and the builds registry turn a ref into a directory,
+  // and `pr/27754` carries a slash. Same class as the builds-root containment
+  // check, closed at the source rather than at every consumer.
+  const dirs = ["master", "b7421", "pr/27754", "pr/27754@head"].map((r) =>
+    refDirName(parseRef(r))
+  );
+  for (const d of dirs) {
+    assert(!d.includes("/"), `${d} must be one segment`);
+    assert(!d.includes("\\"), `${d} must not carry a Windows separator`);
+    assert(d !== "." && d !== "..", `${d} must not be a traversal`);
+    assertEquals(d, d.replace(/[^A-Za-z0-9._-]/g, "_"), `${d} is safe`);
+  }
+  // And the two modes of one pull request are different builds.
+  assertNotEquals(
+    refDirName(parseRef("pr/1")),
+    refDirName(parseRef("pr/1@head")),
+  );
+  // A hostile tag cannot escape either — tags come from GitHub, but they land
+  // in a path, so they are filtered rather than trusted.
+  assert(!refDirName({ kind: "tag", tag: "../../etc" }).includes("/"));
+});
+
+Deno.test("srcref: each ref names the right tarball", () => {
+  // Verified live against ggml-org/llama.cpp on 2026-09-03: the `head` ref
+  // answered 200 for both PRs tried, and `merge` answered 200 for one and 404
+  // for the one whose branch had drifted behind master.
+  assertEquals(
+    tarballUrl(parseRef("master")),
+    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+  );
+  assertEquals(
+    tarballUrl(parseRef("b7421")),
+    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/b7421",
+  );
+  assertEquals(
+    tarballUrl(parseRef("pr/27754")),
+    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/pull/27754/merge",
+  );
+  assertEquals(
+    tarballUrl(parseRef("pr/27754@head")),
+    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/pull/27754/head",
+  );
+});
+
+Deno.test("srcref: a withdrawn merge ref is a verdict, not a missing file", () => {
+  // GitHub publishes the merged form of a pull request only while it still
+  // applies to master. The 404 therefore MEANS something, and the user needs
+  // that sentence before they wait out a twenty-minute compile.
+  const merge = refNotFound(parseRef("pr/27742"));
+  assertStringIncludes(merge.reason, "does not currently merge");
+  assert(merge.steps.length >= 2, "and it names what can be done instead");
+  assert(
+    merge.steps.some((s) => /on its own/.test(s)),
+    "the branch alone is the escape hatch",
+  );
+  // A missing PR is a different sentence from a PR that stopped merging.
+  const head = refNotFound(parseRef("pr/999999@head"));
+  assertStringIncludes(head.reason, "not found");
+  assert(!/merge/.test(head.reason));
+});
+
+Deno.test("srcref: a pull-request build says it is dated, because it is", () => {
+  // "master + PR #27754" means something different tomorrow, and a name that
+  // cannot carry that has to be helped.
+  const at = Date.parse("2026-09-03T10:00:00Z");
+  const p = refProvenance(parseRef("pr/27754"), at);
+  assertStringIncludes(p, "2026-09-03");
+  assertStringIncludes(p, "27754");
+  assertStringIncludes(refProvenance(parseRef("b7421"), at), "b7421");
+  assertStringIncludes(refProvenance(parseRef("master"), at), "2026-09-03");
+});
+
+Deno.test("backend: the release route refuses a pull request before the button lights", () => {
+  // Nobody publishes prebuilt binaries for unmerged code, so the answer is
+  // knowable up front — which is this function's whole job.
+  const ctx = {
+    platform: "linux",
+    arch: "x86_64",
+    found: new Set<string>(["cmake", "compiler"]),
+    availableBackends: ["cpu", "cuda"] as const,
+    assetCount: 12,
+  };
+  const r = targetReadiness("release", "cuda", { ...ctx, pr: 27754 });
+  assertEquals(r.ok, false);
+  assertEquals(r.pending, false, "this is an answer, not a wait");
+  assertStringIncludes(r.diagnosis?.reason ?? "", "27754");
+  assertStringIncludes(r.diagnosis?.reason ?? "", "no prebuilt");
+  // And it points at the route that CAN do it.
+  assert(
+    r.diagnosis?.steps.some((s) =>
+      typeof s !== "string" && s.action?.kind === "switch-origin"
+    ),
+    "with a button that switches route",
+  );
+  // Without a pull request the release route is unaffected.
+  assertEquals(targetReadiness("release", "cuda", ctx).ok, true);
+});
+
+Deno.test("srcref: several pull requests become a stack, and order is kept", () => {
+  // Order is load-bearing: merging A then B is not merging B then A when they
+  // touch the same lines, so it is part of the ref and part of the directory.
+  const r = parseRef("master+pr/27773+pr/28136+pr/27269");
+  assertEquals(r, { kind: "stack", prs: [27773, 28136, 27269] });
+  assertEquals(formatRef(r), "master+pr/27773+pr/28136+pr/27269");
+  assertEquals(refDirName(r), "stack-27773-28136-27269");
+  assertNotEquals(
+    refDirName(parseRef("master+pr/2+pr/1")),
+    refDirName(parseRef("master+pr/1+pr/2")),
+    "a different order is a different build",
+  );
+  // One is not a stack, and none is master: two spellings of one thing is how
+  // a cache ends up holding the same tree twice.
+  assertEquals(parseRef("master+pr/27773"), {
+    kind: "pr",
+    pr: 27773,
+    mode: "merge",
+  });
+  assertEquals(parseRef("master+"), { kind: "master" });
+});
+
+Deno.test("srcref: only a stack needs git", () => {
+  // GitHub merges ONE pull request into master for us and serves a tarball of
+  // it, so the common case installs nothing. It will not merge two into each
+  // other, and nothing but a real merge can.
+  assertEquals(refNeedsGit(parseRef("master")), false);
+  assertEquals(refNeedsGit(parseRef("b7421")), false);
+  assertEquals(refNeedsGit(parseRef("pr/27773")), false);
+  assertEquals(refNeedsGit(parseRef("master+pr/1+pr/2")), true);
+});
+
+Deno.test("srcref: a list of pull requests is read the way people write one", () => {
+  assertEquals(parsePrList("27773, 28136, 27269"), [27773, 28136, 27269]);
+  assertEquals(parsePrList("27773 28136"), [27773, 28136]);
+  assertEquals(parsePrList("#27773; #28136"), [27773, 28136]);
+  assertEquals(
+    parsePrList(
+      "https://github.com/ggml-org/llama.cpp/pull/27773 28136",
+    ),
+    [27773, 28136],
+  );
+  // Duplicates are dropped rather than merged twice — git refuses the second
+  // one anyway, with a message about nothing to do.
+  assertEquals(parsePrList("27773, 27773"), [27773]);
+  assertEquals(parsePrList("master"), []);
+  // And the ref that a list becomes.
+  assertEquals(refForPrs([]), { kind: "master" });
+  assertEquals(refForPrs([5]), { kind: "pr", pr: 5, mode: "merge" });
+  assertEquals(refForPrs([5, 6]), { kind: "stack", prs: [5, 6] });
+  assertEquals(refPrs(parseRef("master+pr/5+pr/6")), [5, 6]);
+  assertEquals(refPrs(parseRef("master")), []);
+});
+
+Deno.test("srcref: a merged pull request is the failure that looks like success", () => {
+  // GitHub keeps `refs/pull/N/merge` after a PR lands, still pointing at the
+  // merge computed back then. So the day it merges, that ref quietly starts
+  // meaning "an older master, plus a change master already has" — the build
+  // succeeds, the name looks right, and the binary is behind plain master.
+  const merged = prStateNote(27742, "merged");
+  assertExists(merged);
+  assertEquals(merged.useMaster, true);
+  assertStringIncludes(merged.message, "OLDER");
+  assertStringIncludes(merged.message, "Build master instead");
+
+  const closed = prStateNote(1, "closed");
+  assertExists(closed);
+  assertStringIncludes(closed.message, "closed without being merged");
+
+  // An open one is the normal case and says nothing.
+  assertEquals(prStateNote(1, "open"), null);
+  assertEquals(prStateNote(1, "unknown"), null, "a hiccup must not nag");
+});
+
+// ── CUDA that is too old for the GPU ───────────────────────────────────────
+
+Deno.test("cuda: a toolkit older than the card is an offer, not just a warning", () => {
+  // Measured on the machine this was written for: CUDA 12.0 against Blackwell
+  // (sm_120) can emit PTX only, the driver re-compiles it at every load, and
+  // the same model then generates at 19 tok/s instead of 42.
+  const up = cudaUpgradeFor("release 12.0, V12.0.140", [12.0, 12.0]);
+  assertExists(up);
+  assertEquals(up.have, 12.0);
+  assertEquals(up.newestCap, 12.0);
+  // The OLDEST release that covers the card, not the newest that exists: a
+  // bigger jump is a bigger download for no gain.
+  assertEquals(up.need, 12.8);
+  assertEquals(cudaUpgradeFor("release 13.3", [12.0]), null, "already covered");
+  assertEquals(cudaUpgradeFor("release 12.0", [8.9]), null, "an older card");
+  assertEquals(cudaUpgradeFor("release 12.0", []), null, "no NVIDIA card");
+  assertEquals(cudaUpgradeFor("nonsense", [12.0]), null, "no readable version");
+});
+
+Deno.test("cuda: the driver is the ceiling, and it is read before anything is offered", () => {
+  // A toolkit newer than the driver produces binaries the machine cannot load.
+  // Installing one would turn a slow build into a broken one, so when the
+  // driver is the limit the app says nothing at all.
+  assertEquals(
+    driverCudaVersion("| NVIDIA-SMI 610.43.02   CUDA UMD Version: 13.3 |"),
+    13.3,
+  );
+  assertEquals(
+    driverCudaVersion("| NVIDIA-SMI 550.90   CUDA Version: 12.4 |"),
+    12.4,
+  );
+  assertEquals(driverCudaVersion("no version here"), 0);
+
+  const caps = [12.0];
+  // This machine, exactly: driver runs 13.3, toolkit is 12.0.
+  assertExists(cudaOffer("release 12.0", caps, 13.3));
+  // A driver that cannot run what the card needs: installing would achieve
+  // nothing, so nothing is offered.
+  assertEquals(cudaOffer("release 12.0", caps, 12.4), null);
+  assertEquals(
+    cudaOffer("release 12.0", caps, 0),
+    null,
+    "unknown ≠ optimistic",
+  );
+});
+
+Deno.test("cudaredist: only the pieces a llama.cpp build reaches for", () => {
+  const keys = CUDA_COMPONENTS.map((c) => c.key);
+  for (const must of ["cuda_nvcc", "cuda_cudart", "libcublas", "cccl"]) {
+    assert(keys.includes(must), `${must} is required to build ggml-cuda`);
+  }
+  // Nothing that installs a driver or a kernel module — the entire safety
+  // claim of this fix rests on this list.
+  for (const never of ["nvidia_driver", "nvidia_fs", "fabricmanager", "imex"]) {
+    assertEquals(keys.includes(never), false, `${never} must never be fetched`);
+  }
+  for (const c of CUDA_COMPONENTS) {
+    assert(c.why.length > 0, `${c.key} must say why it is needed`);
+  }
+});
+
+Deno.test("cudaredist: a manifest becomes checksummed downloads, and a rename is survivable", () => {
+  // Shape taken from NVIDIA's real redistrib_13.3.1.json.
+  const manifest = {
+    cuda_nvcc: {
+      "linux-x86_64": {
+        relative_path:
+          "cuda_nvcc/linux-x86_64/cuda_nvcc-13.3.73-archive.tar.xz",
+        sha256: "a".repeat(64),
+        size: "31600000",
+      },
+    },
+    libcublas: {
+      "linux-x86_64": {
+        relative_path:
+          "libcublas/linux-x86_64/libcublas-13.6.0.2-archive.tar.xz",
+        sha256: "b".repeat(64),
+        size: "818000000",
+      },
+    },
+  };
+  const { files, totalB, missing } = cudaFiles(manifest);
+  assertEquals(files.length, 2);
+  assertEquals(totalB, 849_600_000);
+  assertEquals(files[0]?.sha256, "a".repeat(64));
+  assertStringIncludes(files[0]?.url ?? "", "developer.download.nvidia.com");
+  // Everything else is reported absent rather than throwing: NVIDIA renames
+  // components between releases, and refusing to install over a name change in
+  // a release nobody asked about is worse than a missing optional header.
+  assert(missing.includes("cccl"));
+  assertEquals(cudaFilesUsable(files), true);
+  // Without a compiler there is nothing to install, and that IS fatal.
+  assertEquals(
+    cudaFilesUsable(files.filter((f) => f.key !== "cuda_nvcc")),
+    false,
+  );
+  assertEquals(cudaFiles({}).files.length, 0);
+  assertEquals(cudaFiles(null).files.length, 0);
+});
+
+Deno.test("cudaredist: disk is checked with room for the unpacking, not just the download", () => {
+  // Measured: 929 MB of archives became 2.0 GB installed, and both exist at
+  // once. On a disk at 99% full, refusing politely beats running it to zero.
+  const oneGb = 1024 ** 3;
+  assert(cudaDiskNeededB(oneGb) >= 3 * oneGb, "the unpacked size counts too");
+  assert(cudaDiskNeededB(0) > 0, "there is always some slack");
+});
+
+Deno.test("cudaredist: the fix says what it will NOT do, before it does anything", () => {
+  const said = cudaFixSummary("13.3.1", 1024 ** 3, "/home/u/.llama-master/x")
+    .join(" ");
+  assertStringIncludes(said, "No administrator rights");
+  assert(/[Nn]o driver/.test(said), "the driver is left alone, and it says so");
+  assertStringIncludes(said, "SHA-256");
+  assertStringIncludes(said, "delete that folder");
+});
+
+Deno.test("fix: the CUDA fix is a download, never a package or a script", () => {
+  // `apt install cuda` pulls a new DRIVER, and swapping a driver under a
+  // running desktop is the one failure a Fix button must never be able to
+  // cause. `download` is the app doing it itself, with no elevation at all.
+  const plan = fixPlan("cuda-arch", "linux", "apt");
+  assertEquals(plan.kind, "download");
+  if (plan.kind !== "download") throw new Error("unreachable");
+  assertStringIncludes(plan.label, "no root");
+  assertStringIncludes(plan.label, "no driver change");
 });

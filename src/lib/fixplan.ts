@@ -209,8 +209,15 @@ export function rocmPlan(
       },
       {
         label: "Give your user access to the GPU device nodes",
+        // The user who pressed the button, not the one running the step. Under
+        // `pkexec` that is `PKEXEC_UID` (numeric — pkexec sets no name), under
+        // `sudo` it is `SUDO_UID`. The first spelling of this,
+        // `${SUDO_USER:-$PKEXEC_UID_NAME:-$USER}`, parsed in bash as the
+        // literal word `$PKEXEC_UID_NAME:-$USER` and under pkexec ran
+        // `usermod … :-root` — step 7 of 7 failing after the driver was in.
+        // Pinned in tests/lib.test.ts by running it through bash.
         sh:
-          `usermod -a -G render,video ${"${SUDO_USER:-$PKEXEC_UID_NAME:-$USER}"}`,
+          `usermod -a -G render,video "$(id -un "\${PKEXEC_UID:-\${SUDO_UID:-$(id -u)}}")"`,
       },
     ],
   };
@@ -250,6 +257,19 @@ export function fixPlan(
 ): FixPlan {
   if (id === "cmake") {
     return { kind: "download", label: "Download CMake into the app directory" };
+  }
+  if (id === "cuda-arch") {
+    // A `download`, which is the safest of the three kinds this app has: the
+    // app does it itself, into its own folder, with no elevation at all.
+    // Deliberately NOT a `package` or a `script` plan — the apt route pulls a
+    // new DRIVER, and swapping a driver under a running desktop is the one
+    // failure a "Fix" button must never be able to cause
+    // (`src/lib/cudaredist.ts` has the reasoning).
+    return {
+      kind: "download",
+      label:
+        "Download a newer CUDA toolkit into the app directory (no root, no driver change)",
+    };
   }
   if (id === "spirv") {
     return {

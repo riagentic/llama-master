@@ -187,6 +187,20 @@ async function walkOllama(
 const FIRST_READ = 1024 * 1024;
 const MAX_READ = 64 * 1024 * 1024;
 
+/** The first `want` bytes of `f`, or fewer only at end of file. A single
+ *  `read` may return less than asked on any file system, and a short read
+ *  taken for a short file would misdiagnose a healthy model. */
+async function readPrefix(f: Deno.FsFile, want: number): Promise<Uint8Array> {
+  const buf = new Uint8Array(want);
+  let got = 0;
+  while (got < want) {
+    const n = await f.read(buf.subarray(got));
+    if (n === null || n === 0) break;
+    got += n;
+  }
+  return buf.subarray(0, got);
+}
+
 /** Read as much of the header as the parser asks for, and no more. */
 export async function readMeta(
   path: string,
@@ -197,9 +211,7 @@ export async function readMeta(
     try {
       const f = await Deno.open(path, { read: true });
       try {
-        head = new Uint8Array(want);
-        const n = await f.read(head);
-        head = head.subarray(0, n ?? 0);
+        head = await readPrefix(f, want);
       } finally {
         f.close();
       }
@@ -210,10 +222,20 @@ export async function readMeta(
     const r = await gguf(head);
     if (r.ok) return { meta: r.json as unknown as ModelMeta, error: null };
     if (r.truncated === null) return { meta: null, error: r.error };
+    // The parser wanted more than the file HAS: it is the file that ends
+    // inside its header, not the header that is large. This used to fall
+    // through a condition that was always true, re-read the same bytes four
+    // times and report "header larger than 64 MB" about a cut download.
+    if (head.length < want) {
+      return {
+        meta: null,
+        error:
+          `file ends inside its own header (${head.length} bytes on disk, the header needs at least ${r.truncated}) — an incomplete download?`,
+      };
+    }
     // The parser reports the offset it needed; add slack so the next tensor
     // entry is covered too rather than round-tripping per entry.
     want = Math.min(MAX_READ, Math.max(r.truncated * 2, want * 4));
-    if (want >= head.length && head.length < want) continue;
   }
   return {
     meta: null,

@@ -13,12 +13,17 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.0-alpha71`**, vendored at `dep/aio` → symlink to
-  `../../aio`. Never `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs
-  index: `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must
-  name the version the symlink actually resolves to — `deno task aiol` says so
-  when they drift, and a declaration that lags the code is how the app came to
-  be running alpha54 while claiming alpha44.
+- **Deno 2.9+ + aio `1.0.0-alpha75`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.0-alpha75`). Never
+  `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
+  `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
+  version the symlink actually resolves to — `deno task aiol` says so when they
+  drift, and a declaration that lags the code is how the app came to be running
+  alpha54 while claiming alpha44. Change it with `am pin <version>`, never by
+  hand; `am pin <path>` writes a gitignored `.aio/pin.local` that follows a
+  framework checkout instead, which is for developing against a WIP aio and
+  overrides the committed pin silently — `deno task am pin` prints which one is
+  in force.
 - **Async cells carry `transaction: false`.** alpha52 made `transaction: true`
   (snapshot reads, atomic commit at return) the async default; every cell here
   was written for incremental commits — `srv.poll` is an observer that must read
@@ -700,9 +705,281 @@ cannot act on is a bug.
 - **Compare paths resolved, never as text.** `bin.startsWith(buildsRoot())`
   accepted `<buildsRoot>/../../../../usr/bin/id` — a rule that read like a
   sandbox and was not one. Archive containment had the mirror bug: it split on
-  `/` only, so a Windows-spelled `..\..\evil` walked straight through.
+  `/` only, so a Windows-spelled `..\..\evil` walked straight through. And
+  `removeBuild` had a third: `join(root, "/")` is `root/`, which
+  `startsWith(root + "/")` and contains no `..` — `builds.remove("/")` would
+  have removed every build. It is `dirname(resolve(root, id)) === root` now.
 - **Fail loud.** A missing binary, an unreadable header, a 404 — surface it in
   `lastError` and render it. Never swallow.
+- **A call ceiling belongs on the cell, a reporting budget in `app.ts`.**
+  `perfBudget.methods["srv:start"].timeout` is a string in another file that no
+  rename follows and nothing checks; `long: ["start"]` on `cell("srv", …)` is
+  checked against the method list at `cell()` time. So the six methods whose
+  duration belongs to a compiler, a package manager, a disk or a 145 GB file
+  (`builds.start/update`, `prereq.fix/fixAll`, `models.scan`, `srv.start`)
+  declare `long:` and name no number — the ceilings they used to carry were
+  guesses about somebody else's machine, and a timeout does not cancel anything,
+  it only abandons a call that is still working. The `timeout:` entries that
+  remain are real bounds on work that is quick by nature (a 1 s poll, a
+  `nvidia-smi`, a GitHub GET), where a breach is a fault worth reporting.
+  `effect:` stays per method in `app.ts` either way — that is the budget, not
+  the ceiling.
+- **"Your CUDA is too old for your GPU" is a PREREQUISITE with a Fix button, and
+  the fix installs nothing on the system.** `cuda.ts` always knew the answer —
+  an nvcc older than the card can emit only PTX, which the driver re-compiles at
+  every load — but it was a sentence in a build log. Measured the difference on
+  this machine, same model, same flags, same source: **19 tok/s built with CUDA
+  12.0 (PTX for sm_90) against 41.6 with CUDA 13.3 (native sm_120), and 70 s to
+  load against 10 s.** That is a bigger win than any of the pull requests it was
+  competing with, so it is a prerequisite (`cuda-arch`) rather than a footnote.
+  - **The fix is a `download` plan, never `package` or `script`, and that is the
+    whole design.** `apt install cuda` adds NVIDIA's repository and pulls a new
+    DRIVER; swapping a driver under a running desktop is the one failure a Fix
+    button must never be able to cause, and the .run installer writes across
+    `/usr/local`. What this does instead is what NVIDIA publishes for exactly
+    this purpose: the toolkit as component tarballs, each with a SHA-256 in its
+    manifest (`src/lib/cudaredist.ts`), verified before anything is written,
+    unpacked into `~/.llama-master/cache/toolchain/cuda-<version>`. No root, no
+    apt repository, no driver, no kernel module, no system package, no PATH
+    change — and undone completely by deleting one directory. The list of
+    components is short and every entry says which part of a llama.cpp build
+    asks for it; a test fails if `nvidia_driver` ever appears in it.
+  - **The DRIVER is the ceiling and is read first.** A toolkit newer than the
+    driver produces binaries the machine cannot load, so `cudaOffer` returns
+    nothing when the driver could not run the release that would help — better a
+    slow build than a broken one. Read from `nvidia-smi`, which prints it as
+    `CUDA Version` on older drivers and `CUDA UMD Version` on newer ones. On
+    this machine the driver already reported 13.3 while nvcc was 12.0, so the
+    toolkit was the only thing in the way.
+  - Installed into a staging directory and renamed only when every file is in; a
+    half-unpacked toolkit that looks installed is worse than none, because the
+    next build would pick it up and fail deep inside cmake. Disk is checked at
+    three times the download (measured: 929 MB of archives → 2.0 GB installed,
+    both present at once) — this machine sits at 99% full. System `tar` does the
+    unpacking, because Deno's `DecompressionStream` has gzip and deflate but no
+    xz.
+  - `detectCudaPlan` prefers the app-managed nvcc over PATH and says so in the
+    build log. Without that the Fix button would install a toolkit that cmake
+    then ignored.
+- **A shallow clone cannot always find a merge base, and the fix is more history
+  — never `--allow-unrelated-histories`.** Assembling a stack fetches at
+  `--depth=300`, and a pull request whose branch point is older than that makes
+  git refuse with "unrelated histories". That flag would splice two genuinely
+  unrelated trees together and hand the result to a compiler, so the merge
+  deepens (`--deepen=5000`) and retries instead. Also: a failed merge with NO
+  conflicted files is not a conflict — reporting it as one sent a debugging
+  session looking for overlapping edits that did not exist, so git's own words
+  are used when the file list is empty.
+- **A pull request is a source ref, and GitHub does the merge.** The interesting
+  models arrive as PRs months before they merge, and the only way to run one was
+  to drop its tarball into the source cache by hand — which works once and then
+  rots under a name that no longer describes it. The tempting fix is "clone and
+  merge"; it is wrong here, because source is fetched as a tarball precisely so
+  git is not a dependency. GitHub already publishes `refs/pull/<N>/head` (the
+  author's branch) AND `refs/pull/<N>/merge` (that branch merged into current
+  master, kept up to date by GitHub), and codeload serves a tarball of either.
+  So "latest llama.cpp with this one PR" is a plain download.
+  `src/lib/srcref.ts` owns the ref grammar (`master`, `b7421`, `pr/27754`,
+  `pr/27754@head`), the URLs, and the filesystem-safe directory name —
+  `pr/27754` carries a slash and both the source cache and the build id become
+  directories, so that is closed at the source rather than at every consumer.
+  **The merge ref's 404 is a verdict, not a missing file**: GitHub withdraws it
+  when the branch and master disagree, so `refNotFound` says "this PR does not
+  currently merge" and offers the branch alone. Verified live 2026-09-03: PR
+  27754 answered 200 on both refs, 27742 answered 200 on `head` and 404 on
+  `merge`, and the 27754 merge tarball contains both the PR's code and master's
+  newer CUDA kernels. The release route REFUSES a PR before the button lights
+  (`targetReadiness`) — nobody publishes binaries for unmerged code. One PR at a
+  time: stacking two needs a real merge, which needs git.
+- **More than one PR needs a real merge, so it needs git — and only then.**
+  GitHub merges ONE pull request into master for us; it will not merge two into
+  each other. So `master+pr/A+pr/B` (`SrcRef.kind === "stack"`) is assembled
+  here, and it is the ONLY ref that requires a tool to be installed
+  (`refNeedsGit`) — saying "git is required" flatly would be false for
+  everything else this app builds. Assembly uses one bare clone reused by every
+  stack (`sources/_gitrepo`), merges each PR in the ORDER GIVEN (order is part
+  of the ref and of the directory name, because merging A then B is not merging
+  B then A), and exports the result with `git archive`, so the source tree has
+  the same shape a tarball produces. A conflict names the pull request AND the
+  files. A fetch that fails when the clone already holds every ref needed falls
+  back to what is on disk and SAYS so — GitHub answers 401 to unauthenticated
+  git when it is throttling an address, and losing a build to that would be
+  worse than building from a copy that is named as possibly stale.
+- **A clean merge is not a clean build, and the app must not pretend
+  otherwise.** Measured the expensive way on 2026-09-03: PR #27773 (GLM-5.3-
+  Flash) merged into master with zero textual conflicts and then failed to
+  compile, because master had added an `n_kv_max` parameter to `build_attn_mha`
+  and the PR still called the nine-argument form. Git cannot see that; only the
+  compiler can. So a stack that assembles is not a stack that works, the build
+  log is where that is found out, and the app must never present "merged
+  cleanly" as "will build". Nothing here patches a PR to fix it: guessing a
+  value for an argument in an attention kernel is how an inference engine
+  produces confidently wrong output.
+- **A merged pull request is the failure that looks like success.** GitHub keeps
+  `refs/pull/<N>/merge` after a PR lands, still pointing at the merge computed
+  back then — so the day it merges, `pr/<N>` quietly starts meaning "master as
+  it was months ago, plus a change master already has". The build succeeds, the
+  name looks right, and the binary is BEHIND plain master. `prState` reads the
+  PR's plain page (no API — the 60/hour quota is routinely exhausted) and
+  `prStateNote` says it, with the answer, which is always "build master".
+- **A PR-only setting must default to llama.cpp's own behaviour.** `--lazy-mode`
+  is in master with default `auto`; its `on-direct` VALUE comes from PR #28136
+  only. The catalog entry carries `llamaDef: "auto"`, so at the default the flag
+  is not emitted at all and a build without that PR is untouched. That is the
+  rule for every setting added for an unmerged change: the app's promise that a
+  plain-master build keeps working survives only if nothing PR-specific is ever
+  emitted by default.
+- **Only an immutable ref may be cached, and `master` is not one.** The source
+  cache was keyed on the ref NAME and reused whenever `CMakeLists.txt` existed,
+  so the first `master` build pinned that machine to that day's master for ever
+  — the developer's own cache held a master five weeks old, 112 files behind
+  (new `fattn-swizzle`, `moe-weighted-reduction` and `mmq-config-*` CUDA kernels
+  among them), while the log cheerfully said "Reusing cached source". That is a
+  build compiling something other than what its name claims, which is the exact
+  class this app exists to refuse. `refMoves()` decides: a tag is reused for
+  ever, `master` and any PR ref are re-fetched every time — 37 MB against a
+  compile measured in minutes. A moving build also records the master sha it saw
+  and prints `refProvenance` into the log, because "master + PR #27754" means
+  something different tomorrow.
+- **Speed is MEASURED now, not only estimated.** Everything the app said about
+  tokens per second divided bytes by an effective bandwidth that cannot be read
+  off the machine (`speed.ts` says why), and the only observation it had was
+  `chat.lastTps` — a real rate about an unknown prompt, at an unknown context
+  fill, with an unknown amount of thinking in it. `src/lib/bench.ts` holds those
+  variables still (fixed prompt, fixed 128 tokens, `cache_prompt: false` so the
+  prefill is real work, `temperature: 0`, `reasoning_budget: 0` so a thinking
+  model does not spend the whole budget thinking) and `srv.bench` runs it
+  **against the server that is already up** — no reload, no second process, no
+  extra memory, nothing at risk on a run that took two minutes to place. The
+  numbers are llama.cpp's own `timings`; the first-token latency is measured
+  here because no server metric reports it. `speedCalFromLastReply` prefers the
+  bench over the chat and bills it at the context ACTUALLY filled — charging a
+  near-empty run for a 262,144-token cache would calibrate a bandwidth several
+  times too high. A build too old to report `timings` has measured NOTHING and
+  says so: writing 0 tok/s would put "this machine is broken" on screen over a
+  build's age. The result carries its model AND its context (`benchApplies`),
+  because the same model at 8k and at 256k are different measurements, and it is
+  cleared on every start. State key `lastBench`, not `bench` — aio refuses a
+  cell whose state key shadows a method, and it is right to.
+- **"Would a smaller quantisation be faster?" is the app's biggest speed lever
+  and it used to be silent about it.** A smaller quant was named only in
+  refusals ("try a smaller quantisation"); a model that FITS was never told that
+  half the bits per weight is close to twice the rate. `src/lib/quant.ts`
+  answers it, and the answer has an exact half and an estimated half. Exact:
+  this file's real bits per weight, `tensorBytes * 8 / params`, counted off its
+  own tensor table — `params` was added to `rust/src/gguf.rs` for this, because
+  the LABEL is a mix (a "Q4_K_M" is mostly Q4_K with some Q6_K) and two files
+  wearing it are not the same size. Estimated: what a file of some other quant
+  would weigh (`TYPICAL_BPW`), since that file is not on this machine. What is
+  NOT estimated is the consequence — each candidate is rescaled and run through
+  the real `tune` → `plan` → `bytesPerToken` → `estimateTps`, on this machine,
+  with this reserve. That is the whole point: the interesting row is not "half
+  the bytes, twice the speed", it is the one where the model stops spilling into
+  system RAM and goes four times faster, and a ratio cannot find it (pinned in
+  `tests/lib.test.ts`). Two bugs this found, both fixed and pinned: a current
+  file that does not fit has no rate to be a multiple of and printed "about 0.0×
+  faster"; and the fastest row is always the SMALLEST file, so recommending it
+  recommended the most damaged model every time — `recommend()` aims at the
+  quality knee (`SAFE_BPW`, 4.5 bits) instead, and the table carries the rest
+  with the price on each row.
+- **A reasoning model's thinking is a speed control, and it was invisible.**
+  `--reasoning off` removes most of a thinking model's tokens, which is a bigger
+  win on a short question than any kernel flag — and it shipped as an advanced
+  server flag filed next to Prometheus metrics. `ThinkSwitch` (all-in-one and
+  Tune, beside the LAN and priority switches) has three states because `auto` is
+  the honest default: the model's own template decides, and forcing `on` for a
+  model with no reasoning mode is a request llama.cpp cannot honour.
+- **Speculative decoding: MTP is taken, n-gram is NAMED, a draft model is
+  offered.** `draft-mtp` is switched on whenever the model ships the block — the
+  rare optimisation with nothing to weigh. The `ngram-*` kinds need no second
+  model and no MTP block, so they are available to every model, and they are
+  deliberately NOT switched on: a rejected draft is work thrown away, they pay
+  on repetitive output and cost a little on prose, and nothing here knows what
+  the user is about to ask for. This app does not enable what it has not
+  measured — so the tuner names the option, says what decides it, and points at
+  the Speed panel, which settles it in fifteen seconds. `-md` (a small GGUF of
+  the same family) is in the catalog with a `stability.ts` caution: it loads a
+  second set of weights and `plan.ts` sizes only `-m`, so those bytes are real
+  and unbilled.
+- **Host memory bandwidth is reported, never diagnosed.** A low `ramBps` is the
+  one machine number a user can act on — DDR5 sold as 6000 boots at 4800 until
+  EXPO/XMP is switched on, which is about a fifth of every model with experts in
+  RAM. But the DIMMs cannot be read without root (`dmidecode`, `lshw`), so
+  `bandwidthNote` states wide bands as "what machines like this usually reach"
+  and names something to go and look at rather than asserting what will be
+  found. Silent unless the running placement actually reads host RAM per token:
+  on a VRAM-only run the figure is true and irrelevant.
+- **A draft is not shared state.** The chat box was `value={chat.input}` with a
+  `setInput` dispatch per keystroke, and that is a controlled input over a
+  REPLICATED field: every key was a round trip, and while a reply streamed the
+  60–500 ms `partial` flushes re-rendered the box with whatever the server had
+  last acknowledged — keys still in flight were wiped, and only while the model
+  was answering, which is exactly how it was reported. aio's own rule
+  (`docs/state/real-time.md`): if two clients or a restart never need to agree
+  on it, it does not belong in a server cell. So the draft is a module-level
+  `signal` in `ChatComposer` (survives the Chat-tab ↔ all-in-one switch) and
+  reaches the cell as an ARGUMENT — `chat.submit(url, text)` and
+  `chat.send(url, text)`; `chat.input` no longer exists. The box is a textarea
+  now (Enter sends, Shift+Enter breaks a line, height follows `draftRows`),
+  because what gets pasted into a chat with a model that writes code is code.
+  Every other text and number box bound to a cell (settings, reserve, build
+  jobs, system prompt) goes through `kit.tsx:DraftInput`: the draft is local
+  while the box has focus and the cell sees ONE write on `change`. The reserve
+  boxes are in the auto-tune key, so typing "16" used to re-tune and persist at
+  "1" and again at "16". In a `testUI`, `setValue` fires only `input` — `blur()`
+  is the commit. Pinned in `tests/ui.test.ts` (the chip test types while a reply
+  streams and asserts the text survives a chat-cell write). The LAN client
+  (`client/src/ui/Composer.tsx`) follows the same rule.
+- **The planner chain is memoised, and the page root reads no chat.** Every
+  derived plan in `src/ui/derive.ts` from `currentStatePlan` to `projectedSpeed`
+  (and `maxTunings`, the two hunted contexts `CtxControls` draws) is a
+  `computed()` behind a plain function. It was not, and the all-in-one root —
+  which read chat, hw and srv — ran `tuneAll` three times per render
+  (`placements` → `projectedSettings` → `projectedStatePlan`, then
+  `perTokenBytes` again) at ~14 ms each on a 94-layer MoE: ~100 ms of JS on
+  every streamed-token flush, plus every 1 s hw and srv tick. That was the
+  second half of "typing is slow while it answers". The four things the root
+  read from chat (tok/s pill, error line, copy/clear, the live table's speed)
+  are their own components now (`OnePage.tsx:TpsPill` etc.), so a flush
+  re-renders four small things and not the page. `computed`, never a hand-rolled
+  cache: a cache hit that skips the read skips the subscription.
+- **A boolean whose upstream default is ON needs `llamaDef: true` AND an
+  `offFlag`.** Three switches shipped without: `--jinja`, `--slots` (both ON
+  upstream — `use_jinja`, `endpoint_slots` in `common.h`) and context shift
+  (whose default FLIPPED to off, with the pair now `--context-shift` /
+  `--no-context-shift`). As `def: false` with no `offFlag`, "on" emitted a flag
+  that changed nothing and "off" emitted nothing and changed nothing — the
+  server ran the same in both positions while the panel claimed a choice, and
+  `/slots` (which shows every prompt in flight) was up the whole time under a
+  tip saying it leaks. `stability.ts` now names it on an open bind. Also in that
+  pass: `--defrag-thold` is deprecated upstream (value ignored) and left the
+  catalog; `--cache-reuse 256` is emitted (off upstream, 256 in every upstream
+  preset, auto-disabled where the cache cannot shift); `-to` is upstream's 3600
+  again (600 was shorter than a 250k-token prefill); `--reasoning` /
+  `--reasoning-budget` and the `ngram-*` speculative kinds are in the catalog.
+  `cfg` is `version: 3` and drops the two orphaned keys. Re-check after any
+  llama.cpp bump — the app's own checkout is at
+  `~/.llama-master/cache/sources/master/common/{arg.cpp,common.h}`.
+- **A crash is processed once.** `srv.poll`'s not-running branch is guarded on
+  `s.pid === 0`: the pid is zeroed at the end of that branch, and without the
+  guard every later tick re-diagnosed the same dead run — a fresh `diagnosis`
+  object broadcast per second for as long as the app sat on a crash, `clearLog`
+  undone by the next poll — and, in the gap between a Start being dispatched and
+  its spawn (status "starting", no process yet), ran the fit ladder against the
+  PREVIOUS run's lines. Pinned in `tests/server.test.ts`.
+- **`exec` takes a ceiling, and `nvidia-smi` absence is remembered.** A wedged
+  `nvidia-smi` (after suspend, typically) blocked the 1 s hardware refresh
+  forever with no error anywhere; `hw.server.ts:nvidiaSmi` is the one door, with
+  a 5 s timeout (exit 124) and a 60 s memory of "not installed" so an AMD or
+  Apple box does not spawn a process a second to be told so again.
+- **The ROCm group step is checked by asking bash.**
+  `${SUDO_USER:-$PKEXEC_UID_NAME:-$USER}` read like a fallback chain and was not
+  one — bash parses the nested default as the literal word
+  `$PKEXEC_UID_NAME:-$USER`, and pkexec sets no such variable (it sets
+  `PKEXEC_UID`, a number) — so under the app's preferred `pkexec` path step 7 of
+  7 ran `usermod … :-root` after the driver was in. It is
+  `$(id -un "${PKEXEC_UID:-${SUDO_UID:-$(id -u)}}")` now, and
+  `tests/lib.test.ts` runs it through bash under all three.
 - **`.slice()`, not spread**, on live async state arrays.
 - Tests live in `tests/`, never beside their source.
 
@@ -779,6 +1056,8 @@ llama.master somebody else is running (`.katana/client.md`). `deno task dev`,
 ## Katas
 
 `.katana/*.md` are the quality specs; `/use-katana` audits against them. Field
-reports on the framework go to `dep/aio/feedback/llama-master.md` — that file is
-required by `.katana/_aio.md` and should be updated whenever aio gets in the
-way.
+reports on the framework go to `feedback/llama-master.md` in the aio CHECKOUT
+(`/home/dev/code/gen/aio`) — that file is required by `.katana/_aio.md`, which
+spells the path `dep/aio/feedback/…`, and that spelling stopped resolving when
+this app moved from a path pin to a version pin: a provisioned release worktree
+ships no `feedback/` directory. Update it whenever aio gets in the way.

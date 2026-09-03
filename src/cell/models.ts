@@ -22,6 +22,10 @@ export type ModelsState = {
 export const models = cell("models", {
   // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
   transaction: false,
+  // One scan reads a 2 MB header out of every GGUF on every search path — a
+  // library of hundreds of models, possibly on a spinning disk or an NFS
+  // mount. The old 120 s ceiling was a guess about somebody else's storage.
+  long: ["scan"],
   // The library itself is re-derived by a scan; the user's directory list and
   // their selection are the parts worth keeping across restarts.
   persist: { include: ["dirs", "selected"] },

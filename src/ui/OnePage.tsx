@@ -43,7 +43,9 @@ import { ChatMessage } from "./ChatMessage.tsx";
 import { ChatComposer } from "./ChatComposer.tsx";
 import { CommandPanel } from "./CommandView.tsx";
 import { SetupPanel } from "./SetupView.tsx";
-import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
+import { LanSwitch, PrioritySwitch, ThinkSwitch } from "./LanSwitch.tsx";
+import { SpeedCheck } from "./SpeedPanel.tsx";
+import { QuantLine } from "./QuantAdvice.tsx";
 import { ReserveControls } from "./ReserveControls.tsx";
 import { MemoryDetail } from "./MemoryDetail.tsx";
 import {
@@ -63,6 +65,7 @@ import { Guidance } from "./Guidance.tsx";
 import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
+  benchNow,
   changedCount,
   chatHasContent,
   chatTranscript,
@@ -76,6 +79,7 @@ import {
   memoryIsLive,
   projectedSpeed,
   projectedStatePlan,
+  quantAdviceNow,
   serverRunning,
   shownModel,
   shownSettings,
@@ -83,6 +87,7 @@ import {
   vramTotalB,
   vramUsedB,
 } from "./derive.ts";
+import type { Plan } from "../lib/plan.ts";
 
 /**
  * The four vitals, 2×2: CPU and GPU on top, their memory under each.
@@ -335,10 +340,16 @@ function RunStrip() {
   // that cannot be read off the machine — so the app ships a labelled default and
   // replaces it the first time a real generation gives it a rate to work back
   // from. Keyed on the rate so it runs once per reply, not once per frame.
-  const calFor = useRef(0);
+  //
+  // Keyed on BOTH observations: a chat reply and a bench are two rates about
+  // the same machine, the bench wins when it applies (`speedCalFromLastReply`),
+  // and keying on the chat rate alone meant pressing Measure changed nothing
+  // until the user happened to say something afterwards.
+  const calFor = useRef("");
   afterRender(() => {
-    if (calFor.current === chat.lastTps) return;
-    calFor.current = chat.lastTps;
+    const key = `${chat.lastTps}|${srv.lastBench.at}`;
+    if (calFor.current === key) return;
+    calFor.current = key;
     const cal = speedCalFromLastReply();
     if (cal.gpuBps || cal.ramBps) cfg.setSpeedCal(cal);
   });
@@ -454,6 +465,8 @@ function RunStrip() {
           </button>
         </label>
 
+        <QuantHint />
+
         <div class="run-row">
           <span class="run-label">Runs on</span>
           <div class="ctx-controls">
@@ -499,6 +512,7 @@ function RunStrip() {
           <div class="run-prefs">
             <LanSwitch t="one-lan" />
             <PrioritySwitch t="one-prio" />
+            <ThinkSwitch t="one-think" />
           </div>
         </div>
       </div>
@@ -849,6 +863,83 @@ function AllSettings() {
   );
 }
 
+// ── The chat's readers, kept OUT of the page root ─────────────────────────
+//
+// The root reads srv and hw, and it used to read chat too — a tok/s pill, an
+// error line, the copy/clear buttons, the live table's speed. Every streamed
+// token flush (2-16/s) then re-ran the whole root, and with it the planner
+// chain. Each of these is its own component now: it subscribes to chat, the
+// root does not, and a flush re-renders four small things instead of the page.
+
+/** tok/s of the last reply, or nothing. */
+function TpsPill() {
+  return chat.lastTps > 0
+    ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
+    : null;
+}
+
+/** The server's error, or failing that the chat's. */
+function RunError() {
+  return <ErrorNote message={srv.lastError || chat.lastError} />;
+}
+
+/** Copy and clear for the side chat. */
+function ChatActions() {
+  return (
+    <>
+      <CopyButton
+        text={chatTranscript()}
+        title="Copy the whole conversation as markdown"
+        t="one-chat-copy"
+      />
+      <button
+        type="button"
+        class="btn tiny"
+        t="one-chat-clear"
+        disabled={!chatHasContent()}
+        onClick={() => chat.clear()}
+      >
+        Clear
+      </button>
+    </>
+  );
+}
+
+/**
+ * The current-state table, with the measured speed beside it.
+ *
+ * A BENCH beats the chat when there is one: both are real rates, but a chat
+ * reply is a rate about an unknown prompt at an unknown fill with an unknown
+ * amount of thinking in it, and the bench is the same measurement with all of
+ * that held still (`src/lib/bench.ts`). The button under it is how one gets
+ * taken, and it is here rather than a tab away because this is the panel whose
+ * every other number is an estimate until it has run.
+ */
+function LiveMemoryDetail(props: { plan: Plan }) {
+  const b = benchNow();
+  const tps = b ? b.genTps : chat.lastTps;
+  return (
+    <>
+      <MemoryDetail
+        plan={props.plan}
+        live
+        mode="current"
+        compact
+        rssB={srv.rssB}
+        speed={tps > 0 ? { tps, measured: true } : null}
+      />
+      <SpeedCheck t="one-speed" />
+    </>
+  );
+}
+
+/** One line about a quantisation that would be meaningfully faster, when
+ *  there is one. Its own component so the page root does not read the model
+ *  cell to draw it. */
+function QuantHint() {
+  return <QuantLine advice={quantAdviceNow()} />;
+}
+
 /** The same chat as the Chat tab, sized for a shared page. */
 function MiniChat() {
   const ready = srv.status === "ready";
@@ -973,20 +1064,7 @@ export function OnePage() {
                  RAM 0 B · 0 of 0 layers" — and the map above already says what
                  the machine holds and what is free. */
             }
-            {live
-              ? (
-                <MemoryDetail
-                  plan={currentPlan}
-                  live
-                  mode="current"
-                  compact
-                  rssB={srv.rssB}
-                  speed={chat.lastTps > 0
-                    ? { tps: chat.lastTps, measured: true }
-                    : null}
-                />
-              )
-              : null}
+            {live ? <LiveMemoryDetail plan={currentPlan} /> : null}
           </div>
 
           {live ? null : (
@@ -1058,13 +1136,11 @@ export function OnePage() {
               t="one-srv-failed"
             />
           )
-          : <ErrorNote message={srv.lastError || chat.lastError} />}
+          : <RunError />}
         <Panel
           title={running ? "Running" : "Run a model"}
           icon="▶"
-          right={chat.lastTps > 0
-            ? <Pill tone="idle">{tps(chat.lastTps)} tok/s</Pill>
-            : null}
+          right={<TpsPill />}
         >
           <RunStrip />
           <AllSettings />
@@ -1084,28 +1160,7 @@ export function OnePage() {
           holds a real conversation instead of six lines. */
       }
       <aside class="one-side">
-        <Panel
-          title="Chat"
-          icon="✉"
-          right={
-            <>
-              <CopyButton
-                text={chatTranscript()}
-                title="Copy the whole conversation as markdown"
-                t="one-chat-copy"
-              />
-              <button
-                type="button"
-                class="btn tiny"
-                t="one-chat-clear"
-                disabled={!chatHasContent()}
-                onClick={() => chat.clear()}
-              >
-                Clear
-              </button>
-            </>
-          }
-        >
+        <Panel title="Chat" icon="✉" right={<ChatActions />}>
           <MiniChat />
         </Panel>
       </aside>

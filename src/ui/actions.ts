@@ -32,6 +32,7 @@ import {
   currentModel,
   foundPrereqs,
   hwSnapshot,
+  maxTunings,
   measuredCtx,
   paramBlocker,
   placements,
@@ -128,8 +129,8 @@ export function endpoint(): string {
  * `chat.streaming` from a browser replica that can be one round trip stale, and
  * the cost of getting it wrong is a second request into a live stream.
  */
-export function submitChat(url: string): void {
-  chat.submit(url, {
+export function submitChat(url: string, text: string): Promise<boolean> {
+  return chat.submit(url, text, {
     temp: num(cfg.settings, "temp"),
     topP: num(cfg.settings, "topP"),
   });
@@ -278,6 +279,7 @@ export function applyOptimal(): void {
  * buttons offer, computed the same way they would run.
  */
 export function maxFor(placement: Placement): Tuning | null {
+  if (placement !== "cpu") return maxTunings()[placement];
   const m = currentModel();
   if (!m?.meta) return null;
   return tune(

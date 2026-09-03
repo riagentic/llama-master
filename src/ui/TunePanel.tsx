@@ -16,10 +16,20 @@ import type { Param } from "../lib/types.ts";
 import { plan as computePlan } from "../lib/plan.ts";
 import { pinnedCtx, PLACEMENTS, trainedCtx } from "../lib/tune.ts";
 import { applyOptimal, currentStability, runLocked } from "./actions.ts";
-import { Empty, ErrorNote, Panel, Pill, Segmented, Toggle } from "./kit.tsx";
+import {
+  DraftInput,
+  Empty,
+  ErrorNote,
+  Panel,
+  Pill,
+  Segmented,
+  Toggle,
+} from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
 import { CtxControls } from "./CtxControls.tsx";
-import { LanSwitch, PrioritySwitch } from "./LanSwitch.tsx";
+import { LanSwitch, PrioritySwitch, ThinkSwitch } from "./LanSwitch.tsx";
+import { SpeedPanel } from "./SpeedPanel.tsx";
+import { QuantAdvice } from "./QuantAdvice.tsx";
 import { ReserveControls } from "./ReserveControls.tsx";
 import { CommandPanel } from "./CommandView.tsx";
 import { SetupPanel } from "./SetupView.tsx";
@@ -88,25 +98,23 @@ export function ParamControl(props: { p: Param }) {
     ? <DevicePicker value={String(value)} p={p} />
     : p.kind === "text"
     ? (
-      <input
+      <DraftInput
         type="text"
-        aria-label={p.label}
+        ariaLabel={p.label}
         placeholder={p.unit ?? ""}
         value={String(value)}
-        onInput={(e) =>
-          cfg.set(p.key, (e.currentTarget as HTMLInputElement).value)}
+        onCommit={(v) => cfg.set(p.key, v)}
       />
     )
     : (
-      <input
+      <DraftInput
         type="number"
-        aria-label={p.label}
+        ariaLabel={p.label}
         min={p.min}
         max={p.max}
         step={p.step ?? (p.kind === "float" ? 0.01 : 1)}
         value={String(value)}
-        onInput={(e) =>
-          cfg.set(p.key, (e.currentTarget as HTMLInputElement).value)}
+        onCommit={(v) => cfg.set(p.key, v)}
       />
     );
 
@@ -293,7 +301,16 @@ export function TunePanel() {
           <Panel title="How it runs" icon="⇄">
             <LanSwitch t="tune-lan" />
             <PrioritySwitch t="tune-prio" />
+            <ThinkSwitch t="tune-think" />
           </Panel>
+          {
+            /* Above the memory plan for the same reason the reserve is: a
+               measurement changes every projected number below it, and a page
+               of estimates with a Measure button at the bottom is a page of
+               estimates. */
+          }
+          <SpeedPanel />
+          <QuantAdvice />
           <Panel
             title="Memory plan"
             icon="▤"

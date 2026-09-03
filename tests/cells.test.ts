@@ -316,8 +316,7 @@ testCell(
 
 testCell(chat, "an empty message is never sent", async (t) => {
   t.init();
-  t.send.setInput("   ");
-  await t.send.send("http://127.0.0.1:1");
+  await t.send.send("http://127.0.0.1:1", "   ");
   t.expect.state((s) => s.messages.length === 0);
   t.expect.state((s) => s.streaming === false);
 });
@@ -327,9 +326,8 @@ testCell(
   "an unreachable server surfaces the error and stops streaming",
   async (t) => {
     t.init();
-    t.send.setInput("hello");
     // Port 1 is reserved and never listening.
-    await t.send.send("http://127.0.0.1:1");
+    await t.send.send("http://127.0.0.1:1", "hello");
     t.expect.state((s) => s.streaming === false);
     t.expect.state((s) => s.lastError.length > 0);
     t.expect.state((s) => s.messages.length === 1);
@@ -372,8 +370,7 @@ testCell(
     const url = `http://127.0.0.1:${(srv.addr as Deno.NetAddr).port}`;
 
     t.init();
-    t.send.setInput("hi");
-    const sent = t.send.send(url);
+    const sent = t.send.send(url, "hi");
     await new Promise((r) => setTimeout(r, 200));
     t.send.stop(); // ← cancelOn aborts the in-flight send
     await sent;
@@ -441,14 +438,11 @@ testCell(
     const srv = slowServer();
     t.init();
 
-    t.send.setInput("first");
-    const first = t.send.send(srv.url);
+    const first = t.send.send(srv.url, "first");
     await new Promise((r) => setTimeout(r, 80)); // mid-reply
-    t.send.setInput("second");
-    await t.send.submit(srv.url);
+    await t.send.submit(srv.url, "second");
     t.expect.state((s) => s.queue.length === 1, "held, not sent");
     t.expect.state((s) => s.queue[0] === "second");
-    t.expect.state((s) => s.input === "", "and the box is cleared");
     t.expect.state(
       (s) => s.streaming === true,
       "the first reply is still live",
@@ -499,11 +493,9 @@ testCell(
     const url = `http://127.0.0.1:${(s.addr as Deno.NetAddr).port}`;
 
     t.init();
-    t.send.setInput("one");
-    const sent = t.send.send(url);
+    const sent = t.send.send(url, "one");
     await new Promise((r) => setTimeout(r, 120));
-    t.send.setInput("two");
-    await t.send.submit(url);
+    await t.send.submit(url, "two");
     t.expect.state((x) => x.queue.length === 1);
     t.send.stop();
     await sent;
@@ -528,11 +520,9 @@ testCell(
     const srv = slowServer({ status: 500 });
     t.init();
 
-    t.send.setInput("one");
-    const first = t.send.send(srv.url);
+    const first = t.send.send(srv.url, "one");
     await new Promise((r) => setTimeout(r, 80));
-    t.send.setInput("two");
-    await t.send.submit(srv.url);
+    await t.send.submit(srv.url, "two");
     await first;
 
     t.expect.state((s) => s.streaming === false);
@@ -549,9 +539,7 @@ testCell(chat, "an idle submit is the request itself", async (t) => {
   // queue never holds it.
   const srv = slowServer({ delayMs: 0 });
   t.init();
-  t.send.setInput("go");
-  await t.send.submit(srv.url);
-  t.expect.state((s) => s.input === "");
+  await t.send.submit(srv.url, "go");
   t.expect.state((s) => s.queue.length === 0);
   t.expect.state((s) => s.messages[0]?.content === "go");
   await srv.close();
@@ -559,8 +547,7 @@ testCell(chat, "an idle submit is the request itself", async (t) => {
 
 testCell(chat, "removing a queued message leaves the rest in order", (t) => {
   t.init();
-  t.send.setInput("a");
-  t.send.submit("http://127.0.0.1:1");
+  t.send.submit("http://127.0.0.1:1", "a");
   t.expect.state((s) => s.messages.length >= 0); // the send is allowed to fail
   t.send.clearQueue();
   t.expect.state((s) => s.queue.length === 0);
@@ -568,7 +555,6 @@ testCell(chat, "removing a queued message leaves the rest in order", (t) => {
 
 testCell(chat, "clear wipes the conversation and the last error", (t) => {
   t.init();
-  t.send.setInput("x");
   t.send.setSystem("be brief");
   t.send.clear();
   t.expect.state((s) => s.messages.length === 0);
@@ -703,7 +689,7 @@ Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
       ) => Record<string, unknown>;
     };
   }).__aio;
-  assertEquals(def?.version, 2, "the shape changed, so the version must have");
+  assertEquals(def?.version, 3, "the shape changed, so the version must have");
   const migrate = def?.onMigrate;
   assert(migrate, "and a version bump with no hook only silences the warning");
   const old = {
@@ -724,7 +710,31 @@ Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
   assertEquals(next.reserveConnectedVramB, 8 * 1024 ** 3);
   assertEquals(next.reservePerGpuVramB, 0);
   assertEquals(next.reserveRamB, 16 * 1024 ** 3, "RAM kept its name and value");
-  // A store already at the current version is left alone.
+  // A store already past that version is left alone.
   const current = migrate({ ...old }, 2);
   assertEquals(current.reserveVramB, 4 * 1024 ** 3);
+});
+
+Deno.test("cfg: v3 drops the two settings whose flags left the catalog", () => {
+  // `noContextShift` became `contextShift` (upstream's default flipped and the
+  // old switch reproduced it in both positions), and `--defrag-thold` is
+  // deprecated upstream — its value is ignored. A stored value for either
+  // would sit in the map forever, shown nowhere and emitted never.
+  const migrate = (cfg as unknown as {
+    __aio: {
+      onMigrate: (
+        s: Record<string, unknown>,
+        from: number,
+      ) => Record<string, unknown>;
+    };
+  }).__aio.onMigrate;
+  const next = migrate({
+    settings: { noContextShift: true, defragThold: 0.2, ctxSize: 8192 },
+    touched: ["noContextShift", "defragThold", "ctxSize"],
+  }, 2);
+  assertEquals(next.settings, { ctxSize: 8192 });
+  assertEquals(next.touched, ["ctxSize"]);
+  // The old default (shift off, as `--no-context-shift` said) and the new
+  // default (`contextShift: false`) run the same server, so nothing is carried.
+  assertEquals("contextShift" in (next.settings as object), false);
 });

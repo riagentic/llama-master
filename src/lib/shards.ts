@@ -118,6 +118,7 @@ export function mergeShards(parts: ModelMeta[]): ModelMeta {
     nLayer: first.nLayer || layers.length,
     nTensors: sum((m) => m.nTensors),
     tensorBytes: sum((m) => m.tensorBytes),
+    params: sum((m) => m.params),
     embdBytes: sum((m) => m.embdBytes),
     outputBytes: sum((m) => m.outputBytes),
     unknownTypes: sum((m) => m.unknownTypes),

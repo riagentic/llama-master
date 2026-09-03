@@ -1,8 +1,8 @@
 {
-  "aioVersion": "v1.0.0-alpha71",
+  "aioVersion": "v1.0.0-alpha75",
   "name": "llama-master",
   "title": "llama.master",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "exports": "./src/app.ts",
   "nodeModulesDir": "auto",
   "compilerOptions": {
@@ -36,7 +36,6 @@
   },
   "tasks": {
     "dev": "deno run -A src/app.ts",
-    "dev:browser": "deno run -A src/app.ts --client=browser",
     "wasm": "deno run -A rust/build.ts",
     "test": "deno test -A tests/",
     "test:rust": "cargo test --quiet --manifest-path rust/Cargo.toml",
@@ -49,7 +48,10 @@
     "install:electron": "deno install --allow-scripts=npm:electron",
     "compile": "deno run -A dep/aio/src/build.ts --compile",
     "compile:electron": "deno run -A dep/aio/src/build.ts --compile --electron",
-    "verify": "deno fmt --check src/ tests/ && deno lint src/ tests/ && deno check src/ tests/ && deno test -A tests/"
+    "verify": "deno fmt --check src/ tests/ && deno lint src/ tests/ && deno check src/ tests/ && deno test -A tests/",
+    "build": "deno run -A ./dep/aio/src/build-all.ts --build-spec=./dep/aio/src/build.ts",
+    "publish": "deno run -A ./dep/aio/src/am.ts publish",
+    "ship": "deno run -A ./dep/aio/src/build/ship.ts"
   },
   "fmt": {
     "exclude": [
@@ -65,6 +67,12 @@
       "dist/",
       "rust/",
       "node_modules/"
+    ]
+  },
+  "build": {
+    "targets": [
+      "browser",
+      "electron"
     ]
   }
 }

@@ -5,6 +5,7 @@
 // headers (llama-3 8B Q4_K_M, a 32B dense, and a Mixtral-shaped MoE).
 
 import type { Gpu, Hw, LayerBytes, ModelMeta } from "../src/lib/types.ts";
+import { typicalBpw } from "../src/lib/quant.ts";
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
@@ -50,6 +51,7 @@ export function meta(over: Partial<ModelMeta> = {}): ModelMeta {
     ropeFreqBase: 500000,
     nTensors: 291,
     tensorBytes: 0,
+    params: 0,
     embdBytes: 300 * MB,
     outputBytes: 300 * MB,
     unknownTypes: 0,
@@ -63,6 +65,13 @@ export function meta(over: Partial<ModelMeta> = {}): ModelMeta {
   const m = { ...base, ...over };
   m.tensorBytes = m.layers.reduce((a, l) => a + l.bytes, 0) + m.embdBytes +
     m.outputBytes;
+  // Weights and weight COUNT have to agree, or `src/lib/quant.ts` — which
+  // divides one by the other to get this file's real bits per weight — reads
+  // a healthy fixture as a corrupt file. Derived from the label rather than
+  // typed in, so the two cannot drift apart when a fixture changes size.
+  if (!over.params) {
+    m.params = Math.round((m.tensorBytes * 8) / (typicalBpw(m.quant) || 4.85));
+  }
   return m;
 }
 

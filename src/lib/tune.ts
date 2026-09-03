@@ -655,6 +655,27 @@ export function tune(
         meta.nextnLayers === 1 ? "" : "s"
       }, so it drafts ahead and verifies against itself. Output is identical; only the speed changes.`,
     );
+  } else {
+    // Deliberately NOT switched on, and deliberately not silent either.
+    //
+    // The `ngram-*` kinds need no second model and no MTP block, so unlike
+    // `draft-mtp` they are available to every model here — and they are
+    // lossless in the same way, because the full model verifies every drafted
+    // token. What they are not is free: a draft that is rejected is work
+    // thrown away, so they pay on output that repeats itself (code, edits,
+    // structured text) and cost a little on prose that does not.
+    //
+    // This app does not turn on things it has not measured — that rule is why
+    // the KV cache is only quantised where a kernel exists and why the
+    // residency anchor has a measured slack. Nothing here can know what the
+    // user is about to ask the model to write, and the difference is a real
+    // percentage in both directions. So the tuner names the option, says what
+    // decides it, and points at the one thing that settles it: the Speed
+    // panel, which measures this machine on this model in about fifteen
+    // seconds. A guess would have been faster to write and worse to run.
+    reasons.push(
+      "Speculative decoding is off — this model ships no multi-token-prediction block, so there is nothing to draft with for free. The n-gram kinds under Speculative decoding work on any model and are lossless; they pay off on repetitive output like code and cost a little on prose. Measure before and after with the Speed panel rather than taking either on trust.",
+    );
   }
 
   const quantKvOk = hw.backend !== undefined &&

@@ -10,6 +10,7 @@
 
 import type { Cpu, Gpu, Mem } from "../lib/types.ts";
 import { exec, PLATFORM } from "./host.server.ts";
+import type { Exec } from "./host.server.ts";
 
 // Re-exported so the cell can stamp them into state without importing the
 // host module twice.
@@ -194,6 +195,24 @@ const NVIDIA_QUERY = [
  * GPU". `[N/A]` — an older driver, a non-display card — is `undefined`, which
  * `src/lib/reserve.ts:displayGpus` treats as "not known", not as "no".
  */
+/** Remembered absence: `nvidia-smi` missing is a fact about the machine, and
+ *  spawning a process every second to be told so again is a spawn per second
+ *  on every AMD, Intel and Apple box. Re-asked after a minute, so a driver
+ *  installed mid-session is noticed without a restart. */
+let nvidiaAbsentUntil = 0;
+
+/** Every `nvidia-smi` call goes through here: absence is cached, and the call
+ *  has a ceiling — a wedged one (after suspend, typically) used to block the
+ *  1 s refresh forever. */
+async function nvidiaSmi(args: string[]): Promise<Exec> {
+  if (Date.now() < nvidiaAbsentUntil) {
+    return { code: 127, stdout: "", stderr: "nvidia-smi: not found" };
+  }
+  const r = await exec("nvidia-smi", args, { timeoutMs: 5_000 });
+  if (r.code === 127) nvidiaAbsentUntil = Date.now() + 60_000;
+  return r;
+}
+
 async function nvidiaDisplays(): Promise<(boolean | undefined)[]> {
   // Cached, because `snapshot()` runs every second and this one does not
   // change on that cadence — a monitor gets plugged in about as often as a
@@ -203,7 +222,7 @@ async function nvidiaDisplays(): Promise<(boolean | undefined)[]> {
   if (nvDisplayCache && now - nvDisplayCache.at < DISPLAY_TTL_MS) {
     return nvDisplayCache.v;
   }
-  const r = await exec("nvidia-smi", [
+  const r = await nvidiaSmi([
     "--query-gpu=display_mode,display_active",
     "--format=csv,noheader",
   ]);
@@ -320,7 +339,7 @@ export function lanAddresses(): string[] {
 
 export async function gpus(): Promise<Gpu[]> {
   const [nv, nvDisplays, amd] = await Promise.all([
-    exec("nvidia-smi", NVIDIA_QUERY),
+    nvidiaSmi(NVIDIA_QUERY),
     nvidiaDisplays(),
     PLATFORM === "linux"
       ? amdSysfs()

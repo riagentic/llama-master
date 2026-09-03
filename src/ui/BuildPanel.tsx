@@ -5,12 +5,15 @@
 // minutes. The panel says which one is available before the user commits.
 
 import { builds } from "../cell/builds.ts";
+import { useLocal } from "aio/air";
+import { parsePrList, parseRef, refPrs } from "../lib/srcref.ts";
 import { hw } from "../cell/hw.ts";
 import { availableBackends, pickAsset } from "../lib/assets.ts";
 import { SCHED_SPLIT_CAP, targetReadiness } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
 import { bytes, duration, stamp } from "../lib/format.ts";
 import {
+  DraftInput,
   Empty,
   ErrorNote,
   JobProgress,
@@ -55,6 +58,13 @@ function Chooser() {
     availableBackends: available,
     assetCount: assets.length,
     explain: (id) => prereqById(id)?.why,
+    // A pull request has no prebuilt download, so the release route must
+    // refuse it BEFORE the button is enabled — the same promise this function
+    // makes about a missing toolchain.
+    ...(() => {
+      const r = parseRef(builds.ref);
+      return r.kind === "pr" ? { pr: r.pr } : {};
+    })(),
   });
   const canBuild = ready.ok;
 
@@ -113,6 +123,8 @@ function Chooser() {
         </div>
       </div>
 
+      <PrPicker />
+
       <div class="field-row">
         <label>Backend</label>
         <Segmented
@@ -127,16 +139,13 @@ function Chooser() {
           <div class="field-row">
             <label>Compile</label>
             <div class="field-inline">
-              <input
+              <DraftInput
                 type="number"
                 min="0"
                 max="512"
-                aria-label="Parallel jobs"
+                ariaLabel="Parallel jobs"
                 value={String(builds.jobs)}
-                onInput={(e) =>
-                  builds.setJobs(
-                    Number((e.currentTarget as HTMLInputElement).value),
-                  )}
+                onCommit={(v) => builds.setJobs(Number(v))}
               />
               <span
                 class="unit"
@@ -361,6 +370,157 @@ function Installed() {
           </table>
         )}
     </Panel>
+  );
+}
+
+/**
+ * Build a pull request, on top of current master.
+ *
+ * The interesting models arrive as pull requests months before they merge, and
+ * until now the only way to run one was to download its tarball by hand into
+ * the source cache — which works once and then rots, because the next build
+ * reuses it under a name that no longer describes it.
+ *
+ * GitHub publishes every PR already merged into master as its own ref
+ * (`src/lib/srcref.ts`), so this is one number and a download. What the box
+ * accepts is deliberately wide: people arrive here from a browser, so the URL
+ * they copied is the commonest input and "#27754" is the second.
+ *
+ * Two things it must say out loud. The build is dated, because "master + PR"
+ * means something different tomorrow. And a PR that has stopped merging is
+ * REPORTED rather than attempted — GitHub withdraws the merged ref when the
+ * branch and master disagree, and finding that out after a twenty-minute
+ * compile is the experience this app exists to prevent.
+ */
+function PrPicker() {
+  const cur = parseRef(builds.ref);
+  const on = cur.kind === "pr" || cur.kind === "stack";
+  const [text, setText] = useLocal("");
+  // One box for one pull request and for five: "27773, 28136, 27269" is how
+  // people write a list, and three fields would be three chances to get the
+  // ORDER wrong — which is load-bearing, because merging A then B is not
+  // merging B then A when they touch the same lines.
+  const typed = parsePrList(text);
+  const apply = () => {
+    if (typed.length === 1) builds.setPr(typed[0]!, "merge");
+    else if (typed.length > 1) builds.setPrs(typed);
+  };
+  const prs = refPrs(cur);
+  return (
+    <div class="field-row">
+      <label>Pull request</label>
+      <div class="pr-picker">
+        <div class="field-inline">
+          <input
+            type="text"
+            class="pr-input"
+            t="pr-number"
+            aria-label="Pull request number or URL"
+            placeholder="numbers or URLs, e.g. 27773, 28136, 27269"
+            value={text}
+            onInput={(e) =>
+              setText((e.currentTarget as HTMLInputElement).value)}
+            onKeyDown={(e) => {
+              if ((e as KeyboardEvent).key !== "Enter") return;
+              (e as KeyboardEvent).preventDefault();
+              apply();
+            }}
+          />
+          <button
+            type="button"
+            class="btn small primary"
+            t="pr-use"
+            disabled={typed.length === 0}
+            title={typed.length === 0
+              ? "Type a pull request number, or paste its URL"
+              : typed.length === 1
+              ? `Build llama.cpp master with pull request #${
+                typed[0]
+              } merged into it`
+              : `Build llama.cpp master with pull requests ${
+                typed.map((n) => `#${n}`).join(", ")
+              } merged into it, in that order`}
+            onClick={() => apply()}
+          >
+            {typed.length > 1
+              ? `Use ${typed.length} with master`
+              : "Use with master"}
+          </button>
+          {on
+            ? (
+              <button
+                type="button"
+                class="btn small"
+                t="pr-clear"
+                title="Go back to building a plain version"
+                onClick={() => builds.setRef("master")}
+              >
+                Clear
+              </button>
+            )
+            : null}
+        </div>
+        {on
+          ? (
+            <div class="pr-note" t="pr-note">
+              <span class="pr-what">
+                {cur.kind === "stack"
+                  ? `Building master with ${
+                    prs.map((n) => `#${n}`).join(", ")
+                  } merged into it, in that order. More than one pull request cannot be merged by GitHub, so this one is assembled here and needs git.`
+                  : cur.kind === "pr" && cur.mode === "head"
+                  ? `Building pull request #${
+                    prs[0]
+                  } on its own — the author's branch, without master's recent changes.`
+                  : `Building master with pull request #${
+                    prs[0]
+                  } merged into it.`}
+              </span>
+              {builds.prTitle
+                ? <span class="pr-title">{builds.prTitle}</span>
+                : null}
+              <span class="pr-dated">
+                A pull request build is dated: this is master as it stands
+                today, and rebuilding next week gives you a different one.
+                Existing builds are kept, so nothing you already have is lost.
+              </span>
+              {
+                /* A pull request that has LANDED turns its own ref into an
+                   older master — the trap that arrives on a good day. Said
+                   here, with the answer, which is always "build master". */
+              }
+              {builds.prNotes.map((n) => (
+                <span class="pr-merged" key={n} t="pr-merged">{n}</span>
+              ))}
+              {cur.kind === "pr" && cur.mode === "merge"
+                ? (
+                  <button
+                    type="button"
+                    class="btn tiny"
+                    t="pr-head"
+                    title="Use the author's branch alone. The escape hatch when a pull request no longer merges into master."
+                    onClick={() => builds.setPr(cur.pr, "head")}
+                  >
+                    Use the branch alone instead
+                  </button>
+                )
+                : cur.kind === "pr"
+                ? (
+                  <button
+                    type="button"
+                    class="btn tiny"
+                    t="pr-merge"
+                    onClick={() => builds.setPr(cur.pr, "merge")}
+                  >
+                    Try merging with master again
+                  </button>
+                )
+                : null}
+            </div>
+          )
+          : null}
+      </div>
+    </div>
   );
 }
 

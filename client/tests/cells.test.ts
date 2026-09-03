@@ -173,8 +173,7 @@ Deno.test("chat: a reply streams in, is committed once, and carries its rate", a
   using _boot = await bootCells([chat]);
   try {
     await chat.clear();
-    await chat.setInput("hi");
-    await chat.send(stub.url);
+    await chat.send(stub.url, "hi");
     assertEquals(chat.streaming, false);
     assertEquals(chat.messages.length, 2);
     assertEquals(chat.messages[1]?.content, "Hello LAN");
@@ -197,8 +196,7 @@ Deno.test("chat: a server that vanishes mid-conversation explains itself", async
   await stub.close();
   using _boot = await bootCells([chat]);
   await chat.clear();
-  await chat.setInput("are you there");
-  await chat.send(url);
+  await chat.send(url, "are you there");
   assertEquals(chat.streaming, false);
   assert(chat.lastError.length > 0);
   assertStringIncludes(chat.lastError, "Discover");
@@ -212,8 +210,7 @@ Deno.test("chat: clear wipes the conversation and the numbers with it", async ()
   const stub = stubServer();
   using _boot = await bootCells([chat]);
   try {
-    await chat.setInput("hi");
-    await chat.send(stub.url);
+    await chat.send(stub.url, "hi");
     assert(chat.messages.length > 0 && chat.lastTps > 0);
     await chat.clear();
     assertEquals(chat.messages.length, 0);
@@ -287,13 +284,10 @@ testCell(
     const stub = stubServer({ delayMs: 60 });
     t.init();
 
-    t.send.setInput("first");
-    const first = t.send.send(stub.url);
+    const first = t.send.send(stub.url, "first");
     await new Promise((r) => setTimeout(r, 80)); // mid-reply
-    t.send.setInput("second");
-    await t.send.submit(stub.url);
+    await t.send.submit(stub.url, "second");
     t.expect.state((s) => s.queue.length === 1, "held, not sent");
-    t.expect.state((s) => s.input === "", "and the box is cleared");
     t.expect.state((s) => s.streaming === true);
 
     await first;
@@ -315,11 +309,9 @@ testCell(
     const stub = stubServer({ delayMs: 3_000 });
     t.init();
 
-    t.send.setInput("one");
-    const sent = t.send.send(stub.url);
+    const sent = t.send.send(stub.url, "one");
     await new Promise((r) => setTimeout(r, 120));
-    t.send.setInput("two");
-    await t.send.submit(stub.url);
+    await t.send.submit(stub.url, "two");
     t.send.stop();
     await sent;
 
@@ -340,11 +332,9 @@ testCell(
     const stub = stubServer({ delayMs: 60 });
     t.init();
 
-    t.send.setInput("one");
-    const first = t.send.send(stub.url);
+    const first = t.send.send(stub.url, "one");
     await new Promise((r) => setTimeout(r, 80));
-    t.send.setInput("two");
-    await t.send.submit(stub.url);
+    await t.send.submit(stub.url, "two");
     await stub.close(); // the far end disappears mid-reply
     await first;
 
@@ -357,9 +347,7 @@ testCell(
 testCell(chat, "an idle submit is the request itself", async (t) => {
   const stub = stubServer();
   t.init();
-  t.send.setInput("go");
-  await t.send.submit(stub.url);
-  t.expect.state((s) => s.input === "");
+  await t.send.submit(stub.url, "go");
   t.expect.state((s) => s.queue.length === 0);
   t.expect.state((s) => s.messages[0]?.content === "go");
   await stub.close();

@@ -136,7 +136,6 @@ testUI(
       assertEquals(ui_.App.message.disabled, false, "now it can be used");
 
       ui_.App.message.setValue("fix it");
-      await ui_.expectCell(chat, (s) => s.input === "fix it");
       ui_.App.send.click();
       // The code itself is no longer one string in the DOM — it is coloured,
       // token by token (`src/lib/highlight.ts`), which is the point.
@@ -188,7 +187,6 @@ testUI(App, "a reply cut short keeps what arrived", async (ui_) => {
     await ui_.expectCell(conn, (s) => s.status === "connected");
     await conn.poll();
     ui_.App.message.setValue("go");
-    await ui_.expectCell(chat, (s) => s.input === "go");
     ui_.App.send.click();
     await ui_.waitFor(() => ui_.html().includes("half an ans"));
     await ui_.settle();
@@ -282,7 +280,6 @@ testUI(App, "every finished message can be copied on its own", async (ui_) => {
     await ui_.expectCell(conn, (s) => s.status === "connected");
     await conn.poll();
     ui_.App.message.setValue("ask");
-    await ui_.expectCell(chat, (s) => s.input === "ask");
     ui_.App.send.click();
     await ui_.waitFor(() => ui_.html().includes("a whole answer, verbatim"));
     await ui_.settle();
@@ -327,7 +324,6 @@ testUI(
       await ui_.settle();
 
       ui_.App.message.setValue("first");
-      await ui_.expectCell(chat, (s) => s.input === "first");
       ui_.App.send.click();
       await ui_.expectCell(chat, (s) => s.streaming);
 
@@ -338,7 +334,6 @@ testUI(
         "the input is closed during a reply — that is the bug this fixes",
       );
       ui_.App.message.setValue("second, while it is busy");
-      await ui_.expectCell(chat, (s) => s.input === "second, while it is busy");
       ui_.App.send.click();
       await ui_.expectCell(chat, (s) => s.queue.length === 1);
 
@@ -350,7 +345,11 @@ testUI(
         "this reply finishes",
         "with what will collect it — a queue nothing is coming for reads stuck",
       );
-      assertEquals(chat.input, "", "and the box is ready for the next thought");
+      assertEquals(
+        ui_.App.message.value,
+        "",
+        "and the box is ready for the next thought",
+      );
 
       // Then it sends itself, in order, with no further gesture. Two whole
       // turns of a deliberately slow stream, so the wait is given a ceiling

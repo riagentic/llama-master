@@ -108,8 +108,32 @@ export function targetReadiness(
      *  use than "needs the ROCm toolchain", and detection already worked it
      *  out — this is how that reaches the banner. */
     explain?: (id: string) => string | undefined;
+    /** The ref being targeted, when it is a pull request. Only the source
+     *  route can produce one, and saying so early is the whole job here. */
+    pr?: number;
   },
 ): { ok: boolean; diagnosis: Diagnosis | null; pending: boolean } {
+  // A pull request has no prebuilt binaries — nobody publishes releases for
+  // unmerged code — so the release route cannot serve it at any backend. This
+  // is the same promise the rest of this function makes, one step earlier:
+  // answer before the button is pressed, never after a download fails.
+  if (origin === "release" && ctx.pr) {
+    return {
+      ok: false,
+      pending: false,
+      diagnosis: {
+        reason:
+          `Pull request #${ctx.pr} has no prebuilt download — releases are published for merged code only.`,
+        steps: [
+          {
+            text:
+              "Build it from source instead. That is the only way to run a pull request, and it is what the source route is for.",
+            action: { kind: "switch-origin" as const, to: "source" as const },
+          },
+        ],
+      },
+    };
+  }
   if (origin === "source") {
     const r = canCompile(backend, ctx.found, ctx.platform);
     if (r.ok) return { ok: true, diagnosis: null, pending: false };
