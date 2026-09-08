@@ -20,7 +20,7 @@ import {
 } from "@std/assert";
 import { join } from "@std/path";
 import type { Settings } from "../src/lib/types.ts";
-import { BENCH_TOKENS } from "../src/lib/bench.ts";
+import { BENCH_TOKENS, specVerdict } from "../src/lib/bench.ts";
 import { defaults as paramDefaults } from "../src/lib/params.ts";
 
 // Point the app home at a temp dir BEFORE anything resolves paths: `start()`
@@ -666,6 +666,60 @@ Deno.test({
       settings: { ...DEFAULTS, ctxSize: 4096 },
     });
     assertEquals(srv.lastBench.at, 0, "a new run starts unmeasured");
+    await srv.stop();
+  },
+});
+
+Deno.test({
+  name:
+    "srv: the pair measures both prompts and the verdict reads them together",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // The whole point of two runs: one rate cannot say whether speculative
+    // decoding is worth having, because the gain depends entirely on what the
+    // model is asked to write. The stub's `--drafting` doubles the rate on the
+    // code prompt only, which is the shape a real drafter produces.
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv]);
+    await srv.start(
+      [bin, "-m", "/m.gguf", "--port", String(port), "--drafting"],
+      url,
+      {
+        model: "/m.gguf",
+        settings: { ...DEFAULTS, ctxSize: 4096, specType: "draft-mtp" },
+      },
+    );
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.status === "ready";
+    }, "the stub to come up");
+
+    await srv.benchBoth();
+    assertEquals(srv.benchError, "");
+    assertEquals(srv.benching, false);
+    // Two slots, each holding the prompt it was measured with. One slot would
+    // have let the second run silently overwrite the first.
+    assertEquals(srv.lastBench.kind, "prose");
+    assertEquals(srv.lastBenchCode.kind, "code");
+    assertEquals(srv.lastBench.genTps, 37.25, "prose is the undrafted rate");
+    assertEquals(srv.lastBenchCode.genTps, 74.5, "code is where it pays");
+
+    const v = specVerdict(srv.lastBench, srv.lastBenchCode, "draft-mtp");
+    assertEquals(v?.tone, "ok");
+    assertStringIncludes(v!.headline, "2.00x");
+
+    // A new run starts unmeasured on BOTH slots — a rate from another process
+    // beside this one is exactly what `benchApplies` exists to prevent.
+    await srv.stop();
+    await srv.start([bin, "-m", "/m.gguf", "--port", String(port)], url, {
+      model: "/m.gguf",
+      settings: { ...DEFAULTS, ctxSize: 4096 },
+    });
+    assertEquals(srv.lastBench.at, 0);
+    assertEquals(srv.lastBenchCode.at, 0);
     await srv.stop();
   },
 });

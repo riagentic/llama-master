@@ -221,7 +221,7 @@ export const PARAMS: readonly Param[] = [
     max: 16,
     advanced: true,
     tip:
-      "How many tokens to draft per step. More is faster when the drafts are accepted and slower when they are not, because a rejected draft is work thrown away. 0 leaves llama.cpp's default (3).",
+      "How many tokens to draft per step. More is faster when the drafts are accepted and slower when they are not, because a rejected draft is work thrown away. 0 leaves llama.cpp's default (3). Model authors publishing an MTP block usually name a figure for it — 4 is the published value for the Gemma 4 heads — and it is worth measuring with the Speed panel rather than assuming either.",
   },
   {
     key: "specDraftNMin",
@@ -236,6 +236,46 @@ export const PARAMS: readonly Param[] = [
     advanced: true,
     tip:
       "Stop drafting below this many tokens rather than pay the overhead for a very short run. 0 leaves llama.cpp's default.",
+  },
+  {
+    // ── Why this is here, and why the tuner will not switch it on ──────────
+    //
+    // Sampling — turning the model's output row into the next token — normally
+    // happens on the CPU, which means the logits are copied off the GPU every
+    // single token. On a large vocabulary that is megabytes per token, and the
+    // bytes are the smaller half of the cost: the copy is a SYNCHRONISATION
+    // POINT, so the device stops and waits in the middle of the hot loop.
+    // `-bs` keeps the whole step on the backend and removes the wait.
+    //
+    // It is off upstream and marked experimental, and llama-server still drops
+    // it silently in three situations — the flag stays on the command line and
+    // simply does nothing:
+    //
+    //   1. a grammar or JSON schema is in use (warns in the log)
+    //   2. a reasoning budget is set (warns in the log)
+    //   3. the request asked for logprobs before sampling
+    //
+    // A FOURTH used to be here and is worth remembering, because getting it
+    // wrong cost a round of this work: until some point between 2026-07-27 and
+    // 2026-09-07, `server-context.cpp` also did
+    // `backend_sampling &= !(slot.can_speculate())` — "requires multiple
+    // samples per batch - not supported yet" — so the flag did nothing whenever
+    // a drafter was attached. That line is GONE from master, and `-bs` now
+    // stacks with speculative decoding, which is the combination worth having:
+    // drafting makes tokens cheaper to produce and this makes each one cheaper
+    // to collect. The lesson is in CLAUDE.md — the local source cache is
+    // whatever the last build fetched, not what upstream does today.
+    key: "backendSampling",
+    flag: "-bs",
+    label: "Sample on the GPU",
+    kind: "bool",
+    group: "performance",
+    scope: "both",
+    def: false,
+    llamaDef: false,
+    advanced: true,
+    tip:
+      "Pick the next token on the GPU instead of copying the model's output row back to the CPU every token. The copy is megabytes per token on a large vocabulary, and worse than its size: it stalls the GPU mid-loop. It stacks with speculative decoding — drafting makes each token cheaper to produce, this makes each one cheaper to collect. Experimental upstream, and llama.cpp turns it off by itself, with a warning in the log, when a grammar, a JSON schema or a reasoning budget is in use. Measure it with the Speed panel: it needs a restart, so run the pair before and after.",
   },
   {
     key: "overrideTensor",

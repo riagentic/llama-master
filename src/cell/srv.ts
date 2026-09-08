@@ -21,7 +21,7 @@ import {
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
 import { benchRequest, EMPTY_BENCH, parseBench } from "../lib/bench.ts";
-import type { BenchResult } from "../lib/bench.ts";
+import type { BenchKind, BenchResult } from "../lib/bench.ts";
 
 export type ServerStatus =
   | "stopped"
@@ -136,7 +136,20 @@ export type SrvState = {
    *  (aio refuses the cell at `cell()` time, and it is right to — reading
    *  `srv.bench` in a component would hand back the function). */
   lastBench: BenchResult;
+  /** The same measurement on a CODE prompt, kept in its own slot.
+   *
+   *  Two slots rather than one, because the pair IS the result. Speculative
+   *  decoding is worth 1.5-3x on output that repeats itself and close to
+   *  nothing on prose, so a single rate cannot answer "is it worth turning on"
+   *  — it can only answer it for whichever prompt happened to run. Prose stays
+   *  the calibration (`speedCalFromLastReply`): a drafted token is not a token
+   *  the memory bus paid for, so calibrating bandwidth off accepted drafts
+   *  would report a machine several times faster than it is. */
+  lastBenchCode: BenchResult;
   benching: boolean;
+  /** Which prompt is in flight, so the button can say so rather than showing a
+   *  generic "Measuring…" through two runs that take a minute together. */
+  benchKind: BenchKind;
   benchError: string;
 };
 
@@ -149,6 +162,76 @@ export type SrvState = {
  * a measured fit off a probe that did not finish (`src/lib/fitladder.ts`).
  */
 const PROBE_PATIENCE = 2;
+
+/**
+ * One bench run, shared by `bench` and `benchBoth`.
+ *
+ * Module-level rather than a method calling a sibling method: a cell method's
+ * first argument is the state draft the runtime supplies, so `this.bench(kind)`
+ * does not type-check and `srv.bench(kind)` from inside the cell would be a
+ * second dispatch with its own draft — two commits where the caller wanted one
+ * sequence. A plain function over the draft it was handed is both simpler and
+ * the only version that keeps `benchBoth`'s two runs on the same state.
+ */
+async function runBench(
+  s: SrvState,
+  kind: BenchKind,
+  tokens?: number,
+): Promise<void> {
+  if (s.benching) return;
+  if (s.status !== "ready" || !s.url) {
+    s.benchError = "Nothing is running to measure — start the server first.";
+    return;
+  }
+  s.benching = true;
+  s.benchKind = kind;
+  s.benchError = "";
+  // Captured BEFORE the await: these methods have `transaction: false`, so
+  // every read after the await sees whatever else committed meanwhile, and a
+  // bench must describe the run it started against or nothing at all.
+  const url = s.url;
+  const modelPath = s.runModel;
+  const ctx = Number(s.runSettings?.ctxSize ?? 0) || 0;
+  const pid = s.pid;
+  try {
+    const io = await import("./srv.server.ts");
+    const r = await io.bench(url, benchRequest(kind, tokens));
+    // The run it measured has to still be the run on screen. A stop or a
+    // fit-ladder rung during those seconds replaces the process, and a
+    // measurement of the dead one shown beside the live one is worse than no
+    // measurement.
+    if (s.pid !== pid || s.status !== "ready") {
+      s.benchError =
+        "The server changed while measuring, so the result was discarded.";
+      return;
+    }
+    if (!r.ok) {
+      s.benchError = r.detail;
+      return;
+    }
+    const parsed = parseBench(r.json, {
+      kind,
+      latencyMs: r.latencyMs,
+      ctx,
+      modelPath,
+      at: Date.now(),
+    });
+    if (!parsed) {
+      // A build too old to report `timings`, or a model that stopped before
+      // generating. Neither is a slow machine, and writing 0 tok/s would say
+      // it was.
+      s.benchError =
+        "The server answered but reported no timings — this build is too old to measure, or the model stopped before generating.";
+      return;
+    }
+    if (kind === "code") s.lastBenchCode = parsed;
+    else s.lastBench = parsed;
+  } catch (e) {
+    s.benchError = String(e);
+  } finally {
+    s.benching = false;
+  }
+}
 
 /** The `own` slot a server process lives in. One per pid, never shared — see
  *  the note at `start`. */
@@ -188,7 +271,7 @@ export const srv = cell("srv", {
   // of it can be minutes. A ceiling here would abandon a measurement that is
   // still running and report a fault for a machine that is merely slow —
   // which is the number the bench exists to find out.
-  long: ["start", "bench"],
+  long: ["start", "bench", "benchBoth"],
   // A process cannot survive a restart of this app, so persisting its state
   // would only ever restore a lie.
   persist: "none",
@@ -225,7 +308,9 @@ export const srv = cell("srv", {
     fitNote: "",
     unsupported: [] as string[],
     lastBench: EMPTY_BENCH as BenchResult,
+    lastBenchCode: { ...EMPTY_BENCH, kind: "code" } as BenchResult,
     benching: false,
+    benchKind: "prose" as BenchKind,
     benchError: "",
   } as SrvState,
   methods: {
@@ -243,58 +328,36 @@ export const srv = cell("srv", {
      * timing out against a closed port, because "not running" is an answer and
      * a stack trace is not.
      */
-    async bench(s, tokens?: number) {
+    async bench(s, kind: BenchKind = "prose", tokens?: number) {
+      await runBench(s, kind, tokens);
+    },
+
+    /**
+     * Run BOTH prompts, prose first, against the same loaded server.
+     *
+     * The pair is the product, not two conveniences on one button: with
+     * drafting off the two rates land within a couple of percent of each other,
+     * because a byte of weights costs the same to read whatever the text is
+     * about. That makes prose a self-calibrating baseline, and the gap that
+     * opens on code when a drafter is attached is the drafter's acceptance
+     * rate, measured on this machine rather than quoted from someone else's.
+     *
+     * Sequential on purpose. Two generations in flight share the same server,
+     * and llama.cpp would interleave them across slots — each would then be
+     * measuring a machine that is busy doing the other one, which is a rate
+     * about nothing. It costs twice as long and is the only honest way to run
+     * it.
+     */
+    async benchBoth(s, tokens?: number) {
       if (s.benching) return;
-      if (s.status !== "ready" || !s.url) {
-        s.benchError =
-          "Nothing is running to measure — start the server first.";
-        return;
-      }
-      s.benching = true;
-      s.benchError = "";
-      // Captured BEFORE the await: this method has `transaction: false`, so
-      // every read after the await sees whatever else committed meanwhile, and
-      // a bench must describe the run it started against or nothing at all.
-      const url = s.url;
-      const modelPath = s.runModel;
-      const ctx = Number(s.runSettings?.ctxSize ?? 0) || 0;
-      const pid = s.pid;
-      try {
-        const io = await import("./srv.server.ts");
-        const r = await io.bench(url, benchRequest(tokens));
-        // The run it measured has to still be the run on screen. A stop or a
-        // fit-ladder rung during those seconds replaces the process, and a
-        // measurement of the dead one shown beside the live one is worse than
-        // no measurement.
-        if (s.pid !== pid || s.status !== "ready") { // aiol-ok: deliberate re-read — see above
-          s.benchError =
-            "The server changed while measuring, so the result was discarded.";
-          return;
-        }
-        if (!r.ok) {
-          s.benchError = r.detail;
-          return;
-        }
-        const parsed = parseBench(r.json, {
-          latencyMs: r.latencyMs,
-          ctx,
-          modelPath,
-          at: Date.now(),
-        });
-        if (!parsed) {
-          // A build too old to report `timings`, or a model that stopped
-          // before generating. Neither is a slow machine, and writing 0 tok/s
-          // would say it was.
-          s.benchError =
-            "The server answered but reported no timings — this build is too old to measure, or the model stopped before generating.";
-          return;
-        }
-        s.lastBench = parsed;
-      } catch (e) {
-        s.benchError = String(e);
-      } finally {
-        s.benching = false;
-      }
+      // Both dispatches go through `bench`, which re-checks liveness and
+      // discards a result whose process changed underneath it. If the first
+      // run fails, the second is not attempted: a code rate with no prose
+      // rate beside it is exactly the number this pair exists to avoid
+      // publishing on its own.
+      await runBench(s, "prose", tokens);
+      if (s.benchError) return; // aiol-ok: deliberate re-read after await
+      await runBench(s, "code", tokens);
     },
 
     /** Spawn llama-server with the exact command shown in the UI.
@@ -359,6 +422,7 @@ export const srv = cell("srv", {
       // forward would put a rate measured on a different run beside this one
       // and call it this machine's speed.
       s.lastBench = EMPTY_BENCH;
+      s.lastBenchCode = { ...EMPTY_BENCH, kind: "code" };
       s.benchError = "";
       s.log = [];
       s.diagnosis = null;

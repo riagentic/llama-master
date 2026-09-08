@@ -16,7 +16,7 @@ import {
   assertExists,
   assertStringIncludes,
 } from "@std/assert";
-import { testUI } from "aio/testing";
+import { bootCells, testUI } from "aio/testing";
 import { join } from "@std/path";
 
 // One throwaway app home for the whole file. It has to be set before anything
@@ -33,6 +33,7 @@ import { TunePanel } from "../src/ui/TunePanel.tsx";
 import { BuildPanel } from "../src/ui/BuildPanel.tsx";
 import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
+import { SpeedPanel } from "../src/ui/SpeedPanel.tsx";
 import { ChatPanel } from "../src/ui/ChatPanel.tsx";
 import {
   CTX_BANDS,
@@ -3377,3 +3378,101 @@ testUI(
     await builds.setRef("master");
   },
 );
+
+// The panel is mounted directly rather than reached through the rail: `ui.tab`
+// is persisted and rehydrates asynchronously, so navigating to it first is a
+// ~40% flake that has nothing to do with what is being tested.
+testUI(
+  SpeedPanel,
+  "the speed panel measures both prompts, and says so",
+  (ui_) => {
+    const html = ui_.html();
+    // Nothing running: the button is dead and the panel says what it is for.
+    assertEquals(ui_.SpeedPanel["speed-run"].disabled, true);
+    assertStringIncludes(html, "Start the server first");
+    assertStringIncludes(html, "not measured");
+    // The offer has to name BOTH prompts before it is pressed. A button labelled
+    // "Measure speed" that quietly takes twice as long is the kind of surprise
+    // this app spends its comments avoiding.
+    assertStringIncludes(html, "once on prose, once on code");
+    assertStringIncludes(
+      html,
+      "whether speculative decoding is earning its place",
+    );
+  },
+);
+
+// ── the capability probe ──────────────────────────────────────────────────
+//
+// The first setting the tuner turns on that an OLDER binary would refuse
+// outright. Every other default is one a stale build can safely ignore, so this
+// is the first time the app has had to know what a build understands — and a
+// version string cannot tell it (a PR stack has no version that means
+// anything). So the binary is asked, once, and the answer is kept.
+
+Deno.test({
+  name: "builds: a build is asked which flags it knows, and the answer sticks",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    await installStubBuild("caps-new");
+    // An OLD llama.cpp: a binary whose help text simply has no `-bs` in it.
+    // Written as its own tiny executable rather than a flag on the stub,
+    // because `probeCaps` runs `<bin> --help` and nothing else — which is the
+    // point, and a test that could pass extra arguments would not be testing
+    // the thing the app actually does.
+    const { paths: p2 } = await import("../src/cell/host.server.ts");
+    const oldDir = join(p2().builds, "caps-old");
+    await installStubBuild("caps-old");
+    await Deno.writeTextFile(
+      join(oldDir, "llama-server"),
+      "#!/bin/sh\nprintf '%s\\n' " +
+        "'-h,    --help                          print usage and exit' " +
+        "'-ngl,  --gpu-layers N                  layers to store in VRAM' " +
+        "'-c,    --ctx-size N                    size of the prompt context'\n",
+    );
+    await Deno.chmod(join(oldDir, "llama-server"), 0o755);
+    try {
+      using _boot = await bootCells([builds]);
+      await builds.scan();
+
+      await builds.setActive("caps-new");
+      const caps = builds.caps["caps-new"];
+      assert(caps, "the active build is probed on selection");
+      assert(caps.includes("-bs"), "a modern stub declares -bs");
+      assert(caps.includes("--n-cpu-moe"), "and the flags the app composes");
+      assert(caps.includes("-ngl") && caps.includes("--gpu-layers"), "aliases");
+      assertEquals(caps.includes("N"), false, "placeholders are not flags");
+
+      // Probing twice does not re-run the binary: the flags a file on disk
+      // accepts do not change, and a process per selection would be a cost with
+      // no answer attached.
+      const before = builds.caps["caps-new"];
+      await builds.probe("caps-new");
+      assertEquals(builds.caps["caps-new"], before, "same answer, kept");
+
+      // An older binary is reported as older, not as unprobed. The difference
+      // matters: `tune` stays silent about a build it never asked, and names
+      // the missing flag on one it did.
+      await builds.setActive("caps-old");
+      const oldCaps = builds.caps["caps-old"];
+      assert(oldCaps, "an old build is probed too");
+      assert(oldCaps.includes("-ngl"), "it still declares what it does have");
+      assertEquals(oldCaps.includes("-bs"), false, "and not what it does not");
+
+      // A build that vanishes takes its capabilities with it, so a rebuilt id
+      // can never be answered from its predecessor's flags.
+      await builds.setActive("caps-new");
+      await removeStubBuild("caps-new");
+      await builds.scan();
+      assertEquals(
+        builds.caps["caps-new"],
+        undefined,
+        "a build off disk is forgotten",
+      );
+    } finally {
+      await removeStubBuild("caps-new");
+      await removeStubBuild("caps-old");
+    }
+  },
+});

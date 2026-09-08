@@ -200,6 +200,27 @@ export function stability(
     }
   }
 
+  // llama-server drops backend sampling on its own, with a warning in the log,
+  // when the sampler chain contains something it cannot run on the device
+  // (`common/sampling.cpp`). A grammar or JSON schema is set per REQUEST rather
+  // than in the argv, so that case cannot be decided here — what can be is the
+  // one that IS in the argv, so the flag never sits on a command line looking
+  // effective while doing nothing.
+  //
+  // There was a fourth case and it is deliberately NOT checked: until some
+  // point between 2026-07-27 and 2026-09-07, backend sampling was also
+  // disabled whenever a drafter was attached. That is gone from master, the two
+  // now stack, and a warning written from a stale source cache would talk a
+  // user out of the better configuration.
+  if (bool(s, "backendSampling") && str(s, "reasoning") === "on") {
+    warnings.push({
+      severity: "caution",
+      key: "backendSampling",
+      message:
+        "Sample on the GPU is on together with forced reasoning. A reasoning budget builds a sampler that llama.cpp cannot run on the backend, so it logs a warning and falls back to CPU sampling for those requests.",
+    });
+  }
+
   const host = String(s.host ?? "");
   const open = (host === "0.0.0.0" || host === "::") && !String(s.apiKey ?? "");
   if (open) {

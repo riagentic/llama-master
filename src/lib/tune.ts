@@ -23,6 +23,8 @@
 // costs before choosing.
 
 import { plan } from "./plan.ts";
+import type { MtpSibling } from "./mtp.ts";
+import { supportsFlag } from "./caps.ts";
 import { reserveLabel, reserveOf } from "./reserve.ts";
 import { defaults, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
@@ -586,6 +588,39 @@ function searchCtx(ceiling: number, ok: (c: number) => boolean): number {
  * the tuner may settle lower, it just never aims higher only to walk the
  * retry ladder back down.
  */
+/**
+ * What the tuner needs to know that is not in the model file.
+ *
+ * One entry so far, and it exists because a header can be complete and still
+ * describe only part of a model: Gemma 4 publishes its multi-token-prediction
+ * heads as a SEPARATE GGUF beside the weights, so the main file honestly
+ * reports zero MTP blocks and the tuner honestly concluded there was nothing to
+ * draft with. Finding the companion needs the model SCAN, which is I/O, so it
+ * is done in `mtp.ts` from the list the app already has and handed in here.
+ */
+export type TuneOpts = {
+  /** An MTP drafter found next to this model, or null. */
+  mtpSibling?: MtpSibling | null;
+  /** The flags the ACTIVE build's `llama-server --help` declares
+   *  (`src/lib/caps.ts`). Absent or empty means "not probed", and every
+   *  capability question then answers no — the tuner may leave a lever on the
+   *  table, but it never composes a command the binary cannot parse. */
+  caps?: readonly string[] | null;
+};
+
+/**
+ * The largest a companion drafter may be before the tuner declines to attach it
+ * on its own.
+ *
+ * A real MTP head is a few layers — tens to a few hundred megabytes. Anything
+ * substantially bigger is either a full second model or a mispairing, and its
+ * weights are VRAM that `plan.ts` does not bill (`-md` carries a `stability.ts`
+ * caution saying exactly that). Silently spending an unbudgeted 6 GB to buy
+ * speed is how "optimal settings" becomes a failed allocation, so above this
+ * the app names the file and lets the user decide.
+ */
+const MTP_SIBLING_MAX_B = 2 * 1024 ** 3;
+
 export function tune(
   meta: ModelMeta,
   hw: Hw,
@@ -599,6 +634,9 @@ export function tune(
    *  context is the priority, so the memory search goes to the model's edge
    *  and the measured-boundary warning covers what arithmetic cannot see. */
   aimFull = false,
+  /** Facts the tuner cannot read out of a GGUF header. Optional and trailing so
+   *  every existing positional call keeps working. */
+  opts: TuneOpts = {},
 ): Tuning {
   const d = defaults();
   const s: Settings = { ...d, ...base };
@@ -648,12 +686,37 @@ export function tune(
   // Never set for a model without the block: llama.cpp asserts on
   // `n_layer_nextn > 0` and refuses to load, which would be "optimal settings"
   // that do not start.
-  s.specType = meta.nextnLayers > 0 ? "draft-mtp" : "";
+  //
+  // The block is not always IN the file. Gemma 4 publishes its heads as a
+  // separate GGUF in the same directory, so `nextnLayers` is 0 and the branch
+  // below used to print "this model ships no multi-token-prediction block" over
+  // a drafter sitting unopened next to it — a 2-3x speed-up declined on the
+  // strength of a fact that was true about the file and false about the model.
+  // `mtp.ts` finds it; the size gate is there because a draft model's weights
+  // are VRAM `plan.ts` does not bill.
+  const sib = opts.mtpSibling ?? null;
+  const sibUsable = sib !== null && sib.sizeB > 0 &&
+    sib.sizeB <= MTP_SIBLING_MAX_B;
+  s.specType = meta.nextnLayers > 0 || sibUsable ? "draft-mtp" : "";
+  if (sibUsable && sib) s.draftModel = sib.path;
   if (meta.nextnLayers > 0) {
     reasons.push(
       `Speculative decoding on — this model ships ${meta.nextnLayers} multi-token-prediction block${
         meta.nextnLayers === 1 ? "" : "s"
       }, so it drafts ahead and verifies against itself. Output is identical; only the speed changes.`,
+    );
+  } else if (sibUsable && sib) {
+    reasons.push(
+      `Speculative decoding on — this model's multi-token-prediction head ships as a separate file (${sib.file}, ${
+        gb(sib.sizeB)
+      }) and it was found next to the weights, so it is attached as the draft model. Output is identical; only the speed changes. Those bytes are the one thing the memory plan below does not count.`,
+    );
+  } else if (sib) {
+    // Found, and deliberately not taken: too big to spend unbudgeted.
+    reasons.push(
+      `A file named as a multi-token-prediction drafter sits next to this model (${sib.file}, ${
+        gb(sib.sizeB)
+      }), but it is larger than a drafting head should be, so it has not been attached on its own — a draft model's weights are VRAM the memory plan does not count. Set it under Draft model if it is what you think it is.`,
     );
   } else {
     // Deliberately NOT switched on, and deliberately not silent either.
@@ -674,7 +737,39 @@ export function tune(
     // panel, which measures this machine on this model in about fifteen
     // seconds. A guess would have been faster to write and worse to run.
     reasons.push(
-      "Speculative decoding is off — this model ships no multi-token-prediction block, so there is nothing to draft with for free. The n-gram kinds under Speculative decoding work on any model and are lossless; they pay off on repetitive output like code and cost a little on prose. Measure before and after with the Speed panel rather than taking either on trust.",
+      "Speculative decoding is off — this model ships no multi-token-prediction block, so there is nothing to draft with for free. The n-gram kinds under Speculative decoding work on any model and are lossless; they pay off on repetitive output like code and cost a little on prose. Measure before and after with the Speed panel, which now runs a prose prompt AND a code prompt: the gap between the two is exactly what this setting is worth here.",
+    );
+  }
+  // ── GPU sampling ───────────────────────────────────────────────────────
+  //
+  // Sampling on the CPU copies the model's output row off the device every
+  // token — megabytes on a large vocabulary, and worse than its size, because
+  // the copy is a synchronisation point that stalls the GPU inside the hot
+  // loop. `-bs` removes the stall, it composes with speculative decoding (one
+  // makes a token cheaper to produce, the other cheaper to collect), and it
+  // costs no memory.
+  //
+  // Taken only when the BUILD says it knows the flag. This is the first setting
+  // the tuner turns on that an older binary would refuse outright — every other
+  // default is one a stale build can safely ignore — and inferring support from
+  // a version string is not available: a PR stack has no version that means
+  // anything. So the binary was asked (`caps.ts`, `builds.probe`), and an
+  // unprobed build answers no and simply does not get the lever.
+  //
+  // Not offered on a CPU-only placement: there is no device to keep the logits
+  // on, so the flag would be a claim about nothing.
+  const onGpu = placement !== "cpu" && hw.gpus.length > 0;
+  if (onGpu && supportsFlag(opts.caps, "-bs")) {
+    s.backendSampling = true;
+    reasons.push(
+      "Sampling runs on the GPU (`-bs`) — the next token is picked on the device instead of copying the model's output row back to the CPU every token, which stalls the GPU mid-loop. It costs no memory and it stacks with speculative decoding. llama.cpp still falls back to CPU sampling for any request that uses a grammar, a JSON schema or a reasoning budget, and says so in the log.",
+    );
+  } else if (onGpu && opts.caps && opts.caps.length > 0) {
+    // Probed, and the flag is genuinely absent. Naming the build's age beats
+    // silence: the same model on a newer build is measurably quicker, and
+    // nothing else on screen would explain the difference.
+    reasons.push(
+      "This build does not know `-bs` (sample on the GPU), so each token's output row is copied back to the CPU before the next one starts — a stall in the hot loop. It is a newer llama.cpp flag; a fresher build under Builds would pick it up. Measure with the Speed panel before and after.",
     );
   }
 
@@ -1101,11 +1196,21 @@ export function tuneAll(
   base: Settings,
   ctxOverride?: number,
   measuredCtx?: number,
+  opts: TuneOpts = {},
 ): Record<Placement, Tuning> {
   return {
-    vram: tune(meta, hw, base, "vram", ctxOverride, measuredCtx),
-    hybrid: tune(meta, hw, base, "hybrid", ctxOverride, measuredCtx),
-    cpu: tune(meta, hw, base, "cpu", ctxOverride, measuredCtx),
+    vram: tune(meta, hw, base, "vram", ctxOverride, measuredCtx, false, opts),
+    hybrid: tune(
+      meta,
+      hw,
+      base,
+      "hybrid",
+      ctxOverride,
+      measuredCtx,
+      false,
+      opts,
+    ),
+    cpu: tune(meta, hw, base, "cpu", ctxOverride, measuredCtx, false, opts),
   };
 }
 

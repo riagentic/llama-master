@@ -46,8 +46,15 @@ import type { Drift } from "../lib/adapt.ts";
 import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
 import { setupRows } from "../lib/setup.ts";
-import { bandwidthNote, benchApplies, benchIsSound } from "../lib/bench.ts";
-import type { BandwidthNote, BenchResult } from "../lib/bench.ts";
+import {
+  bandwidthNote,
+  benchApplies,
+  benchIsSound,
+  specVerdict,
+} from "../lib/bench.ts";
+import type { BandwidthNote, BenchResult, SpecVerdict } from "../lib/bench.ts";
+import { findMtpSibling } from "../lib/mtp.ts";
+import type { MtpSibling } from "../lib/mtp.ts";
 import { quantAdvice, quantOptions } from "../lib/quant.ts";
 import type { QuantOption } from "../lib/quant.ts";
 import type { SetupRow } from "../lib/setup.ts";
@@ -87,6 +94,17 @@ export function modelsSizeB(): number {
 }
 
 // ── builds ─────────────────────────────────────────────────────────────────
+
+/**
+ * The flags the active build declares it accepts (`src/lib/caps.ts`).
+ *
+ * `null` until it has been probed, which the tuner reads as "switch nothing
+ * extra on" — a lever left on the table, never a command the binary cannot
+ * parse.
+ */
+export function activeCaps(): readonly string[] | null {
+  return builds.caps[builds.activeId] ?? null;
+}
 
 export function activeBuild(): Build | null {
   return builds.installed.find((b) => b.id === builds.activeId) ?? null;
@@ -519,6 +537,24 @@ export function reserveCost(): ReserveCost {
  * Every placement for the current model, so the UI can compare them without
  * three separate calls. Null when no model with a readable header is selected.
  */
+/**
+ * The multi-token-prediction drafter published beside the selected model.
+ *
+ * A derived value rather than something the tuner works out, because finding it
+ * needs the model SCAN and `src/lib/` is pure. Gemma 4 ships its MTP heads as a
+ * separate GGUF, so the main file's header honestly says zero blocks — and the
+ * tuner honestly concluded there was nothing to draft with, over a 2-3x
+ * speed-up sitting in the same directory (`src/lib/mtp.ts`).
+ */
+const mtpSiblingC = computed<MtpSibling | null>(() => {
+  const m = currentModel();
+  if (!m) return null;
+  return findMtpSibling(m.path, models.items);
+});
+export function mtpSibling(): MtpSibling | null {
+  return mtpSiblingC.value;
+}
+
 const placementsC = computed(() => {
   const m = currentModel();
   if (!m?.meta) return null;
@@ -536,6 +572,7 @@ const placementsC = computed(() => {
     // would just walk the retry ladder back down (`src/lib/fitladder.ts`).
     ctxOverride() || undefined,
     measuredCtx(m.path) || undefined,
+    { mtpSibling: mtpSibling(), caps: activeCaps() },
   );
 });
 export function placements(): Record<Placement, Tuning> | null {
@@ -710,12 +747,35 @@ export function speedCalFromLastReply(): { gpuBps?: number; ramBps?: number } {
   return calibrate(tps, bytes);
 }
 
-/** The last speed measurement, when it describes the run on screen. */
+/** The last PROSE speed measurement, when it describes the run on screen. */
 export function benchNow(): BenchResult | null {
   const run = srv.runSettings;
   if (!run) return null;
   const b = srv.lastBench;
   return benchApplies(b, srv.runModel, Number(run.ctxSize ?? 0)) ? b : null;
+}
+
+/** The last CODE speed measurement, when it describes the run on screen. */
+export function benchCodeNow(): BenchResult | null {
+  const run = srv.runSettings;
+  if (!run) return null;
+  const b = srv.lastBenchCode;
+  return benchApplies(b, srv.runModel, Number(run.ctxSize ?? 0)) ? b : null;
+}
+
+/**
+ * What the two measurements say about speculative decoding, together.
+ *
+ * Read against the settings the RUN was started with, never the panel's current
+ * contents: speculative decoding is a load-time flag, so a user who has since
+ * flipped the switch has changed the next run and not this one, and judging a
+ * measurement by a setting that was not in force when it was taken is how a
+ * verdict comes to contradict its own numbers.
+ */
+export function specVerdictNow(): SpecVerdict | null {
+  const run = srv.runSettings;
+  if (!run) return null;
+  return specVerdict(benchNow(), benchCodeNow(), str(run, "specType"));
 }
 
 /**

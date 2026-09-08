@@ -17,6 +17,7 @@ import { basename, dirname, join, resolve } from "@std/path";
 import type { Asset } from "../lib/assets.ts";
 import { availableBackends, pickAsset } from "../lib/assets.ts";
 import { progressOf } from "../lib/buildlog.ts";
+import { CAPS_TIMEOUT_MS, parseHelpFlags } from "../lib/caps.ts";
 import { cudaCmakeFlags, cudaPlan } from "../lib/cuda.ts";
 import { diagnoseNoAsset } from "../lib/diagnose.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
@@ -1026,4 +1027,54 @@ async function finalize(
     );
   }
   return build;
+}
+
+/**
+ * Ask a build which flags it accepts.
+ *
+ * `llama-server --help` prints every option and exits, so this is a fact about
+ * the binary on disk rather than an inference from its version string — which
+ * is the only alternative, and which means nothing for the builds that most
+ * need the answer (a PR stack, a `master` from an unknown day).
+ *
+ * Sandboxed like a start: only a binary under the builds root is executed,
+ * compared RESOLVED rather than as text, because `<buildsRoot>/../../usr/bin/x`
+ * begins with the root as a string and leaves it as a path. `--help` is not a
+ * dangerous argument, but "we only ever run our own binaries" is a rule, and a
+ * rule with an exception for the harmless case is not a rule.
+ *
+ * Returns `[]` rather than throwing when the probe cannot run or the binary
+ * answers nothing usable. An unknown capability set reads as "switch nothing
+ * extra on" (`caps.ts:supportsFlag`), which is the safe direction: the cost of
+ * a failed probe is that the tuner is conservative, not that a server dies.
+ */
+export async function probeCaps(bin: string): Promise<string[]> {
+  if (!bin) return [];
+  const root = resolve(paths().builds);
+  if (!resolve(bin).startsWith(root + "/")) {
+    throw new Error(
+      `refusing to run ${bin}: only binaries under ${root} may be probed`,
+    );
+  }
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), CAPS_TIMEOUT_MS);
+  try {
+    const out = await new Deno.Command(bin, {
+      args: ["--help"],
+      stdout: "piped",
+      stderr: "piped",
+      signal: ac.signal,
+    }).output();
+    const dec = new TextDecoder();
+    // Both pipes: llama.cpp has printed usage to stderr in the past, and a
+    // probe that reads only stdout would report a modern build as knowing
+    // nothing at all — which is the one answer that is worse than no answer,
+    // because it looks like a measurement.
+    const help = dec.decode(out.stdout) + "\n" + dec.decode(out.stderr);
+    return [...parseHelpFlags(help)].sort();
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }

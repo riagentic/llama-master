@@ -238,12 +238,17 @@ import {
 } from "../src/lib/quant.ts";
 import {
   bandwidthNote,
+  BENCH_PROMPTS,
   BENCH_TOKENS,
   benchApplies,
   benchRequest,
   EMPTY_BENCH,
   parseBench,
+  specVerdict,
 } from "../src/lib/bench.ts";
+import type { BenchResult } from "../src/lib/bench.ts";
+import { findMtpSibling, isMtpName, pairKey } from "../src/lib/mtp.ts";
+import { parseHelpFlags, supportsFlag } from "../src/lib/caps.ts";
 import {
   formatRef,
   parsePrInput,
@@ -6176,7 +6181,13 @@ Deno.test("quant: the quality note follows the curve every perplexity table agre
 Deno.test("bench: a reply without timings is not a slow machine", () => {
   // A build too old to report `timings` has measured NOTHING. Writing 0 tok/s
   // would put "this machine is broken" on screen over a build's age.
-  const at = { latencyMs: 100, ctx: 4096, modelPath: "/m.gguf", at: 1 };
+  const at = {
+    kind: "prose" as const,
+    latencyMs: 100,
+    ctx: 4096,
+    modelPath: "/m.gguf",
+    at: 1,
+  };
   assertEquals(parseBench({}, at), null, "no timings block");
   assertEquals(parseBench({ timings: {} }, at), null, "an empty one");
   assertEquals(
@@ -6195,7 +6206,13 @@ Deno.test("bench: llama.cpp's own numbers come through, and ours are measured he
       predicted_n: 128,
       predicted_per_second: 13.1,
     },
-  }, { latencyMs: 1234.6, ctx: 262144, modelPath: "/m.gguf", at: 99 });
+  }, {
+    kind: "prose" as const,
+    latencyMs: 1234.6,
+    ctx: 262144,
+    modelPath: "/m.gguf",
+    at: 99,
+  });
   assertExists(r);
   assertEquals(r.promptTokens, 42);
   assertEquals(r.promptTps, 364.5);
@@ -6211,7 +6228,13 @@ Deno.test("bench: llama.cpp's own numbers come through, and ours are measured he
 Deno.test("bench: a measurement belongs to one model at one context", () => {
   const b = parseBench(
     { timings: { predicted_n: 128, predicted_per_second: 13 } },
-    { latencyMs: 1, ctx: 4096, modelPath: "/a.gguf", at: 5 },
+    {
+      kind: "prose" as const,
+      latencyMs: 1,
+      ctx: 4096,
+      modelPath: "/a.gguf",
+      at: 5,
+    },
   );
   assertExists(b);
   assertEquals(benchApplies(b, "/a.gguf", 4096), true);
@@ -6232,7 +6255,11 @@ Deno.test("bench: the request holds every variable still", () => {
   // A reasoning model asked for 128 tokens can spend all of them thinking,
   // which measures the right rate on the wrong work.
   assertEquals(body.reasoning_budget, 0);
-  assertEquals(benchRequest(8).n_predict, 16, "too short to mean anything");
+  assertEquals(
+    benchRequest("prose", 8).n_predict,
+    16,
+    "too short to mean anything",
+  );
 });
 
 Deno.test("bench: the bandwidth note speaks only when host RAM is in the path", () => {
@@ -6718,4 +6745,374 @@ Deno.test("fix: the CUDA fix is a download, never a package or a script", () => 
   if (plan.kind !== "download") throw new Error("unreachable");
   assertStringIncludes(plan.label, "no root");
   assertStringIncludes(plan.label, "no driver change");
+});
+
+// ── The bench pair, and what it settles ────────────────────────────────────
+//
+// One rate could not answer "should speculative decoding be on", and the tuner
+// was pointing at this panel to answer exactly that. The pair can, because with
+// no drafter the two prompts agree — so the gap that appears with one attached
+// is the drafter's, measured here rather than quoted from someone else's rig.
+
+const benched = (kind: "prose" | "code", genTps: number): BenchResult => ({
+  ...EMPTY_BENCH,
+  kind,
+  genTps,
+  genTokens: 128,
+  promptTokens: 40,
+  promptTps: 300,
+  at: 1,
+  ctx: 4096,
+  modelPath: "/m.gguf",
+});
+
+Deno.test("bench: the two prompts differ in the one property that matters", () => {
+  assertEquals(benchRequest("prose").prompt, BENCH_PROMPTS.prose);
+  assertEquals(benchRequest("code").prompt, BENCH_PROMPTS.code);
+  assert(
+    BENCH_PROMPTS.prose !== BENCH_PROMPTS.code,
+    "two names for one prompt would measure the same thing twice",
+  );
+  // The code prompt has to actually produce repetitive output, or it measures
+  // prose with a different vocabulary and the whole comparison is noise.
+  assert(
+    /typescript|function/i.test(BENCH_PROMPTS.code),
+    "the code prompt must ask for code",
+  );
+  // Both must refuse thinking: a reasoning model that spends the budget
+  // thinking measures the right rate on the wrong work.
+  for (const k of ["prose", "code"] as const) {
+    assert(
+      /do not think/i.test(BENCH_PROMPTS[k]),
+      `${k} prompt must suppress thinking`,
+    );
+    assertEquals(benchRequest(k).temperature, 0);
+    assertEquals(benchRequest(k).cache_prompt, false);
+  }
+  // The default is prose, because prose is what calibrates bandwidth.
+  assertEquals(benchRequest().prompt, BENCH_PROMPTS.prose);
+});
+
+Deno.test("bench: a result carries the prompt it came from", () => {
+  const r = parseBench({
+    timings: { predicted_n: 64, predicted_per_second: 9 },
+  }, {
+    kind: "code",
+    latencyMs: 10,
+    ctx: 4096,
+    modelPath: "/m.gguf",
+    at: 7,
+  });
+  assertEquals(r?.kind, "code");
+});
+
+Deno.test("specVerdict: half a comparison is not published", () => {
+  assertEquals(specVerdict(null, null, ""), null);
+  assertEquals(
+    specVerdict(benched("prose", 20), null, ""),
+    null,
+    "prose alone",
+  );
+  assertEquals(specVerdict(null, benched("code", 60), ""), null, "code alone");
+  // A code rate with no baseline is the "2.9x faster!" number with nothing
+  // under it. That is the reading this exists to refuse.
+});
+
+Deno.test("specVerdict: drafting on and paying is reported as a multiple", () => {
+  const v = specVerdict(benched("prose", 20), benched("code", 58), "draft-mtp");
+  assertEquals(v?.tone, "ok");
+  assert(v!.ratio > 2.8 && v!.ratio <= 2.9, `ratio ${v!.ratio}`);
+  assert(v!.headline.includes("2.90x"), v!.headline);
+  assert(/lossless/i.test(v!.advice), "the reason it is free must be said");
+});
+
+Deno.test("specVerdict: drafting on and NOT paying names the cost", () => {
+  // Rejected drafts are work thrown away, so "on and slower" is a real and
+  // actionable state — and the one a user would never guess at.
+  const v = specVerdict(
+    benched("prose", 20),
+    benched("code", 15),
+    "ngram-cache",
+  );
+  assertEquals(v?.tone, "caution");
+  assert(/SLOWER/.test(v!.headline), v!.headline);
+  assert(/switch/i.test(v!.advice), "must name the way out");
+});
+
+Deno.test("specVerdict: MTP that is not paying is still kept", () => {
+  // The model's own block is already loaded — its weights are in the file
+  // whether it drafts or not — so "off" buys nothing back. An n-gram kind is a
+  // different answer, because it is a choice with alternatives.
+  const mtp = specVerdict(
+    benched("prose", 20),
+    benched("code", 21),
+    "draft-mtp",
+  );
+  assertEquals(mtp?.tone, "info");
+  assert(/Leave it/i.test(mtp!.advice), mtp!.advice);
+  const ngram = specVerdict(
+    benched("prose", 20),
+    benched("code", 21),
+    "ngram-mod",
+  );
+  assert(/worth trying|switch it off/i.test(ngram!.advice), ngram!.advice);
+});
+
+Deno.test("specVerdict: drafting off, agreement IS the finding", () => {
+  const v = specVerdict(benched("prose", 20), benched("code", 20.4), "");
+  assertEquals(v?.tone, "info");
+  assert(/baseline/i.test(v!.headline), v!.headline);
+  assert(/k4v/.test(v!.advice), "must name the setting to try next");
+});
+
+Deno.test("specVerdict: drafting off with a gap blames the tokenizer, not the machine", () => {
+  // With no drafter involved the model reads the same weights either way, so a
+  // gap cannot be speed. Saying "code is 30% faster" here would invent a
+  // hardware finding out of a tokenization detail.
+  const v = specVerdict(benched("prose", 20), benched("code", 26), "");
+  assert(/tokenizer/i.test(v!.headline), v!.headline);
+});
+
+// ── The drafter that ships beside the model ───────────────────────────────
+
+Deno.test("mtp: the marker is a token, never a substring", () => {
+  assert(isMtpName("gemma-4-E4B-it-mtp-Q4_0.gguf"));
+  assert(isMtpName("model.mtp.gguf"));
+  assert(isMtpName("mtp-head-Q8_0.gguf"));
+  assert(isMtpName("something_mtp.gguf"));
+  // A model whose name merely contains the letters is not a drafter, and
+  // pairing one would hand llama.cpp a second full model whose drafts are
+  // never accepted — a silent slowdown, the worst failure available here.
+  assertEquals(isMtpName("Mtptune-7B-Q4_K_M.gguf"), false);
+  assertEquals(isMtpName("prompt-Q4_0.gguf"), false);
+});
+
+Deno.test("mtp: quantisation labels do not have to agree", () => {
+  // A drafter is routinely published at a different quant from the model it
+  // drafts for; requiring a match would reject the exact pairing sought.
+  assertEquals(
+    pairKey("gemma-4-E4B-it-Q8_0.gguf"),
+    pairKey("gemma-4-E4B-it-mtp-Q4_0.gguf"),
+  );
+  assert(
+    pairKey("gemma-4-E4B-it-Q8_0.gguf") !== pairKey("gemma-4-E2B-it-Q8_0.gguf"),
+    "different models must not pair",
+  );
+});
+
+Deno.test("mtp: the sibling is found, and only the right one", () => {
+  const dir = "/models/gemma";
+  const f = (file: string, sizeB = 300 * 1024 ** 2, d = dir) => ({
+    path: `${d}/${file}`,
+    file,
+    sizeB,
+    dir: d,
+  });
+  const main = f("gemma-4-E4B-it-Q4_0.gguf", 4 * 1024 ** 3);
+  const draft = f("gemma-4-E4B-it-mtp-Q4_0.gguf");
+  const other = f("Qwen3.5-9B-mtp-Q4_0.gguf");
+  const elsewhere = f(
+    "gemma-4-E4B-it-mtp-Q4_0.gguf",
+    300 * 1024 ** 2,
+    "/other",
+  );
+  const list = [main, draft, other, elsewhere];
+
+  assertEquals(findMtpSibling(main.path, list)?.path, draft.path);
+  // A drafter does not draft for itself.
+  assertEquals(findMtpSibling(draft.path, list), null);
+  // A drafter for a different family is not offered: the vocabularies differ,
+  // so every draft would be rejected.
+  assertEquals(
+    findMtpSibling(main.path, [main, other]),
+    null,
+    "wrong family must not pair",
+  );
+  // Nor one filed somewhere else — that is a guess about somebody's folders.
+  assertEquals(findMtpSibling(main.path, [main, elsewhere]), null);
+  assertEquals(findMtpSibling("/nope.gguf", list), null);
+});
+
+Deno.test("tune: a separate MTP head is attached, and a huge one is not", () => {
+  // The header is honest and incomplete: Gemma 4 keeps its heads in another
+  // file, so `nextnLayers` is 0 and the old tuner printed "this model ships no
+  // multi-token-prediction block" over a 2-3x speed-up in the same directory.
+  const m = meta({ name: "Gemma", nextnLayers: 0, nCtxTrain: 8192 });
+  const machine = hw({ gpus: [gpu(24, 0)] });
+  const sib = {
+    path: "/models/g-mtp-Q4_0.gguf",
+    file: "g-mtp-Q4_0.gguf",
+    sizeB: 300 * 1024 ** 2,
+  };
+
+  const off = tune(m, machine, defaults(), "vram");
+  assertEquals(off.settings.specType, "", "no sibling, no drafting");
+
+  const on = tune(m, machine, defaults(), "vram", undefined, undefined, false, {
+    mtpSibling: sib,
+  });
+  assertEquals(on.settings.specType, "draft-mtp");
+  assertEquals(on.settings.draftModel, sib.path);
+  assert(
+    on.reasons.some((r) => r.includes("separate file")),
+    "the reason must say the head was not in the model file",
+  );
+
+  // A draft model's weights are VRAM `plan.ts` does not bill, so an
+  // implausibly large "drafter" is named rather than spent.
+  const big = tune(
+    m,
+    machine,
+    defaults(),
+    "vram",
+    undefined,
+    undefined,
+    false,
+    {
+      mtpSibling: { ...sib, sizeB: 9 * 1024 ** 3 },
+    },
+  );
+  assertEquals(big.settings.specType, "", "too big to attach unbudgeted");
+  assertEquals(big.settings.draftModel, "");
+  assert(
+    big.reasons.some((r) => r.includes("larger than a drafting head")),
+    "and it must say why it declined",
+  );
+});
+
+Deno.test("stability: GPU sampling beside a drafter is NOT a conflict", () => {
+  // It was, and this app said so for one round of work, reading a source cache
+  // six weeks stale: `backend_sampling &= !(slot.can_speculate())` was removed
+  // from llama.cpp between 2026-07-27 and 2026-09-07. The two stack now, and a
+  // warning here would talk the user out of the better configuration. The
+  // regression guarded is the WARNING coming back, not the flag.
+  const m = meta({ name: "M", nCtxTrain: 4096 });
+  const machine = hw({ gpus: [gpu(24, 0)] });
+  const both = stability(m, machine, {
+    ...defaults(),
+    backendSampling: true,
+    specType: "draft-mtp",
+  });
+  assertEquals(
+    both.warnings.some((x) => x.key === "backendSampling"),
+    false,
+    "drafting and GPU sampling are compatible upstream",
+  );
+
+  // What IS still dropped, and still worth naming: a reasoning budget builds a
+  // sampler llama.cpp cannot run on the device, and it says so only in the log.
+  const thinking = stability(m, machine, {
+    ...defaults(),
+    backendSampling: true,
+    reasoning: "on",
+  });
+  const w = thinking.warnings.find((x) => x.key === "backendSampling");
+  assert(w, "the reasoning-budget drop must still be reported");
+  assert(/reasoning/i.test(w!.message), w!.message);
+});
+
+// ── What THIS build can be told to do ─────────────────────────────────────
+
+Deno.test("caps: the help text is parsed, and its prose is not", () => {
+  // Real llama.cpp layout: aliases separated by comma-and-spaces, a value
+  // placeholder, then the description at a fixed column, then indented
+  // continuation lines.
+  const help = [
+    "----- common params -----",
+    "",
+    "-h,    --help, --usage                  print usage and exit",
+    "-t,    --threads N                      number of CPU threads (default: -1)",
+    "                                        (env: LLAMA_ARG_THREADS)",
+    "-tb,   --threads-batch N                number of threads, same as --threads",
+    "--cpu-strict <0|1>                      use strict CPU placement (default: 0)",
+    "-Cr,   --cpu-range lo-hi                range of CPUs for affinity",
+    "-bs,   --backend-sampling               enable backend sampling (experimental)",
+  ].join("\n");
+  const f = parseHelpFlags(help);
+
+  // Every alias of every option, short and long.
+  for (
+    const k of [
+      "-h",
+      "--help",
+      "--usage",
+      "-t",
+      "--threads",
+      "-bs",
+      "--backend-sampling",
+      "--cpu-strict",
+      "-Cr",
+      "--cpu-range",
+    ]
+  ) {
+    assert(f.has(k), `missing ${k}`);
+  }
+  // Value placeholders are not flags, however they are spelled.
+  for (const junk of ["N", "<0|1>", "lo-hi", "FNAME", "-1"]) {
+    assertEquals(f.has(junk), false, `${junk} is not a flag`);
+  }
+  // A description that MENTIONS a flag does not declare it. `--threads` is
+  // real here only because line 2 declares it; the point is that the parse cuts
+  // the description off before looking, so a build could not be credited with a
+  // flag that appears only in someone else's prose.
+  assertEquals(f.has("params"), false);
+  assertEquals(f.has("--usage") && f.has("--cpu-range"), true);
+  // Headings and blank lines are not options.
+  assertEquals(f.has("-----"), false);
+});
+
+Deno.test("caps: an unprobed build supports nothing", () => {
+  // The safe reading of "no answer" is "switch nothing extra on". Reading it as
+  // "assume modern" is how a tuner writes a command the binary cannot parse.
+  assertEquals(supportsFlag(null, "-bs"), false);
+  assertEquals(supportsFlag(undefined, "-bs"), false);
+  assertEquals(supportsFlag([], "-bs"), false);
+  assertEquals(supportsFlag(["-bs"], "-bs"), true);
+  assertEquals(supportsFlag(["-bs"], "--fit"), false);
+});
+
+Deno.test("tune: GPU sampling is taken only when the build declares it", () => {
+  const m = meta({ name: "M", nCtxTrain: 4096 });
+  const machine = hw({ gpus: [gpu(24, 0)] });
+  const T = (o: Record<string, unknown>, placement = "vram") =>
+    tune(
+      m,
+      machine,
+      defaults(),
+      placement as "vram",
+      undefined,
+      undefined,
+      false,
+      o,
+    );
+
+  // Probed and present: taken. It costs no memory, it composes with drafting,
+  // and it removes a per-token stall.
+  const modern = T({ caps: ["-bs", "-ngl", "-c"] });
+  assertEquals(modern.settings.backendSampling, true);
+  assert(modern.reasons.some((r) => r.includes("Sampling runs on the GPU")));
+
+  // Probed and absent: NOT taken — this is the one setting an older binary
+  // refuses outright — and the build's age is named rather than left as an
+  // unexplained difference in speed.
+  const old = T({ caps: ["-ngl", "-c"] });
+  assertEquals(old.settings.backendSampling, false);
+  assert(
+    old.reasons.some((r) => r.includes("does not know `-bs`")),
+    "an absent flag must be explained, not silent",
+  );
+
+  // Never probed: not taken, and not complained about either — the app has no
+  // finding to report about a question it did not ask.
+  const unknown = T({});
+  assertEquals(unknown.settings.backendSampling, false);
+  assertEquals(
+    unknown.reasons.some((r) => r.includes("-bs")),
+    false,
+    "silence about an unprobed build",
+  );
+
+  // CPU-only: there is no device to keep the logits on, so the flag would be a
+  // claim about nothing.
+  assertEquals(T({ caps: ["-bs"] }, "cpu").settings.backendSampling, false);
 });

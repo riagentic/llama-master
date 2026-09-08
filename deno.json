@@ -2,7 +2,7 @@
   "aioVersion": "v1.0.0-alpha75",
   "name": "llama-master",
   "title": "llama.master",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "exports": "./src/app.ts",
   "nodeModulesDir": "auto",
   "compilerOptions": {

@@ -25,8 +25,31 @@
 
 import type { ModelMeta } from "./types.ts";
 
+/**
+ * Which KIND of work a bench measured, and why there are two.
+ *
+ * Speculative decoding is the app's biggest un-measured lever, and its whole
+ * character is that the gain DEPENDS ON THE TEXT. A drafter is only paid for
+ * the tokens the full model then accepts, so output that repeats itself — code,
+ * lists, edits of earlier text — is where it wins, and flowing prose is where it
+ * very nearly does not. One prompt therefore cannot answer "is this worth it";
+ * it can only answer it for whichever kind of work the prompt happened to be.
+ *
+ * Ours was prose, deliberately and for good reasons (it runs to a steady state
+ * rather than stopping early). The consequence went unnoticed: every speculative
+ * setting in this app was being measured at its WORST case, every time, and the
+ * tuner then told the user to go and measure it themselves.
+ *
+ * So there are two, run against the same loaded server, and the pair is the
+ * result — one number is a rate, two numbers are an answer.
+ */
+export type BenchKind = "prose" | "code";
+
 /** What one bench run measured. Every field is llama.cpp's own number. */
 export type BenchResult = {
+  /** Which prompt produced this. Part of the result because a code rate and a
+   *  prose rate are not comparable to each other by accident — only on purpose. */
+  kind: BenchKind;
   /** Prompt tokens processed, and how fast — the wait before the first word. */
   promptTokens: number;
   promptTps: number;
@@ -48,6 +71,7 @@ export type BenchResult = {
 };
 
 export const EMPTY_BENCH: BenchResult = {
+  kind: "prose",
   promptTokens: 0,
   promptTps: 0,
   genTokens: 0,
@@ -70,21 +94,47 @@ export const EMPTY_BENCH: BenchResult = {
 export const BENCH_TOKENS = 128;
 
 /**
- * The prompt, and why it is this one.
+ * The two prompts, and why they are these.
  *
- * Long enough to make the prefill measurable (a two-word prompt measures
- * nothing but overhead), fixed so two runs are comparable, and deliberately
- * dull: a prompt that invites reasoning gets a thinking model to spend the
- * whole budget thinking, and then the "generation rate" is measured on a
- * different kind of work than the one being compared. Asking for open-ended
- * prose keeps the output flowing for the whole budget, where a question an
- * instruct model can answer in a sentence would stop early and measure the
+ * Both are long enough to make the prefill measurable (a two-word prompt
+ * measures nothing but overhead), fixed so two runs are comparable, and
+ * deliberately dull: a prompt that invites reasoning gets a thinking model to
+ * spend the whole budget thinking, and then the "generation rate" is measured
+ * on a different kind of work than the one being compared. Both ask for
+ * open-ended output that keeps flowing for the whole budget, where a question
+ * an instruct model can answer in a sentence would stop early and measure the
  * first batch instead of the steady state.
+ *
+ * What differs is the ONE property speculative decoding is sensitive to:
+ * whether the next token is guessable from the tokens before it.
+ *
+ * - `prose` is the original, and it stays the calibration prompt. Bandwidth is
+ *   what `speed.ts` needs and prose is the honest floor for it — no drafter can
+ *   flatter a rate that has nothing to predict.
+ * - `code` is written to be the opposite: repeated declaration shapes, repeated
+ *   punctuation, a doc comment before each function. That is not a trick, it is
+ *   what a local model is mostly asked for, and it is the case a drafter was
+ *   built to win. Anything a drafter can do, it does here.
+ *
+ * Neither is "the" speed. The PAIR is the measurement, and the gap between them
+ * is the only honest answer to "should I turn speculative decoding on".
  */
-export const BENCH_PROMPT =
-  "You are a text generator used for a speed measurement. " +
-  "Do not think, explain, or comment. Write plain prose about the sea, " +
-  "continuously, until you are stopped. Begin now: The sea at dawn is";
+export const BENCH_PROMPTS: Record<BenchKind, string> = {
+  prose: "You are a text generator used for a speed measurement. " +
+    "Do not think, explain, or comment. Write plain prose about the sea, " +
+    "continuously, until you are stopped. Begin now: The sea at dawn is",
+  code: "You are a code generator used for a speed measurement. " +
+    "Do not think, explain, or comment. Emit only TypeScript. " +
+    "Write a long series of very small pure functions, one after another, " +
+    "each preceded by a one-line JSDoc comment, continuously, until you are " +
+    "stopped. Begin now:\n\n/** Adds two numbers. */\n" +
+    "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+};
+
+/** The calibration prompt: what `speed.ts` divides bytes by. Prose, because a
+ *  drafted token is not a token the memory bus paid for, and a bandwidth
+ *  calibrated off accepted drafts would be several times too high. */
+export const BENCH_PROMPT = BENCH_PROMPTS.prose;
 
 /**
  * The request body for one bench run.
@@ -95,9 +145,12 @@ export const BENCH_PROMPT =
  * repeatability. No `stop`, because a stop sequence would end the run early
  * and measure fewer tokens than asked for.
  */
-export function benchRequest(tokens = BENCH_TOKENS): Record<string, unknown> {
+export function benchRequest(
+  kind: BenchKind = "prose",
+  tokens = BENCH_TOKENS,
+): Record<string, unknown> {
   return {
-    prompt: BENCH_PROMPT,
+    prompt: BENCH_PROMPTS[kind] ?? BENCH_PROMPTS.prose,
     n_predict: Math.max(16, Math.round(tokens)),
     temperature: 0,
     cache_prompt: false,
@@ -105,6 +158,14 @@ export function benchRequest(tokens = BENCH_TOKENS): Record<string, unknown> {
     // and emit nothing, which measures the right rate on the wrong work — and
     // on a build that supports it, this is the one place we WANT thinking off.
     // Unknown fields are ignored by older servers, so it costs nothing there.
+    //
+    // It has one side effect worth knowing, because it is invisible: a
+    // reasoning budget builds llama.cpp's `rbudget` sampler, and that sampler
+    // turns BACKEND SAMPLING off for the request with a warning in the server
+    // log (`common/sampling.cpp`). So on a thinking model this bench measures
+    // the CPU sampling path even when `-bs` is set. It is the right trade —
+    // measuring generation while the model thinks would be far more wrong —
+    // but it is why `-bs` is never judged from a bench alone.
     reasoning_budget: 0,
   };
 }
@@ -127,7 +188,13 @@ type Timings = {
  */
 export function parseBench(
   json: unknown,
-  ctx: { latencyMs: number; ctx: number; modelPath: string; at: number },
+  ctx: {
+    kind: BenchKind;
+    latencyMs: number;
+    ctx: number;
+    modelPath: string;
+    at: number;
+  },
 ): BenchResult | null {
   const t = (json as { timings?: Timings } | null)?.timings;
   if (!t) return null;
@@ -139,6 +206,7 @@ export function parseBench(
   // read as "this machine is broken" when the truth is "the model stopped".
   if (genTokens <= 0 || genTps <= 0) return null;
   return {
+    kind: ctx.kind,
     promptTokens: n(t.prompt_n),
     promptTps: n(t.prompt_per_second),
     genTokens,
@@ -273,4 +341,123 @@ export function benchIsSound(b: BenchResult, meta: ModelMeta | null): boolean {
   // rate is a fact with nothing to divide it by.
   if (!meta || meta.tensorBytes <= 0) return false;
   return true;
+}
+
+// ── The pair, and what it settles ──────────────────────────────────────────
+//
+// Speculative decoding is the one setting this app names and refuses to switch
+// on (`tune.ts`): it is lossless, it is free of memory cost, and it is
+// nonetheless a bad idea about half the time, because a drafted token that the
+// full model rejects is work thrown away. Which half you are in depends on what
+// you ask the model to write, and nothing in a GGUF header knows that.
+//
+// So the tuner said "measure it" and pointed at the Speed panel — which then
+// measured PROSE, the case where a drafter has least to offer, and reported one
+// number with no baseline to read it against. The advice was right and the
+// instrument could not carry it out.
+//
+// Two runs against the same loaded server can. Generation is bandwidth-bound,
+// and a byte of weights costs the same to read whatever the text is about, so
+// with drafting OFF the two rates land within a few percent of each other. That
+// makes the pair self-calibrating: the gap that appears when drafting is ON is
+// the drafter's acceptance rate, in tokens per second, on this machine.
+
+/** How far apart two rates must be before the difference is a finding rather
+ *  than noise. Two runs of the same prompt on an idle machine land within a
+ *  couple of percent; 15% is comfortably outside that and well inside the
+ *  1.5–3x a working drafter produces on code. */
+const SPEC_MARGIN = 0.15;
+
+export type SpecVerdict = {
+  tone: "ok" | "info" | "caution";
+  /** What the two runs measured, in one sentence. */
+  headline: string;
+  /** What to do about it — "" when the answer is "nothing". */
+  advice: string;
+  /** code ÷ prose. 1 means the text made no difference. */
+  ratio: number;
+};
+
+/**
+ * Read a prose bench and a code bench together.
+ *
+ * `null` until both exist: half a comparison is not a weaker finding, it is a
+ * different and much worse one — a single code rate invites exactly the
+ * "2.9x faster!" reading that has no baseline under it.
+ */
+export function specVerdict(
+  prose: BenchResult | null,
+  code: BenchResult | null,
+  specType: string,
+): SpecVerdict | null {
+  if (!prose || !code) return null;
+  if (prose.genTps <= 0 || code.genTps <= 0) return null;
+  const ratio = code.genTps / prose.genTps;
+  const on = specType !== "";
+  const pct = Math.round(Math.abs(ratio - 1) * 100);
+  const rates = `${fmt(code.genTps)} tok/s on code against ${
+    fmt(prose.genTps)
+  } on prose`;
+
+  if (!on) {
+    // Drafting off: the two SHOULD agree, because the model reads the same
+    // weights either way. Agreement is therefore not a null result — it is the
+    // baseline that makes the next measurement mean something.
+    if (ratio < 1 + SPEC_MARGIN && ratio > 1 - SPEC_MARGIN) {
+      return {
+        tone: "info",
+        ratio,
+        headline:
+          `Speculative decoding is off, and code and prose run at the same rate — ${rates}. That is the expected result and it is the baseline.`,
+        advice:
+          "Switch Speculative decoding to `n-gram map (k4v)` under Performance, restart, and measure again. The code number is the one that should move; if it does, the setting is worth keeping for the work you do.",
+      };
+    }
+    return {
+      tone: "info",
+      ratio,
+      headline: `Speculative decoding is off, and code still runs ${pct}% ${
+        ratio > 1 ? "faster" : "slower"
+      } than prose — ${rates}. With no drafter involved that is the tokenizer, not the machine: the two texts pack a different number of characters into a token.`,
+      advice:
+        "Switch Speculative decoding to `n-gram map (k4v)` under Performance, restart, and measure again — the gap that opens beyond this one is the drafter's.",
+    };
+  }
+
+  if (ratio >= 1 + SPEC_MARGIN) {
+    return {
+      tone: "ok",
+      ratio,
+      headline: `Speculative decoding is paying: ${
+        ratio.toFixed(2)
+      }x on code — ${rates}.`,
+      advice:
+        "Drafting is lossless, so this is free speed on code, edits and structured output. Prose is close to the undrafted rate, which is the honest shape of this setting rather than a fault in it.",
+    };
+  }
+  if (ratio > 1 - SPEC_MARGIN) {
+    return {
+      tone: "info",
+      ratio,
+      headline:
+        `Speculative decoding is on and is not making much difference here — ${rates}.`,
+      advice: specType === "draft-mtp"
+        ? "The model's own MTP block costs nothing to keep on: its weights are in the file and loaded either way, and a rejected draft is discarded rather than wrong. Leave it."
+        : "The n-gram kinds are worth trying against each other — `n-gram map (k4v)` and `n-gram (cache)` accept at quite different rates on different work. Or switch it off: what it is not doing, it is not doing for free.",
+    };
+  }
+  return {
+    tone: "caution",
+    ratio,
+    headline:
+      `Speculative decoding is on and code is ${pct}% SLOWER than prose — ${rates}.`,
+    advice:
+      "That is drafts being rejected: every one is a batch of work thrown away, and here they are costing more than the accepted ones save. Switch Speculative decoding off under Performance, or try a different n-gram kind, and measure again.",
+  };
+}
+
+/** One decimal below 100, none above — a rate of 1043.2 tok/s is false
+ *  precision, and 9.6 rounded to 10 loses a real difference. */
+function fmt(v: number): string {
+  return v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1);
 }

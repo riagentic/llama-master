@@ -57,6 +57,17 @@ export type BuildsState = {
   installed: Build[];
   /** The build every other panel uses. */
   activeId: string;
+  /** Build id → the flags that build's `llama-server --help` declares.
+   *
+   *  Kept because the tuner has to be able to switch something ON. Every other
+   *  setting is safe to leave at a default a stale build ignores; `-bs` is a
+   *  real speed lever, and a build that has never heard of it refuses to start
+   *  at all. Guessing from the version string is not available either — a PR
+   *  stack has no version that means anything — so the binary is asked, once,
+   *  and the answer is kept (`src/lib/caps.ts`). Persisted with the cell: a
+   *  build's flags do not change while it sits on disk, and re-probing every
+   *  boot would spawn a process per build for an answer already known. */
+  caps: Record<string, string[]>;
   scanning: boolean;
   /** Monotonic scan generation — the last scan to START is the one whose
    *  result may land; a superseded one discards its own (see `scan`). */
@@ -135,6 +146,36 @@ function applyRef(s: BuildsState, ref: string): void {
   if (parseRef(ref).kind === "pr") s.origin = "source";
 }
 
+/**
+ * Probe one build's flags into state, unless they are already known.
+ *
+ * A plain function over the draft rather than a method calling a method: a
+ * cell method's first argument is the runtime's draft, so a sibling call would
+ * be a second dispatch with a draft of its own — two commits where `scan`
+ * wanted one sequence.
+ *
+ * A failed probe writes `[]` and nothing else happens: `supportsFlag` reads an
+ * empty set as "switch nothing extra on", so the tuner is merely conservative.
+ * Recording the failure as an error would put a red line on screen about a
+ * question the user never asked.
+ */
+async function probeInto(
+  s: BuildsState,
+  id: string,
+  force = false,
+): Promise<void> {
+  if (!id) return;
+  if (!force && s.caps[id]) return;
+  const bin = s.installed.find((b) => b.id === id)?.serverBin ?? "";
+  if (!bin) return;
+  try {
+    const io = await import("./builds.server.ts");
+    s.caps[id] = await io.probeCaps(bin);
+  } catch {
+    s.caps[id] = [];
+  }
+}
+
 export const builds = cell("builds", {
   // aiol: pre-alpha52 behavior pinned — remove to adopt transactions (s.$commit/s.$live)
   transaction: false,
@@ -181,6 +222,7 @@ export const builds = cell("builds", {
     log: [] as string[],
     installed: [] as Build[],
     activeId: "",
+    caps: {} as Record<string, string[]>,
     scanning: false,
     scanEpoch: 0,
     upstream: { latestTag: "", masterSha: "", checkedAt: 0 } as Upstream,
@@ -281,8 +323,25 @@ export const builds = cell("builds", {
     setAsset(s, name: string) {
       s.assetName = name;
     },
-    setActive(s, id: string) {
+    async setActive(s, id: string) {
       s.activeId = id;
+      await probeInto(s, id);
+    },
+
+    /**
+     * Ask a build which flags it accepts, and remember the answer.
+     *
+     * Safe to call repeatedly: a build already probed is skipped, because the
+     * flags a binary on disk accepts do not change. `force` re-asks, which is
+     * what an update to the same id needs.
+     */
+    async probe(s, id?: string, force = false) {
+      // Resolved before the await, not inside the call: `id ?? s.activeId` on
+      // the same line as `await` reads as a post-await state read, and the one
+      // thing this must not do is probe whichever build happened to become
+      // active while it was suspended.
+      const target = id ?? s.activeId;
+      await probeInto(s, target, force);
     },
     clearLog(s) {
       s.log = [];
@@ -389,6 +448,16 @@ export const builds = cell("builds", {
         if (!list.some((b) => b.id === s.activeId)) { // aiol-ok
           s.activeId = list[0]?.id ?? "";
         }
+        // Forget builds that are no longer on disk, so a removed-and-rebuilt
+        // id cannot be answered from the flags its predecessor had.
+        for (const id of Object.keys(s.caps)) { // aiol-ok
+          if (!list.some((b) => b.id === id)) delete s.caps[id];
+        }
+        // Only the ACTIVE build is probed. Probing all of them would spawn a
+        // process per installed build on every scan for answers about builds
+        // nothing is going to run; `setActive` covers the moment one becomes
+        // interesting.
+        await probeInto(s, s.activeId); // aiol-ok — deliberate re-read
       } catch (e) {
         s.lastError = String(e);
       } finally {

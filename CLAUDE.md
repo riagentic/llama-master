@@ -861,6 +861,101 @@ cannot act on is a bug.
   because the same model at 8k and at 256k are different measurements, and it is
   cleared on every start. State key `lastBench`, not `bench` — aio refuses a
   cell whose state key shadows a method, and it is right to.
+- **The bench runs TWO prompts, and the PAIR is the measurement.** It measured
+  prose — chosen well, because prose runs to a steady state where a question an
+  instruct model answers in a sentence measures the first batch. The consequence
+  went unseen: speculative decoding pays on output that repeats itself and close
+  to nothing on prose, so every speculative setting in this app was being
+  measured at its WORST case, every time, while `tune.ts` told the user to go
+  and measure it. The instrument could not carry out the advice. `BENCH_PROMPTS`
+  is prose AND code now (`srv.benchBoth`, sequential — two generations in flight
+  share the server and each would be timing a machine busy doing the other).
+  Generation is bandwidth-bound and a byte of weights costs the same whatever
+  the text is about, so with drafting OFF the two land within a couple of
+  percent: prose is a self-calibrating baseline, and the gap that opens on code
+  is the drafter's acceptance rate in tok/s, on this machine. `specVerdict`
+  reads them together and refuses to speak from one — a code rate with no
+  baseline under it is exactly the "2.9x faster!" claim this exists to avoid
+  making. Bandwidth is still calibrated from PROSE only (`lastBench`, with
+  `lastBenchCode` beside it): a drafted token is not a token the memory bus paid
+  for, and calibrating off accepted drafts would report a machine several times
+  faster than it is.
+- **`-bs` is a real lever, and checking it against the local source cache is
+  how this app got it wrong once.** `--backend-sampling` picks the next token on
+  the GPU instead of copying the model's output row to the CPU every token —
+  megabytes per token on a large vocabulary, and worse than its size because the
+  copy is a SYNCHRONISATION POINT that stalls the device mid-loop. In the
+  catalog (`params.ts:backendSampling`, `llamaDef: false`, so the default emits
+  nothing) and the tuner TAKES it on a GPU placement whenever the build's probe
+  says the flag exists — it costs no memory, it composes with drafting, and a
+  build that has never heard of it is never handed it. A probed build that lacks
+  it is told so, because "the same model is quicker on a newer build" is
+  otherwise an unexplained difference. llama-server still drops it silently for a grammar,
+  a JSON schema or a reasoning budget (`common/sampling.cpp`, warns in the log);
+  `stability.ts` names the reasoning case, which is the one visible in the argv.
+  - **It DOES stack with speculative decoding, and this file said the opposite
+    for one round of work.** `tools/server/server-context.cpp` used to carry
+    `backend_sampling &= !(slot.can_speculate())` — "requires multiple samples
+    per batch - not supported yet" — which made the flag inert on any drafted
+    run. That line is gone from master; the two now compose, and it is the
+    combination worth having (drafting makes a token cheaper to produce, this
+    makes it cheaper to collect).
+  - **The cause is worth more than the fact: `~/.llama-master/cache/sources/`
+    is whatever the last BUILD fetched, not what upstream does today.**
+    `refMoves()` re-fetches `master` on every build, which is correct and is
+    not the same promise — with no master build since 2026-07-27, the checkout
+    sat six weeks behind while reading like the current source. It is the right
+    place to check a flag's spelling, its default, and whether it exists at all;
+    it is NOT evidence about behaviour that may have changed. For that, read
+    `raw.githubusercontent.com/ggml-org/llama.cpp/master/<path>` and compare.
+    A conclusion drawn from the cache alone was published here as a correction
+    to a third party who was right.
+- **A build is ASKED what it can do, and that is what lets the tuner turn
+  something on.** Every default in this app is one a stale llama.cpp can safely
+  ignore — until `-bs`, which an older binary refuses outright with `unknown
+  argument`. Inferring support from the version is not available either: a
+  release is a `b`-number, `master` is a day, and a PR stack has no version that
+  means anything. So `llama-server --help` is run once per build
+  (`builds.probe` → `builds.server.ts:probeCaps`, sandboxed to the builds root
+  the same way a start is, 5 s ceiling, both pipes because usage has gone to
+  stderr before now) and `src/lib/caps.ts` parses it. The parse splits each
+  option line at the first run of two-plus spaces NOT followed by another flag —
+  by column would be a guess about a layout upstream may change, by "two spaces"
+  alone would cut `-t,    --threads` in half — so a description that mentions
+  `--threads` can never be mistaken for a build that declares it. Verified
+  against a real b10151 binary: 410 flags, no placeholders, and it correctly
+  reported `--lazy-mode` ABSENT, which is the whole point.
+  - **An unprobed build supports nothing** (`supportsFlag(null, …) === false`).
+    The tuner then leaves a lever on the table, which is recoverable; the other
+    reading — "assume modern" — writes a command the binary cannot parse.
+  - `caps` is persisted per build id and dropped when the build leaves disk, so
+    a removed-and-rebuilt id is never answered from its predecessor's flags.
+    Only the ACTIVE build is probed: a process per installed build, per scan,
+    would be spent on builds nothing is going to run.
+  - The stub llama-server answers `--help` and exits for this reason. It did not,
+    and every `setActive` in the UI suite hung until the probe timed out — 23 s
+    of suite became 95 s, which is exactly what a wedged binary would do to the
+    app.
+- **A multi-token-prediction head does not always live in the model file.**
+  `tune` keys `draft-mtp` on `meta.nextnLayers > 0`, read from the header — and
+  Gemma 4 publishes its heads as a SEPARATE GGUF beside the weights
+  (`…-mtp-Q4_0.gguf`), passed to llama.cpp as a second model path, not as a
+  header key. So the header was honest, the tuner was honest, and the sentence
+  on screen was "this model ships no multi-token-prediction block, so there is
+  nothing to draft with for free" — printed over a 2-3x speed-up sitting
+  unopened in the same directory. Not a crash: worse, because nothing said
+  anything. `src/lib/mtp.ts` finds it (pure — the scan is handed in, because a
+  function that read the disk could not be tested against the naming shapes),
+  matching `mtp` as a whole TOKEN and requiring the rest of the name to pair
+  after quantisation labels are stripped: `…-Q8_0` beside `…-mtp-Q4_0` is the
+  normal case, while "any file with mtp in it" would pair a Gemma drafter to a
+  Qwen model — llama.cpp loads that, the vocabularies differ, every draft is
+  rejected, and the result is a SILENT slowdown. Attached only up to
+  `MTP_SIBLING_MAX_B` (2 GiB): a draft model's weights are VRAM `plan.ts` does
+  not bill, and a "drafter" larger than a head is a mispairing or a second full
+  model. Above it the tuner names the file and lets the user decide. `TuneOpts`
+  is the trailing argument that carries it, because `src/lib/` is pure and
+  finding the file is I/O.
 - **"Would a smaller quantisation be faster?" is the app's biggest speed lever
   and it used to be silent about it.** A smaller quant was named only in
   refusals ("try a smaller quantisation"); a model that FITS was never told that

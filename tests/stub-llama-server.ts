@@ -16,6 +16,44 @@ const flag = (name: string, fallback: string): string => {
   return i >= 0 ? args[i + 1] ?? fallback : fallback;
 };
 
+// `--help` must print and exit, the way a real llama-server does — the app
+// probes every build's flags this way (`src/lib/caps.ts`). A stub that started
+// a server instead left the probe hanging until its timeout, once per test that
+// selects a build: 23 s of suite became 95 s, which is the same bug a wedged
+// binary would cause in the app.
+//
+// The layout is copied from real `--help` output, aliases and value
+// placeholders included, because that layout is exactly what `parseHelpFlags`
+// has to survive. `--old-build` answers a llama.cpp from before `-bs` existed,
+// so the tuner's "this build cannot do that" branch has something to run
+// against.
+if (args.includes("--help")) {
+  const lines = [
+    "----- common params -----",
+    "",
+    "-h,    --help, --usage                  print usage and exit",
+    "-m,    --model FNAME                    model path (default: unset)",
+    "-t,    --threads N                      number of CPU threads to use during generation (default: -1)",
+    "                                        (env: LLAMA_ARG_THREADS)",
+    "-c,    --ctx-size N                     size of the prompt context (default: 0, 0 = loaded from model)",
+    "-ngl,  --gpu-layers, --n-gpu-layers N   number of layers to store in VRAM",
+    "--cpu-strict <0|1>                      use strict CPU placement (default: 0)",
+    "-ts,   --tensor-split N0,N1,N2,...      fraction of the model to offload to each GPU",
+    "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)",
+    "-np,   --parallel N                     number of parallel sequences to decode (default: -1)",
+    "--n-cpu-moe N                           keep the MoE weights of the first N layers in the CPU",
+    "--spec-type TYPE                        speculative decoding type",
+    "-md,   --model-draft FNAME              draft model for speculative decoding",
+    "--port PORT                             port to listen on (default: 8080)",
+    ...(args.includes("--old-build") ? [] : [
+      "-bs,   --backend-sampling              enable backend sampling (experimental) (default: disabled)",
+      "--fit <on|off>                         adjust unset parameters to fit device memory (default: on)",
+    ]),
+  ];
+  console.log(lines.join("\n"));
+  Deno.exit(0);
+}
+
 const port = Number(flag("--port", "8080"));
 const model = flag("-m", "");
 const ctx = Number(flag("-c", "4096"));
@@ -101,8 +139,19 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, async (req) => {
     // OTHER thing a bench can meet: a build old enough not to report them,
     // which has measured nothing — and must be reported as nothing rather than
     // as a machine running at 0 tokens a second.
-    const asked = await req.json().catch(() => ({})) as { n_predict?: number };
+    const asked = await req.json().catch(() => ({})) as {
+      n_predict?: number;
+      prompt?: string;
+    };
     const predict = Number(asked.n_predict ?? 2) || 2;
+    // `--drafting` models the ONE behaviour the bench pair exists to see: a
+    // drafter is paid only for the tokens the full model then accepts, so it
+    // roughly doubles the rate on output that repeats itself and does close to
+    // nothing on prose. A stub that answered the same number to both prompts
+    // would let a broken pairing (both slots fed the same prompt, or the code
+    // result overwriting the prose one) pass every assertion.
+    const codey = /TypeScript|JSDoc/i.test(String(asked.prompt ?? ""));
+    const rate = args.includes("--drafting") && codey ? 74.5 : 37.25;
     return Response.json({
       content: " ok",
       tokens_predicted: predict,
@@ -111,7 +160,7 @@ Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, async (req) => {
           prompt_n: 42,
           prompt_per_second: 512.5,
           predicted_n: predict,
-          predicted_per_second: 37.25,
+          predicted_per_second: rate,
         },
       }),
     });
