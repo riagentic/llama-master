@@ -6,7 +6,7 @@
 // on this machine — because a mocked filesystem would only prove the mock
 // agrees with the code.
 
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { bootCells, testCell } from "aio/testing";
 import { join } from "@std/path";
 
@@ -58,14 +58,14 @@ testCell(
   "an unknown parameter throws rather than writing a dead field",
   async (t) => {
     t.init();
-    // aio alpha43: a call starts when made and a method's throw REJECTS, as in
+    // A call starts when it is made and a method's throw REJECTS, as in
     // production — `assertThrows` around a dispatch asserts nothing, and the
-    // unawaited rejection used to cancel every later test in this file.
-    await assertRejects(
-      () => Promise.resolve(t.send.set("nglll", "8")),
-      Error,
-      "unknown parameter",
-    );
+    // unawaited rejection used to cancel every later test in this file. The
+    // `assertRejects(() => Promise.resolve(t.send…))` this used to need is
+    // retired: `t.expect.rejects` is the harness's own (aio 1.0.0-beta), and
+    // the pattern NARROWS the refusal, so a typo throwing `TypeError` can no
+    // longer pass for the validation this claims to test.
+    await t.expect.rejects(() => t.send.set("nglll", "8"), /unknown parameter/);
     t.expect.state((s) => s.settings.nglll === undefined);
   },
 );
@@ -85,10 +85,10 @@ testCell(
 testCell(cfg, "reset returns every parameter to its default", (t) => {
   t.init();
   t.send.set("ngl", "40");
-  t.send.set("mlock", true);
+  t.send.set("loadMode", "mlock");
   t.send.reset();
   t.expect.state((s) => s.touched.length === 0);
-  t.expect.state((s) => s.settings.mlock === false);
+  t.expect.state((s) => s.settings.loadMode === "auto");
 });
 
 testCell(cfg, "reset clears the context pin with everything else", (t) => {
@@ -286,6 +286,43 @@ testCell(
     t.expect.state((s) => s.lastError.length > 0);
     // Crucially: the callback DID write to state before the failure.
     t.expect.state((s) => s.log[0]?.includes("Looking up") === true);
+  },
+);
+
+testCell(
+  builds,
+  "update builds the version it is updating TO, not the one installed",
+  async (t) => {
+    // A nested `builds.start()` is a SECOND dispatch with its own draft, so it
+    // read `ref`, `origin` and `backend` as COMMITTED — from before the four
+    // lines `update` had just written. The job came out labelled with the
+    // version already on disk: an Update button that reinstalls what you have,
+    // reports success, and says it updated. The label is the assertion because
+    // it is built from those three fields before any I/O happens
+    // (`builds.ts:start`), so it says exactly what the sibling read.
+    t.init({
+      ref: "b1111",
+      origin: "release",
+      backend: "cpu",
+      activeId: "x",
+      installed: [{
+        id: "x",
+        ref: "b9999",
+        origin: "release",
+        backend: "cpu",
+        dir: "/tmp/x",
+        serverBin: "/tmp/x/llama-server",
+        cliBin: "/tmp/x/llama-cli",
+        createdAt: 0,
+        sizeB: 0,
+      }],
+      // A tag that cannot resolve, so the build fails at the lookup instead of
+      // downloading anything — the same shape the failing-job test above uses.
+      upstream: { latestTag: "b0-does-not-exist", masterSha: "", checkedAt: 1 },
+    });
+    await t.send.update();
+    t.expect.state((s) => s.ref === "b0-does-not-exist");
+    t.expect.state((s) => s.job?.label === "Install b0-does-not-exist (cpu)");
   },
 );
 
@@ -689,7 +726,7 @@ Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
       ) => Record<string, unknown>;
     };
   }).__aio;
-  assertEquals(def?.version, 3, "the shape changed, so the version must have");
+  assertEquals(def?.version, 4, "the shape changed, so the version must have");
   const migrate = def?.onMigrate;
   assert(migrate, "and a version bump with no hook only silences the warning");
   const old = {
@@ -713,6 +750,45 @@ Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
   // A store already past that version is left alone.
   const current = migrate({ ...old }, 2);
   assertEquals(current.reserveVramB, 4 * 1024 ** 3);
+});
+
+Deno.test("cfg: v4 renames mlock/no-mmap into the one load-mode setting", () => {
+  // Upstream deprecated `--mlock`, `--mmap`/`--no-mmap` and `--direct-io` in
+  // favour of `-lm/--load-mode` and then DELETED them, so a current
+  // llama-server answers either with `unknown argument` and exits before it has
+  // read the model path. The two booleans become one enum.
+  //
+  // Carried forward, unlike the reserve in v2: the old pair and the new enum
+  // say the same thing about the same file, so the user's choice survives the
+  // rename instead of being silently reset.
+  const migrate = (cfg as unknown as {
+    __aio: {
+      onMigrate: (
+        s: Record<string, unknown>,
+        from: number,
+      ) => Record<string, unknown>;
+    };
+  }).__aio.onMigrate;
+
+  const pinned = migrate(
+    { settings: { ngl: 99, mlock: true }, touched: ["ngl", "mlock"] },
+    3,
+  ) as { settings: Record<string, unknown>; touched: string[] };
+  assertEquals(pinned.settings.loadMode, "mlock");
+  assert(!("mlock" in pinned.settings), "the dead key is removed");
+  assertEquals(pinned.touched.sort(), ["loadMode", "ngl"]);
+
+  const unmapped = migrate({ settings: { noMmap: true }, touched: [] }, 3) as {
+    settings: Record<string, unknown>;
+  };
+  assertEquals(unmapped.settings.loadMode, "none", "--no-mmap meant no mmap");
+  assert(!("noMmap" in unmapped.settings));
+
+  // Neither set: nothing to carry, and no value invented.
+  const plain = migrate({ settings: { ngl: 1 }, touched: [] }, 3) as {
+    settings: Record<string, unknown>;
+  };
+  assert(!("loadMode" in plain.settings));
 });
 
 Deno.test("cfg: v3 drops the two settings whose flags left the catalog", () => {

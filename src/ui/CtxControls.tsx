@@ -103,6 +103,7 @@ function CtxRange(props: { meta: ModelMeta; ctxNow: number }) {
         ))}
         {/* Where the current setting actually sits. */}
         <div
+          key="needle"
           class="ctx-needle"
           t="ctx-needle"
           style={{ left: pct(props.ctxNow) }}
@@ -213,6 +214,7 @@ export function CtxControls(
               );
             })}
             <button
+              key="auto"
               type="button"
               class={`btn tiny${pinned ? "" : " on"}`}
               t={`${id}-optimal`}

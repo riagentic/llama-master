@@ -185,8 +185,17 @@ function Rail() {
           <span class="rail-label">{t.label}</span>
         </button>
       ))}
-      <div class="rail-spacer" />
-      <div class="rail-foot" title="Total size of installed builds and models">
+      {
+        /* Keys on the static siblings too: a container that mixes keyed and
+          unkeyed children leaves the reconciler matching by position on one
+          half and by key on the other, and aio names it at dev time. */
+      }
+      <div key="spacer" class="rail-spacer" />
+      <div
+        key="foot"
+        class="rail-foot"
+        title="Total size of installed builds and models"
+      >
         <div>{bytes(buildsSizeB())} builds</div>
         <div>{bytes(modelsSizeB())} models</div>
       </div>

@@ -20,9 +20,14 @@
   --panel-2: #161b24;
   --line: #222936;
   --line-soft: #1a202a;
+  /* Three steps, and every one of them READABLE — the same ramp the desktop
+     app uses, solved the same way. `--text-faint` was #5b6577: 3.11:1 on the
+     panel where WCAG AA asks 4.5:1 for body text, and this is body text.
+     Nothing had ever measured it; aio 1.0.0-beta's dev-time colour walk did.
+     Worst case over every background painted here: 11.2 / 7.0 / 4.5. */
   --text: #dfe5ee;
-  --text-dim: #8b95a6;
-  --text-faint: #5b6577;
+  --text-dim: #b0b7c2;
+  --text-faint: #8892a4;
   --accent: #f0a92e;
   --ok: #35d07f;
   --warn: #f4b942;
@@ -48,8 +53,9 @@
   --line: #d8dee8;
   --line-soft: #e6eaf1;
   --text: #1b2231;
-  --text-dim: #5b6577;
-  --text-faint: #8b95a6;
+  /* The same ramp, solved against the light backgrounds: 13.5 / 7.0 / 4.5. */
+  --text-dim: #474f5d;
+  --text-faint: #616c7f;
   --accent: #b9761a;
   --ok: #12905a;
   --warn: #a4720a;
@@ -577,12 +583,16 @@ input:disabled {
 
 .codeblock-lang,
 .codeblock-live {
-  color: var(--text-faint);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   flex: 0 0 auto;
 }
 
+.codeblock-lang {
+  color: var(--text-faint);
+}
+
+/* Still streaming — the one that is a STATE rather than a label. */
 .codeblock-live {
   color: var(--busy);
 }

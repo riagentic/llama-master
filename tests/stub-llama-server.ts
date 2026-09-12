@@ -17,40 +17,110 @@ const flag = (name: string, fallback: string): string => {
 };
 
 // `--help` must print and exit, the way a real llama-server does — the app
-// probes every build's flags this way (`src/lib/caps.ts`). A stub that started
-// a server instead left the probe hanging until its timeout, once per test that
-// selects a build: 23 s of suite became 95 s, which is the same bug a wedged
-// binary would cause in the app.
+// probes every build's flags this way (`src/lib/caps.ts`) and then REFUSES to
+// emit anything this list does not name (`command.ts:emitFor`). A stub that
+// started a server instead left the probe hanging until its timeout, once per
+// test that selects a build: 23 s of suite became 95 s, which is the same bug a
+// wedged binary would cause in the app.
 //
-// The layout is copied from real `--help` output, aliases and value
-// placeholders included, because that layout is exactly what `parseHelpFlags`
-// has to survive. `--old-build` answers a llama.cpp from before `-bs` existed,
-// so the tuner's "this build cannot do that" branch has something to run
+// The layout is copied from real `--help` output — aliases, value placeholders,
+// the two-space description margin, a continuation line — because that layout
+// is exactly what `parseHelpFlags` has to survive. WHAT it lists is the whole
+// catalog, because this stub stands in for a CURRENT llama.cpp: since the app
+// stopped emitting flags a probed build does not declare, a short illustrative
+// list turned every test build into an ancient one, and the symptom is a
+// setting quietly missing from the command with nothing explaining it.
+//
+// It cannot import the catalog — the stub is COPIED into a temporary builds
+// directory, where a relative import does not resolve — so
+// `tests/guards.test.ts` fails if the two ever drift.
+//
+// `--old-build` answers a llama.cpp from before `-bs` and `--fit` existed, so
+// the "this build cannot do that" branches still have something real to run
 // against.
 if (args.includes("--help")) {
+  const old = args.includes("--old-build");
+  const RECENT = ["-bs", "--fit"];
   const lines = [
     "----- common params -----",
     "",
     "-h,    --help, --usage                  print usage and exit",
     "-m,    --model FNAME                    model path (default: unset)",
+    // Aliases in the real comma-separated shape, which is the case that a
+    // by-column split and a plain two-space split both get wrong.
     "-t,    --threads N                      number of CPU threads to use during generation (default: -1)",
-    "                                        (env: LLAMA_ARG_THREADS)",
-    "-c,    --ctx-size N                     size of the prompt context (default: 0, 0 = loaded from model)",
     "-ngl,  --gpu-layers, --n-gpu-layers N   number of layers to store in VRAM",
     "--cpu-strict <0|1>                      use strict CPU placement (default: 0)",
-    "-ts,   --tensor-split N0,N1,N2,...      fraction of the model to offload to each GPU",
-    "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)",
-    "-np,   --parallel N                     number of parallel sequences to decode (default: -1)",
-    "--n-cpu-moe N                           keep the MoE weights of the first N layers in the CPU",
-    "--spec-type TYPE                        speculative decoding type",
-    "-md,   --model-draft FNAME              draft model for speculative decoding",
-    "--port PORT                             port to listen on (default: 8080)",
-    ...(args.includes("--old-build") ? [] : [
-      "-bs,   --backend-sampling              enable backend sampling (experimental) (default: disabled)",
-      "--fit <on|off>                         adjust unset parameters to fit device memory (default: on)",
-    ]),
+    "-ngl N                                  gpu layers",
+    "--n-cpu-moe N                           moe layers on cpu",
+    "--fit TYPE                              llama.cpp auto-fit",
+    "-sm TYPE                                split mode",
+    "-ts FNAME                               tensor split",
+    "-mg N                                   main gpu",
+    "-dev <dev1,dev2,..>                     gpus to use",
+    "-nkvo                                   keep kv cache on cpu",
+    "--spec-type TYPE                        speculative decoding",
+    "--lazy-mode TYPE                        lazy tensor reads",
+    "-md FNAME                               draft model",
+    "--spec-draft-n-max N                    draft tokens (max)",
+    "--spec-draft-n-min N                    draft tokens (min)",
+    "-bs                                     sample on the gpu",
+    "-ot FNAME                               tensor override",
+    "-c N                                    context size",
+    "-b N                                    batch size",
+    "-ub N                                   micro-batch size",
+    "-np N                                   parallel slots",
+    "--context-shift                         context shift",
+    "--no-context-shift                      context shift",
+    "--cache-reuse N                         cache reuse",
+    "--keep N                                keep tokens",
+    "-t N                                    threads",
+    "-tb N                                   threads (batch)",
+    "-fa TYPE                                flash attention",
+    "-ctk TYPE                               kv cache type (k)",
+    "-ctv TYPE                               kv cache type (v)",
+    "--load-mode TYPE                        model loading",
+    "--numa TYPE                             numa policy",
+    "--rope-scaling TYPE                     rope scaling",
+    "--rope-freq-base N                      rope freq base",
+    "--rope-freq-scale N                     rope freq scale",
+    "--temp N                                temperature",
+    "--top-k N                               top-k",
+    "--top-p N                               top-p",
+    "--min-p N                               min-p",
+    "--repeat-penalty N                      repeat penalty",
+    "--repeat-last-n N                       repeat window",
+    "-s N                                    seed",
+    "--host FNAME                            host",
+    "--port N                                port",
+    "-a FNAME                                model alias",
+    "--api-key FNAME                         api key",
+    "--jinja                                 jinja templates",
+    "--no-jinja                              jinja templates",
+    "--reasoning TYPE                        reasoning",
+    "--reasoning-budget N                    reasoning budget",
+    "--chat-template FNAME                   chat template",
+    "--cont-batching                         continuous batching",
+    "--no-cont-batching                      continuous batching",
+    "--metrics                               prometheus metrics",
+    "--slots                                 expose slots",
+    "--no-slots                              expose slots",
+    "--no-webui                              disable web ui",
+    "-to N                                   read timeout",
+    "-v                                      verbose log",
+    "-p FNAME                                prompt",
+    "-n N                                    tokens to predict",
+    "-cnv                                    conversation mode",
   ];
-  console.log(lines.join("\n"));
+  console.log(
+    lines.filter((l) => !old || !RECENT.some((f) => l.startsWith(f + " ")))
+      // One continuation line, indented, exactly as llama.cpp prints its
+      // `(env: …)` notes — the parser must not read it as another option.
+      .flatMap((l) =>
+        /^--?[A-Za-z]/.test(l) ? [l, " ".repeat(40) + "(env: …)"] : [l]
+      )
+      .join("\n"),
+  );
   Deno.exit(0);
 }
 
@@ -59,6 +129,18 @@ const model = flag("-m", "");
 const ctx = Number(flag("-c", "4096"));
 const readyAfter = Number(flag("--ready-after", "0"));
 const failAfter = Number(flag("--fail-after", "0"));
+
+// `--print-env NAME` makes the stub report one environment variable on stdout
+// and exit — the app's env-var feature (`src/lib/envvars.ts`) is about the
+// process ENVIRONMENT, which no HTTP endpoint can observe, so the test has to
+// read it the way the running process itself would.
+if (args.includes("--print-env")) {
+  for (const name of args.slice(args.indexOf("--print-env") + 1)) {
+    if (name.startsWith("-")) break;
+    console.log(`${name}=${Deno.env.get(name) ?? ""}`);
+  }
+  Deno.exit(0);
+}
 
 console.log(`build: 9999 (stub)`);
 console.log(`llama_model_loader: loading model from ${model}`);

@@ -194,6 +194,11 @@ export const conn = cell("conn", {
           // One answer is not a menu. Connecting to it is what the user was
           // going to do next anyway.
           const only = s.found[0];
+          // aiol-ok — a second dispatch, and safe because the URL travels as an
+          // ARGUMENT: `connect` reads `s.host`/`s.port` only when it is given
+          // no override, so there is nothing of this method's writes for it to
+          // read stale. Its own action is also what the user wants here — the
+          // connect shows up in the journal as a connect.
           if (only) await conn.connect(only.url);
         } else {
           s.status = s.url ? "connected" : "idle"; // aiol-ok — as above

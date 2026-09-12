@@ -46,16 +46,86 @@
  */
 export function parseHelpFlags(help: string): Set<string> {
   const out = new Set<string>();
+  /** The option the indented lines below currently belong to. */
+  let openFlags: string[] = [];
   for (const line of help.split("\n")) {
-    if (!line.startsWith("-")) continue;
+    if (!line.startsWith("-")) {
+      for (const v of valuesFromContinuation(line)) {
+        for (const f of openFlags) out.add(`${f}=${v}`);
+      }
+      continue;
+    }
     const head = splitHead(line);
+    const flags: string[] = [];
     for (const tok of head.split(/[,\s]+/)) {
       // `-h`, `--help`, `--cache-reuse`. Rejects value placeholders (`N`,
       // `<0|1>`, `lo-hi`) and anything that is not shaped like a flag.
-      if (/^--?[A-Za-z][A-Za-z0-9-]*$/.test(tok)) out.add(tok);
+      if (/^--?[A-Za-z][A-Za-z0-9-]*$/.test(tok)) flags.push(tok);
+    }
+    for (const f of flags) out.add(f);
+    openFlags = flags;
+    for (const v of valuesFromHead(head, flags)) {
+      for (const f of flags) out.add(`${f}=${v}`);
     }
   }
   return out;
+}
+
+/**
+ * The values an option ACCEPTS, as `--flag=value` entries beside the flag.
+ *
+ * The flag existing is not the whole question, and the half that was missing is
+ * the half that bites: master knows `--lazy-mode` and answers `--lazy-mode
+ * on-direct` with `error while handling argument "--lazy-mode": invalid value`,
+ * because that value arrived in a pull request (#28136) that master does not
+ * carry. Same shape as an unknown flag from the user's side — the server exits
+ * before it reads the model path — and the app has to tell them apart to say
+ * anything useful, since dropping the whole setting and falling back to
+ * llama.cpp's default is right in both cases.
+ *
+ * llama.cpp writes the list four ways and all four are read, because which one
+ * an option uses is not something this app gets to choose:
+ *
+ *   -ctk,  --cache-type-k TYPE       KV cache data type for K
+ *                                    allowed values: f32, f16, bf16, q8_0, …
+ *   -lm,   --load-mode MODE          model loading mode (default: auto)
+ *                                    - auto: mmap, unless a device does not …
+ *   -sm,   --split-mode {none,layer,row,tensor}
+ *   --spec-type none,draft-simple,draft-eagle3,draft-mtp,…
+ *
+ * An option whose values are NOT listed contributes no `=` entries at all, and
+ * the caller must then emit whatever it was going to — silence is "this help
+ * does not say", never "no values are allowed".
+ */
+const VALUE = /^[A-Za-z0-9][A-Za-z0-9_.+-]*$/;
+
+/** A comma/pipe list in the option's own placeholder. */
+function valuesFromHead(head: string, flags: readonly string[]): string[] {
+  // Everything after the last recognised alias is the placeholder.
+  const last = flags[flags.length - 1];
+  const at = last ? head.lastIndexOf(last) + last.length : 0;
+  const ph = head.slice(at).trim().replace(/^[{[(]|[}\])]$/g, "");
+  // `N0,N1,N2,...` and `MiB0,MiB1,...` are a SHAPE, not a list of choices, and
+  // they say so with the ellipsis. Without this check `-ts` would "allow" the
+  // literal value `N0`.
+  if (!ph || ph.includes("...")) return [];
+  if (!/[,|]/.test(ph)) return [];
+  const parts = ph.split(/[,|]/).map((x) => x.trim());
+  return parts.every((x) => VALUE.test(x)) ? parts : [];
+}
+
+/** `allowed values: …` and `- value: description` under an option. */
+function valuesFromContinuation(line: string): string[] {
+  const t = line.trim();
+  const allowed = t.match(/^allowed values:\s*(.+)$/i);
+  if (allowed) {
+    const parts = (allowed[1] as string).split(",").map((x) => x.trim());
+    return parts.every((x) => VALUE.test(x)) ? parts : [];
+  }
+  // `- layer (default): split layers …` — the parenthetical is llama.cpp's, not
+  // part of the value.
+  const bullet = t.match(/^-\s+([A-Za-z0-9][A-Za-z0-9_.+-]*)(\s+\([^)]*\))?:/);
+  return bullet ? [bullet[1] as string] : [];
 }
 
 /** The part of an option line before its description. */

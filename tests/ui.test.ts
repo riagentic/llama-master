@@ -236,6 +236,77 @@ testUI(
   },
 );
 
+testUI(
+  OnePage as never,
+  "the environment input prefixes the command, and refuses what it cannot honour",
+  async (ui_) => {
+    // The whole contract in one journey: type `GGML_CUDA_DISABLE_GRAPHS=1`,
+    // see it lead the command the way a shell would read it — and type
+    // something the input cannot honour and be TOLD, rather than watching it
+    // silently not appear.
+    await ui_.settle();
+    if (!ui.showCommand) ui.toggleCommand();
+    await ui_.settle();
+
+    const page = ui_.find("OnePage");
+    const envBox = () => page["one-cmd-env-input"];
+    await envBox().setValue("GGML_CUDA_DISABLE_GRAPHS=1");
+    // `setValue` types; `blur` is the commit — one write per edit, the same
+    // contract every DraftInput carries.
+    await envBox().blur();
+    await ui_.settle();
+
+    // The prefix leads the block, above the binary. Searched inside the
+    // block's own body — the page says "llama-server" in several places (the
+    // copy button's title among them), and the ORDER claim is about the
+    // command text, not the DOM around it.
+    assertStringIncludes(ui_.html(), "GGML_CUDA_DISABLE_GRAPHS=1");
+    const body = ui_.html().match(
+      /class="codeblock-body cmd-body"[^>]*>([^<]*)/,
+    )?.[1] ?? "";
+    const prefixed = body.indexOf("GGML_CUDA_DISABLE_GRAPHS=1");
+    const server = body.indexOf("llama-server");
+    assert(
+      prefixed >= 0 && server > prefixed,
+      `the prefix comes before the command; block reads: ${body.slice(0, 80)}`,
+    );
+    // A clean line stays quiet — no refusal sentence for nothing.
+    assert(!ui_.html().includes("cmd-env-bad"), "clean is quiet");
+
+    // A token that is not NAME=value is refused and NAMED, and the good ones
+    // survive beside it.
+    await envBox().setValue("oops GGML_CURL=http://x A=");
+    await envBox().blur();
+    await ui_.settle();
+    assertStringIncludes(ui_.html(), "oops");
+    assertStringIncludes(ui_.html(), "GGML_CURL=http://x");
+    // The refused tokens are named under the box — and they do not reach the
+    // command above it.
+    const body2 = ui_.html().match(
+      /class="codeblock-body cmd-body"[^>]*>([^<]*)/,
+    )?.[1] ?? "";
+    assert(!body2.includes("oops"), "a refused token never reaches the block");
+    assert(!body2.includes("A="), "an empty value never reaches the block");
+    // And the parsed one still prefixes the command.
+    assert(
+      body2.startsWith("GGML_CURL=http://x"),
+      `block: ${body2.slice(0, 60)}`,
+    );
+
+    // Clearing the box clears the prefix — an empty line means no variables.
+    await envBox().setValue("");
+    await envBox().blur();
+    await ui_.settle();
+    const body3 = ui_.html().match(
+      /class="codeblock-body cmd-body"[^>]*>([^<]*)/,
+    )?.[1] ?? "";
+    assert(
+      body3.startsWith("llama-server"),
+      `no prefix when the box is empty; block: ${body3.slice(0, 60)}`,
+    );
+  },
+);
+
 // ── tune ───────────────────────────────────────────────────────────────────
 
 testUI(

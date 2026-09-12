@@ -55,6 +55,8 @@ import {
 import type { BandwidthNote, BenchResult, SpecVerdict } from "../lib/bench.ts";
 import { findMtpSibling } from "../lib/mtp.ts";
 import type { MtpSibling } from "../lib/mtp.ts";
+import { parseEnvVars } from "../lib/envvars.ts";
+import type { EnvVar } from "../lib/envvars.ts";
 import { quantAdvice, quantOptions } from "../lib/quant.ts";
 import type { QuantOption } from "../lib/quant.ts";
 import type { SetupRow } from "../lib/setup.ts";
@@ -308,6 +310,32 @@ export function changedCount(): number {
  */
 export function shownSettings(): Settings {
   return srv.runSettings ?? cfg.settings;
+}
+
+/**
+ * The environment variables the command preview should show.
+ *
+ * The same rule as `shownSettings`: while a server is up, the prefix on the
+ * command is the one the RUNNING process carries — not whatever the input has
+ * drifted to since, because the preview's whole job is to describe what exists.
+ */
+export function shownEnv(): readonly EnvVar[] {
+  return srv.runEnv ?? parseEnvVars(cfg.envVars).vars;
+}
+
+/**
+ * The tokens of the env input that are not a `NAME=value` this app can honour,
+ * with the reason. Empty when the line is clean — a clean line stays quiet.
+ */
+export function envProblems(): { token: string; why: string }[] {
+  return parseEnvVars(cfg.envVars).bad.map((token) => ({
+    token,
+    why: token.includes("=")
+      ? token.endsWith("=")
+        ? "empty value — unset the variable instead of setting it to nothing"
+        : "the value is empty or carries a $, which a shell would expand and this input cannot"
+      : "not a NAME=value assignment",
+  }));
 }
 
 /**

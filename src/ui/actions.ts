@@ -28,6 +28,7 @@ import { stability } from "../lib/stability.ts";
 import type { Stability } from "../lib/stability.ts";
 import {
   activeBuild,
+  activeCaps,
   ctxOverride,
   currentModel,
   foundPrereqs,
@@ -39,6 +40,7 @@ import {
   planningHw,
   reserveCost,
   serverRunning,
+  shownEnv,
   unsupportedHere,
 } from "./derive.ts";
 
@@ -351,15 +353,25 @@ export function startServer(): Promise<void> {
     bin: serverBin(),
     model: model?.path ?? "",
     settings,
+    // What THIS build understands. A flag it has never heard of is not an
+    // ignored setting — llama-server exits with `unknown argument` before it
+    // reads the model path (`command.ts:emitFor`).
+    caps: activeCaps(),
   });
   return srv.start(command, serverUrl(settings), {
     model: model?.path ?? "",
     settings,
+    env: shownEnv(),
     freeAtStart: freeNowB(),
     // The ladder is only for settings the APP chose. A context the user typed
     // is an instruction, and halving it because it did not fit would be the app
     // overruling them silently (`src/lib/fitladder.ts`).
     autoFit: cfg.autoOptimal && !ctxOverride(),
+    // A pinned context does not pin the MICRO-BATCH. The tuner raised `-ub`
+    // above 512 to spend VRAM it thought was spare; if the load then dies for
+    // want of compute buffer, it may take that back without shortening the
+    // context the user asked for (`fitladder.ts:autoUbatch`).
+    autoUbatch: cfg.autoOptimal,
     lowPriority: cfg.lowPriority,
     shape: modelShape(model?.meta ?? null),
     // The cards llama.cpp will see, not every card the machine has. Both readers
@@ -437,10 +449,16 @@ export async function restartTuned(): Promise<void> {
     settings = r.tuning.settings;
     cfg.apply(r.tuning.settings, r.reasons);
   }
-  const command = argv("server", { bin, model: model.path, settings });
+  const command = argv("server", {
+    bin,
+    model: model.path,
+    settings,
+    caps: activeCaps(),
+  });
   await srv.start(command, serverUrl(settings), {
     model: model.path,
     settings,
+    env: shownEnv(),
     freeAtStart: freeNowB(),
     // The same run context `startServer` records, for the same reasons — this
     // is the restart most likely to meet a machine that just changed, so it
@@ -451,6 +469,7 @@ export async function restartTuned(): Promise<void> {
     // attribution. The ladder stays reserved for settings the APP chose: only
     // when the re-tune actually produced them, and never over a typed pin.
     autoFit: r !== null && !ctxOverride(),
+    autoUbatch: r !== null,
     lowPriority: cfg.lowPriority,
     shape: modelShape(model.meta ?? null),
     cardFreeB: hwSnapshot().gpus.map((g) =>
@@ -488,6 +507,9 @@ export async function updateNow(): Promise<void> {
   // run it replaces had the switch off.
   const autoFitBefore = srv.autoFit;
   const lowPriorityBefore = srv.runLowPriority;
+  // And the environment the run carried — same reason: the resumed run is the
+  // run that was, and its variables are part of what it was.
+  const envBefore = srv.runEnv;
 
   if (wasRunning) await srv.stop();
   // The RETURN value, not `builds.job`: a state read straight after an await
@@ -509,6 +531,7 @@ export async function updateNow(): Promise<void> {
         urlBefore || endpoint(),
         runBefore && {
           ...runBefore,
+          env: envBefore ?? undefined,
           freeAtStart: freeNowB(),
           autoFit: autoFitBefore,
           lowPriority: lowPriorityBefore,

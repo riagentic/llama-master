@@ -13,6 +13,8 @@
 import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
 import { exec, paths, PLATFORM } from "./host.server.ts";
+import type { EnvVar } from "../lib/envvars.ts";
+import { envPrefix, envRecord } from "../lib/envvars.ts";
 
 /** Trailing separator so `/builds-evil` cannot pass a `/builds` prefix test. */
 const BIN_NAME = PLATFORM === "windows" ? "llama-server.exe" : "llama-server";
@@ -35,6 +37,11 @@ type Slot = {
   startedAt: number;
   argv: string[];
 };
+
+/** The env prefix for the log's `$` line, or "". */
+function envPrefixText(env?: readonly EnvVar[]): string {
+  return env?.length ? envPrefix(env) + " " : "";
+}
 
 let slot: Slot | null = null;
 let exitCode: number | null = null;
@@ -245,8 +252,18 @@ export async function lowerPriority(pid: number): Promise<string> {
 }
 
 /** Spawn llama-server. Throws if one is already running or the binary will not
- *  start — never returns a half-started state. */
-export function start(argv: string[]): { pid: number } {
+ * start — never returns a half-started state.
+ *
+ * `env` is the user's variable set (`src/lib/envvars.ts`). The parser already
+ * refuses a shell expansion, an empty value and a bare word; the gate here is
+ * the LAST one that stands between a typed line and a live process, so it
+ * refuses rather than assumes — a variable that slipped through unset would be
+ * a run that differs from the command on screen in exactly the way this app
+ * exists to refuse. */
+export function start(
+  argv: string[],
+  env?: readonly EnvVar[],
+): { pid: number } {
   if (slot) {
     throw new Error(`llama-server is already running (pid ${slot.pid})`);
   }
@@ -268,13 +285,20 @@ export function start(argv: string[]): { pid: number } {
   exitCode = null;
   exitedAt = 0;
   buffer = [];
-  push(`$ ${argv.join(" ")}`);
+  // The prefix first, the way the command preview shows it: the `$` line is
+  // the one place the log restates what was asked for, and a variable that
+  // changes the run belongs in that restatement.
+  push(`$ ${envPrefixText(env)}${argv.join(" ")}`);
   const startedAtGeneration = stopGeneration;
 
   let child: Deno.ChildProcess;
   try {
     child = new Deno.Command(bin, {
       args,
+      // Deno MERGES `env` over the inherited environment rather than replacing
+      // it, so PATH and the app's own variables survive — verified, because the
+      // opposite behaviour would strand a binary whose loader needs them.
+      env: env?.length ? envRecord(env) : undefined,
       stdout: "piped",
       stderr: "piped",
       stdin: "null",

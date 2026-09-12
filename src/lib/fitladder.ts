@@ -151,6 +151,51 @@ export function isFitFailure(lines: readonly string[]): boolean {
  * thing that is too big. Walking down in small steps would spend several
  * whole-model loads to discover what one halving establishes.
  */
+/** llama.cpp's own `-ub` default, and the floor this ladder will not go under. */
+export const MIN_UBATCH = 512;
+
+/** The next micro-batch down, or 0 when there is no step left to take. */
+export function retryUbatch(current: number): number {
+  const half = Math.floor(current / 2);
+  return half >= MIN_UBATCH ? half : 0;
+}
+
+/** `-ub` in an argv, or 0 when it does not say one. */
+export function ubatchOf(argv: readonly string[]): number {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === "-ub" || argv[i] === "--ubatch-size") {
+      const n = Number(argv[i + 1]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  return 0;
+}
+
+/**
+ * The same argv with a smaller micro-batch — and a logical batch that still
+ * covers it.
+ *
+ * `-b` below `-ub` is not a configuration llama.cpp accepts as written: it
+ * clamps, and the command would then describe a run that is not happening. The
+ * tuner keeps them in step (`-b = max(2048, ub)`) and so does this.
+ */
+export function withUbatch(argv: readonly string[], ub: number): string[] {
+  const out = argv.slice();
+  let sawUb = false;
+  for (let i = 0; i < out.length - 1; i++) {
+    if (out[i] === "-ub" || out[i] === "--ubatch-size") {
+      out[i + 1] = String(ub);
+      sawUb = true;
+    }
+    if (out[i] === "-b" || out[i] === "--batch-size") {
+      const b = Number(out[i + 1]);
+      if (Number.isFinite(b) && b < ub) out[i + 1] = String(ub);
+    }
+  }
+  if (!sawUb) out.push("-ub", String(ub));
+  return out;
+}
+
 export function retryCtx(current: number): number {
   const half = Math.floor(current / 2 / CTX_STEP) * CTX_STEP;
   return half >= MIN_CTX ? half : 0;
@@ -271,6 +316,8 @@ export function vetoUnsupported(
 export type FitDecision =
   | { kind: "none" }
   | { kind: "retry"; ctx: number; attempt: number; note: string }
+  | { kind: "ubatch"; ubatch: number; attempt: number; note: string }
+  | { kind: "nospec"; attempt: number; note: string }
   | { kind: "offload"; nCpuMoe: number; attempt: number; note: string }
   | {
     kind: "drop";
@@ -299,6 +346,21 @@ export function fitDecision(args: {
   /** Off when the user is driving the settings by hand: an automatic retry
    *  would silently overwrite a context they chose on purpose. */
   auto: boolean;
+  /**
+   * May the ladder take the MICRO-BATCH back?
+   *
+   * A separate permission from `auto`, because they are separate choices. `auto`
+   * is off whenever the user pinned a context — "Max on Hybrid", or a number
+   * they typed — and shrinking that context would be the app overruling them.
+   * But `-ub` is not what they pinned: the tuner raised it from 512 to spend
+   * leftover VRAM on prefill speed (`tune.ts`), so the tuner may give it back,
+   * and giving it back costs prompt-ingestion speed and NOT one token of the
+   * length that was asked for. Off when the tuner is off, for the same reason
+   * `auto` is: then the micro-batch is the user's own.
+   */
+  autoUbatch?: boolean;
+  /** `-ub` as it ran. */
+  ubatch?: number;
   /** `--n-cpu-moe` as it ran. */
   nCpuMoe?: number;
   /** Layers this model has — the cap on the above. */
@@ -309,7 +371,8 @@ export function fitDecision(args: {
    *  rather than the whole allocation. Card total minus what else is on it. */
   deviceFreeB?: readonly number[];
 }): FitDecision {
-  if (!args.auto || args.tries >= MAX_FIT_RETRIES) return { kind: "none" };
+  if (args.tries >= MAX_FIT_RETRIES) return { kind: "none" };
+  if (!args.auto && !args.autoUbatch) return { kind: "none" };
 
   // BEFORE the memory rungs, because an abort is not an allocation failure and
   // neither of them would move it: the run would shrink its context five times
@@ -328,6 +391,65 @@ export function fitDecision(args: {
 
   const fault = fitFault(args.lines);
   if (!fault) return { kind: "none" };
+
+  // Speculative decoding off the model's own MTP block builds a SECOND FULL
+  // CONTEXT — its own KV cache, its own compute buffer on every device, and (on
+  // a recurrent model) three more copies of the recurrent state
+  // (`plan.ts:mtpDraft`). When THAT is what ran out, llama.cpp says so by name,
+  // and the cheapest possible answer is to stop drafting: it costs generation
+  // speed and nothing else — not one token of context, not one layer of
+  // residency — and the answer the model gives is identical either way.
+  //
+  // Deliberately NOT recorded as a capability the build lacks, unlike the
+  // `drop` rung above: this build can do it, this machine did not have room for
+  // it today. Writing it down would disable drafting for that build and model
+  // for ever, including on the day the desktop is not holding 5 GB of VRAM.
+  if (
+    fault === "context" &&
+    /failed to create MTP context|common_speculative_init/i.test(
+      args.lines.join("\n"),
+    )
+  ) {
+    return {
+      kind: "nospec",
+      attempt: args.tries + 1,
+      note:
+        "The main context loaded and then the draft context for speculative decoding did not fit — it is a second context, with its own cache and its own compute buffer on every card. " +
+        "Retrying without it. Nothing else about the plan changes: same context, same placement, same answers, only slower to produce them.",
+    };
+  }
+
+  // The micro-batch rung, and it comes FIRST among the memory rungs for a
+  // context fault — it is the cheapest thing on the table.
+  //
+  // The compute graph is sized `context x micro-batch` (`plan.ts:attnMaskB`),
+  // so halving `-ub` and halving `-c` free exactly the same bytes. They do not
+  // cost the same thing: halving `-c` takes away the length the user asked for,
+  // halving `-ub` takes away prompt-ingestion speed and nothing else — and the
+  // tuner is what raised `-ub` above 512 in the first place, precisely because
+  // it thought there was VRAM going spare. There was not, so it takes it back.
+  //
+  // Only down to 512 (llama.cpp's own default). Below that the placement itself
+  // may have chosen 256 to buy layers, and undoing that trade is the ladder
+  // working against the plan.
+  if (fault === "context" && args.autoUbatch) {
+    const now = args.ubatch ?? 0;
+    const next = retryUbatch(now);
+    if (next > 0) {
+      return {
+        kind: "ubatch",
+        ubatch: next,
+        attempt: args.tries + 1,
+        note:
+          `The compute buffer did not fit — retrying with a micro-batch of ${next.toLocaleString()} instead of ${now.toLocaleString()}. ` +
+          `It is sized context x micro-batch, so this frees as much as halving the context would, and it costs prompt-ingestion speed rather than the context you asked for.`,
+      };
+    }
+  }
+
+  // Everything below shrinks something the USER asked for — the residency, then
+  // the context — so it needs the full permission, not the micro-batch one.
+  if (!args.auto) return { kind: "none" };
 
   if (fault === "weights") {
     const perLayerB = args.expertPerLayerB ?? 0;

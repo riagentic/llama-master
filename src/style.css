@@ -42,9 +42,18 @@ body {
   --panel-2: #161b24;
   --line: #222936;
   --line-soft: #1a202a;
+  /* Three steps, and every one of them READABLE. `--text-faint` was #5b6577,
+     which is 3.11:1 on the panel and 2.42:1 on a selected card's accent wash —
+     WCAG AA asks 4.5:1 for body text, and this is body text: units, sub-lines,
+     parameter tips. Nothing had ever measured it; aio 1.0.0-beta's dev-time
+     colour walk did, on twelve elements at once. Raising faint alone would
+     have collapsed it into dim (4.53 against 4.70) and quietly cost the design
+     a level, so the whole ramp moved up: the app still says which text is
+     secondary, and all of it can be read. Worst case over every background
+     this app paints, the accent wash included: 11.2 / 7.0 / 4.5. */
   --text: #dfe5ee;
-  --text-dim: #8b95a6;
-  --text-faint: #5b6577;
+  --text-dim: #b0b7c2;
+  --text-faint: #8892a4;
 
   --accent: #f0a92e;
   --accent-soft: rgba(240, 169, 46, 0.14);
@@ -103,8 +112,9 @@ body {
   --line: #d8dee8;
   --line-soft: #e6eaf1;
   --text: #1b2231;
-  --text-dim: #5b6577;
-  --text-faint: #8b95a6;
+  /* The same ramp, solved against the light backgrounds: 13.5 / 7.0 / 4.5. */
+  --text-dim: #474f5d;
+  --text-faint: #616c7f;
   --accent: #b9761a;
   --accent-soft: rgba(185, 118, 26, 0.12);
   --ok: #12905a;
@@ -1295,6 +1305,10 @@ input[type="checkbox"] {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--busy) 25%, transparent);
 }
 
+/* Only what the two genuinely share. `white-space` and `color` differ, so they
+   live on each class rather than being set here and overridden below — a reader
+   of the shared block should not have to scroll to find out that half of it
+   does not apply. */
 .log,
 .cmd {
   font-family: var(--mono);
@@ -1305,14 +1319,18 @@ input[type="checkbox"] {
   border: 1px solid var(--line-soft);
   border-radius: var(--radius);
   overflow: auto;
-  white-space: pre-wrap;
   word-break: break-word;
+}
+
+.log {
+  white-space: pre-wrap;
   color: var(--text-dim);
 }
 
+/* A command is never re-wrapped: a broken line is a different command. */
 .cmd {
-  color: var(--text);
   white-space: pre;
+  color: var(--text);
 }
 
 .cmd.dim {
@@ -1795,6 +1813,47 @@ pre.cmd-body {
   margin: 0;
 }
 
+/* The env-var input: one row inside the command panel, in the panel's own
+   voice — a label, a box that fills, and the refusal sentence under it when a
+   token is not a NAME=value this app can honour. */
+.cmd-env {
+  display: grid;
+  gap: 4px;
+}
+
+.cmd-env-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cmd-env-label {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.cmd-env-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.cmd-env-bad {
+  font-size: var(--fs-sm);
+  color: var(--warn);
+  word-break: break-word;
+}
+
+/* Settings this build has no flag for, under the command they are absent from.
+   Inside the code block, because it is a statement ABOUT that command. */
+.cmd-dropped {
+  font-size: var(--fs-sm);
+  color: var(--warn);
+  padding: 0.35rem 0.6rem 0.5rem;
+  word-break: break-word;
+}
+
 /* ── chat ──────────────────────────────────────────────────────────────── */
 
 .chat-tab {
@@ -1917,12 +1976,16 @@ pre.cmd-body {
 
 .codeblock-lang,
 .codeblock-live {
-  color: var(--text-faint);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   flex: 0 0 auto;
 }
 
+.codeblock-lang {
+  color: var(--text-faint);
+}
+
+/* Still streaming — the one that is a STATE rather than a label. */
 .codeblock-live {
   color: var(--busy);
 }
@@ -2530,14 +2593,20 @@ pre.cmd-body {
 }
 
 /* One row per core: index, bar, percentage. Reads as a bar chart without being
-   one, and stays legible at 32 cores. */
-.cores {
+   one, and stays legible at 32 cores.
+
+   Named apart from the dashboard's `.cores`/`.core` (the 26px strip of bare
+   bars) because both were spelled the same and 1,200 lines apart, so THIS rule
+   won in both places: the dashboard's strip was being laid out as a three-column
+   grid it has no children for. Two components wanting opposite layouts from one
+   class name is not a cascade, it is a collision. */
+.core-rows {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 3px 12px;
 }
 
-.core {
+.core-row {
   display: grid;
   grid-template-columns: 2.5ch 1fr 4ch;
   align-items: center;

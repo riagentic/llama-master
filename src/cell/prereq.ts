@@ -86,6 +86,9 @@ export const prereq = cell("prereq", {
         const result = await io.fix(
           id,
           (line) => {
+            // aiol-ok — a streaming progress callback: reading the log back to
+            // append to it IS the mechanism, and it must see what earlier lines
+            // of the same run wrote.
             s.fixLog = appendLog(s.fixLog.slice(), [line], 200);
           },
           (received, total, note) => {
@@ -118,6 +121,12 @@ export const prereq = cell("prereq", {
       s.fixQueue = queue;
       for (const id of queue) {
         s.fixQueue = s.fixQueue.filter((q) => q !== id);
+        // aiol-ok — a SECOND dispatch on purpose, not an oversight. `fix` reads
+        // nothing this method has written (its only guard is `s.fixing`, which
+        // it owns), and the separate commit is the point: `s.$call.fix(id)`
+        // would fold the whole queue into one action, so the fix log and the
+        // progress bar would not move until every item had finished. One
+        // dispatch per item is what makes a queue watchable.
         await prereq.fix(id);
         // aiol-ok: `fix` writes lastError, and reading it back is how this
         // queue knows to stop — the post-await read IS the mechanism.

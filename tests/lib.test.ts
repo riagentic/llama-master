@@ -30,11 +30,12 @@ import {
   argv,
   commandBlock,
   commandLine,
+  droppedFlags,
   quote,
   serverUrl,
 } from "../src/lib/command.ts";
+import { envPrefix, envRecord, parseEnvVars } from "../src/lib/envvars.ts";
 import {
-  bool,
   coerce,
   defaults,
   num,
@@ -43,11 +44,14 @@ import {
   str,
 } from "../src/lib/params.ts";
 import {
+  attnMaskB,
   computeScratch,
   effectiveCtx,
+  hybridScratch,
   kvLayers,
   kvPerToken,
   kvTotal,
+  mtpDraft,
   NO_MODEL,
   plan,
   recurrentStateB,
@@ -82,11 +86,13 @@ import {
   nCpuMoeOf,
   openingCtx,
   requestedB,
+  ubatchOf,
   unsupportedFeature,
   vetoUnsupported,
   withCtx,
   withNCpuMoe,
   withoutFlag,
+  withUbatch,
 } from "../src/lib/fitladder.ts";
 import type { Hw, ModelMeta, Settings } from "../src/lib/types.ts";
 import {
@@ -228,7 +234,15 @@ import {
   replyBlocks,
   transcript,
 } from "../src/lib/richtext.ts";
-import { gpu, hw, layers, meta, moeMeta, NO_GPU } from "./fixtures.ts";
+import {
+  gpu,
+  hw,
+  layers,
+  meta,
+  moeMeta,
+  NO_GPU,
+  ornithMeta,
+} from "./fixtures.ts";
 import {
   fileBpw,
   qualityNote,
@@ -321,9 +335,9 @@ Deno.test("params: coerce clamps, rejects NaN, and keeps types", () => {
   assertEquals(coerce(ngl, "abc"), ngl.def, "NaN falls back to the default");
   const temp = param("temp")!;
   assertEquals(coerce(temp, "0.35"), 0.35);
-  const mlock = param("mlock")!;
-  assertEquals(coerce(mlock, true), true);
-  assertEquals(coerce(mlock, "false"), false);
+  const slots = param("slots")!;
+  assertEquals(coerce(slots, true), true);
+  assertEquals(coerce(slots, "false"), false);
 });
 
 Deno.test("params: a range that the tip documents is actually reachable", () => {
@@ -345,7 +359,7 @@ Deno.test("params: a range that the tip documents is actually reachable", () => 
 Deno.test("params: typed readers fall back to catalog defaults", () => {
   assertEquals(num({}, "ctxSize"), 4096);
   assertEquals(str({}, "host"), "127.0.0.1");
-  assertEquals(bool({}, "mlock"), false);
+  assertEquals(str({}, "loadMode"), "auto");
   assertEquals(num({ ctxSize: 32768 }, "ctxSize"), 32768);
 });
 
@@ -375,7 +389,7 @@ Deno.test("command: a flag is omitted only when llama.cpp would agree", () => {
   assertEquals(cmd[cmd.indexOf("-np") + 1], "1");
   // Everything whose catalog default really is llama.cpp's stays absent — the
   // command is still short enough to read, which is the point of omitting.
-  for (const flag of ["-fa", "-ts", "--mlock", "--no-mmap", "-ctk", "-ctv"]) {
+  for (const flag of ["-fa", "-ts", "--load-mode", "-ctk", "-ctv"]) {
     assertEquals(cmd.includes(flag), false, `${flag} should be absent`);
   }
 });
@@ -644,14 +658,14 @@ Deno.test("command: the block form keeps each flag with its value", () => {
   const lines = commandBlock("server", {
     bin: "llama-server",
     model: "/m/x.gguf",
-    settings: { ...defaults(), ngl: 99, mlock: true },
+    settings: { ...defaults(), ngl: 99, loadMode: "mlock" },
   });
   assertEquals(lines.slice(0, 3), [
     "llama-server",
     "  -m /m/x.gguf",
     "  -ngl 99",
   ]);
-  assert(lines.includes("  --mlock"), lines.join("\n"));
+  assert(lines.includes("  --load-mode mlock"), lines.join("\n"));
   // One flag per line, value attached to it — never a line of bare values.
   for (const l of lines.slice(1)) assert(l.startsWith("  -"), l);
 });
@@ -1046,7 +1060,7 @@ Deno.test("tune: never leaves the machine over its RAM budget silently", () => {
     },
   });
   const { settings, reasons } = tune(m, machine, defaults(), "cpu");
-  assertEquals(settings.mlock, false, "never pin what does not fit");
+  assertEquals(settings.loadMode, "auto", "never pin what does not fit");
   assert(
     reasons.some((r) => r.includes("RAM")),
     `the shortfall must be named: ${JSON.stringify(reasons)}`,
@@ -2899,6 +2913,97 @@ Deno.test("command: extra arguments reach argv exactly as typed", () => {
   const blank = argv("server", { ...base, settings: { extraArgs: "   " } });
   assertEquals(blank.at(-1) === "" || /^-/.test(String(blank.at(-2))), true);
   assertEquals(blank.includes("--lora"), false);
+});
+
+// ── the user's environment variables ───────────────────────────────────────
+
+Deno.test("env: NAME=value tokens parse, and everything else is named", () => {
+  // The shape the input exists for: one or more assignments the process will
+  // read at startup.
+  const ok = parseEnvVars("GGML_CUDA_DISABLE_GRAPHS=1");
+  assertEquals(ok, {
+    vars: [{ name: "GGML_CUDA_DISABLE_GRAPHS", value: "1" }],
+    bad: [],
+  });
+  const two = parseEnvVars("A=1 B=2");
+  assertEquals(two.vars.map((v) => v.name), ["A", "B"]);
+  // Whitespace-tolerant, and empty means "no variables".
+  assertEquals(parseEnvVars("   ").vars, []);
+  assertEquals(parseEnvVars("").vars, []);
+
+  // Everything the input CANNOT honour is refused and NAMED — a token that
+  // disappears silently is a setting the user believes in that does not exist.
+  assertEquals(parseEnvVars("justaword").bad, ["justaword"]);
+  // No value: half a line, or a pasted $VAR whose expansion cannot happen here.
+  assertEquals(parseEnvVars("A=").bad, ["A="]);
+  assertEquals(parseEnvVars("A=$X").bad, ["A=$X"]);
+  // Not an identifier the shell would accept as an assignment target.
+  assertEquals(parseEnvVars("9B=1").bad, ["9B=1"]);
+  assertEquals(parseEnvVars("A-B=1").bad, ["A-B=1"]);
+  // The good survive beside the bad — one typo does not void the line.
+  const mixed = parseEnvVars("A=1 oops B=2");
+  assertEquals(mixed.vars.map((v) => v.name), ["A", "B"]);
+  assertEquals(mixed.bad, ["oops"]);
+
+  // A value may carry a space: pasted with quotes (the shell spelling), the
+  // quotes are SYNTAX and are stripped, the value arrives as one token.
+  const sp = parseEnvVars("LLAMA_CURL='-x http://host:1'");
+  assertEquals(sp.vars, [{ name: "LLAMA_CURL", value: "-x http://host:1" }]);
+  assertEquals(sp.bad, []);
+});
+
+Deno.test("env: the record is spawn-shaped, last one wins as a shell would", () => {
+  assertEquals(envRecord(parseEnvVars("A=1 B=x").vars), { A: "1", B: "x" });
+  // A duplicate is one input line edited in place far more often than two
+  // variables competing — the shell's own answer.
+  assertEquals(envRecord(parseEnvVars("A=1 A=2").vars), { A: "2" });
+  assertEquals(envRecord([]), {});
+});
+
+Deno.test("env: the prefix reads as a shell would, quoted per assignment", () => {
+  assertEquals(envPrefix([{ name: "A", value: "1" }]), "A=1");
+  assertEquals(
+    envPrefix([{ name: "A", value: "1" }, { name: "B", value: "2" }]),
+    "A=1 B=2",
+  );
+  // A value with a space is one shell word only when quoted.
+  assertEquals(
+    envPrefix([{ name: "LLAMA_CURL", value: "-x http://h" }]),
+    `LLAMA_CURL='-x http://h'`,
+  );
+});
+
+Deno.test("command: the env prefix leads the display forms, never the argv", () => {
+  const base = {
+    bin: "/b/llama-server",
+    model: "/m.gguf",
+    settings: {},
+    home: "/home/me",
+  };
+  const env = [{ name: "GGML_CUDA_DISABLE_GRAPHS", value: "1" }];
+  // argv is UNTOUCHED: everything downstream (the `-m`/`-c` surgery the fit
+  // ladder does, `srv.server.ts`'s sandbox check on argv[0]) indexes it, and
+  // an env token must not be able to move any of that by one position. argv
+  // takes no `env` at all — that is the point.
+  assertEquals(
+    argv("server", { bin: "/b/llama-server", model: "/m.gguf", settings: {} }),
+    argv("server", base),
+  );
+  assert(
+    !argv("server", base).includes("GGML_CUDA_DISABLE_GRAPHS=1"),
+    "no env token may enter the argv",
+  );
+  // The one-liner carries the prefix the way a shell reads it.
+  const line = commandLine("server", { ...base, env });
+  assertStringIncludes(line, "GGML_CUDA_DISABLE_GRAPHS=1 /b/llama-server");
+  // And the block form gives it its own line, because a `\`-continuation that
+  // began with NAME=value would not be one the shell reads as an assignment
+  // for the command at the end of it.
+  const block = commandBlock("server", { ...base, env });
+  assertEquals(block[0], "GGML_CUDA_DISABLE_GRAPHS=1");
+  assert(block[1]?.includes("llama-server"), "the command follows");
+  // No variables: no prefix, no empty line — the forms are exactly as before.
+  assertEquals(commandBlock("server", base)[0]?.includes("llama-server"), true);
 });
 
 // ── which GPUs llama.cpp may use ───────────────────────────────────────────
@@ -4807,7 +4912,7 @@ Deno.test("tune: an expert-heavy tail is split by bytes, not by layer count", ()
   );
 });
 
-Deno.test("tune: --mlock is only promised when the kernel would honour it", () => {
+Deno.test("tune: mlock is only promised when the kernel would honour it", () => {
   // The report, from the app's own running state: a CPU placement of a 145 GB
   // model came out with `mlock: true` and the reason "pinning them stops the OS
   // paging the model out mid-generation". Stock RLIMIT_MEMLOCK on that machine
@@ -4833,7 +4938,11 @@ Deno.test("tune: --mlock is only promised when the kernel would honour it", () =
     lockableB: 23.3 * GB, // what this machine actually allows
   };
   const cpu = tune(big, hw({ gpus: [], mem: roomy }), defaults(), "cpu");
-  assertEquals(cpu.settings.mlock, false, "100 GB cannot be pinned under 23");
+  assertEquals(
+    cpu.settings.loadMode,
+    "auto",
+    "100 GB cannot be pinned under 23",
+  );
   assert(
     cpu.reasons.some((r) => r.includes("RLIMIT_MEMLOCK")),
     `and it names the limit rather than going quiet: ${
@@ -4845,7 +4954,11 @@ Deno.test("tune: --mlock is only promised when the kernel would honour it", () =
   // it is only promised when it means something.
   const small = meta({ nLayer: 32, layers: layers(32, 200 * MB) });
   const fits = tune(small, hw({ gpus: [], mem: roomy }), defaults(), "cpu");
-  assertEquals(fits.settings.mlock, true, "6 GB under a 23 GB limit is fine");
+  assertEquals(
+    fits.settings.loadMode,
+    "mlock",
+    "6 GB under a 23 GB limit is fine",
+  );
 
   // And a machine that does not report a limit is never promised anything:
   // "unknown" is a reason to stay quiet, not to assume the best.
@@ -4855,15 +4968,19 @@ Deno.test("tune: --mlock is only promised when the kernel would honour it", () =
     defaults(),
     "cpu",
   );
-  assertEquals(silent.settings.mlock, false);
+  assertEquals(silent.settings.loadMode, "auto");
 });
 
 Deno.test("tune: never emits two flags that are the same llama.cpp setting", () => {
-  // `--mlock` and `--no-mmap` both assign `params.load_mode` (`common/arg.cpp`),
-  // so passing both is not "locked and unmapped" — it is whichever came last,
-  // silently. The app would then print a reason claiming --mlock while shipping
-  // an argv that cancelled it. Checked across the shapes that reach the branch:
-  // a MoE with experts on the host, a dense model, and a machine with no room.
+  // `--mlock` and `--no-mmap` both assigned `params.load_mode`
+  // (`common/arg.cpp`), so passing both was not "locked and unmapped" — it was
+  // whichever came last, silently, while the app printed a reason claiming the
+  // other. Upstream has since collapsed them into `-lm/--load-mode` and DELETED
+  // both, so the catalog now holds one enum and this is structural. The test
+  // stays because the SPELLING is not the rule — one setting, one flag is —
+  // and because the branch it covers still has to choose the right value.
+  // Checked across the shapes that reach it: a MoE with experts on the host, a
+  // dense model, and a machine with no room.
   const MB = 1024 * 1024;
   const roomy = {
     totalB: 186 * GB,
@@ -4904,9 +5021,12 @@ Deno.test("tune: never emits two flags that are the same llama.cpp setting", () 
     for (const p of ["vram", "hybrid", "cpu"] as const) {
       const { settings } = tune(m, machine, defaults(), p);
       const cmd = argv("server", { bin: "s", model: "m", settings });
+      const loadFlags = cmd.filter((t) =>
+        t === "--load-mode" || t === "--mlock" || t === "--no-mmap"
+      );
       assert(
-        !(cmd.includes("--mlock") && cmd.includes("--no-mmap")),
-        `${name} / ${p}: both flags emitted — ${cmd.join(" ")}`,
+        loadFlags.length <= 1,
+        `${name} / ${p}: more than one load-mode flag — ${cmd.join(" ")}`,
       );
       // Routed experts on the host get llama.cpp's mmap default, and NO flag:
       // --no-mmap re-copied the whole file on every start (160 s where mmap
@@ -4914,12 +5034,14 @@ Deno.test("tune: never emits two flags that are the same llama.cpp setting", () 
       // would ask to pin more than stock memlock limits allow, so its stated
       // effect would not happen. Measured on the 145 GB DeepSeek-V4.
       if (Number(settings.nCpuMoe ?? 0) > 0) {
-        assert(
-          !cmd.includes("--no-mmap") && !cmd.includes("--mlock"),
+        assertEquals(
+          settings.loadMode,
+          "auto",
           `${name} / ${p}: experts on host must stay memory-mapped — ${
             cmd.join(" ")
           }`,
         );
+        assertEquals(loadFlags.length, 0, "and emit no flag at all");
       }
     }
   }
@@ -7115,4 +7237,488 @@ Deno.test("tune: GPU sampling is taken only when the build declares it", () => {
   // CPU-only: there is no device to keep the logits on, so the flag would be a
   // claim about nothing.
   assertEquals(T({ caps: ["-bs"] }, "cpu").settings.backendSampling, false);
+});
+
+// ── what THIS build understands (src/lib/command.ts, src/lib/caps.ts) ───────
+
+/** A build that has been probed and knows everything in the catalog. */
+const MODERN = PARAMS.flatMap((p) => [p.flag, p.offFlag]).filter((
+  f,
+): f is string => !!f);
+
+Deno.test("command: a flag this build has never heard of is left out", () => {
+  // Upstream REMOVES flags, not just adds them. `--mlock` and `--no-mmap` were
+  // deprecated in favour of `-lm/--load-mode` and then deleted, so a master
+  // build meets either with `unknown argument` and exits before it has read the
+  // model path — which is how "llama.cpp master fails" looked from the outside:
+  // no diagnosis, no model name, nothing on screen about a flag.
+  const settings = { ...defaults(), ctxSize: 8192, backendSampling: true };
+  const old = MODERN.filter((f) => f !== "-bs" && f !== "--backend-sampling");
+
+  const on = argv("server", { bin: "s", model: "m", settings, caps: MODERN });
+  assert(on.includes("-bs"), `a build that has it gets it: ${on.join(" ")}`);
+
+  const off = argv("server", { bin: "s", model: "m", settings, caps: old });
+  assert(
+    !off.includes("-bs"),
+    `a build that has not, does not: ${off.join(" ")}`,
+  );
+  // And only that one: nothing else is collateral.
+  assertEquals(
+    on.filter((t) => t !== "-bs").join(" "),
+    off.join(" "),
+    "dropping one flag must not disturb the rest of the command",
+  );
+});
+
+Deno.test("command: an UNPROBED build is given everything", () => {
+  // The opposite default from `caps.ts:supportsFlag`, and deliberately.
+  // There the question is "may the tuner switch an extra thing ON?" and silence
+  // means no. Here it is "should the app DELETE a setting the user can see?",
+  // and deleting on a guess would strip flags from every build the probe never
+  // managed to reach.
+  const settings = { ...defaults(), backendSampling: true };
+  const full = argv("server", { bin: "s", model: "m", settings, caps: MODERN });
+  for (const caps of [undefined, null, []]) {
+    assertEquals(
+      argv("server", { bin: "s", model: "m", settings, caps }).join(" "),
+      full.join(" "),
+      `caps=${JSON.stringify(caps)} means "not probed", not "supports nothing"`,
+    );
+  }
+});
+
+Deno.test("command: an older build gets the older spelling of load-mode", () => {
+  // The rename has a legacy map (`params.ts:loadMode`), so a release from
+  // before `-lm` still does what the user asked rather than losing the setting.
+  const settings = { ...defaults(), loadMode: "mlock" };
+  const oldBuild = MODERN.filter((f) => f !== "--load-mode").concat([
+    "--mlock",
+    "--no-mmap",
+  ]);
+
+  const now = argv("server", { bin: "s", model: "m", settings, caps: MODERN });
+  assertEquals(now[now.indexOf("--load-mode") + 1], "mlock");
+  assert(
+    !now.includes("--mlock"),
+    "a current build is never given the old one",
+  );
+
+  const then = argv("server", {
+    bin: "s",
+    model: "m",
+    settings,
+    caps: oldBuild,
+  });
+  assert(then.includes("--mlock"), `the old spelling: ${then.join(" ")}`);
+  assert(!then.includes("--load-mode"));
+
+  // "none" meant --no-mmap; "auto" and "mmap" were the default and emit nothing.
+  const none = argv("server", {
+    bin: "s",
+    model: "m",
+    settings: { ...defaults(), loadMode: "none" },
+    caps: oldBuild,
+  });
+  assert(none.includes("--no-mmap"), none.join(" "));
+
+  // And a build that has NEITHER spelling gets neither, rather than a token it
+  // would refuse to parse.
+  const ancient = MODERN.filter((f) => f !== "--load-mode");
+  const gone = argv("server", {
+    bin: "s",
+    model: "m",
+    settings,
+    caps: ancient,
+  });
+  assert(!gone.includes("--mlock") && !gone.includes("--load-mode"));
+});
+
+Deno.test("command: what was left out is named, not silently dropped", () => {
+  // A setting that disappears with no explanation is a setting the user
+  // believes in that does not exist — the same failure the environment box
+  // refuses to commit.
+  const settings = { ...defaults(), backendSampling: true, lazyMode: "on" };
+  const old = MODERN.filter((f) => f !== "-bs" && f !== "--lazy-mode");
+  const gone = droppedFlags("server", { settings, caps: old });
+  assertEquals(gone.map((g) => g.flag).sort(), ["--lazy-mode", "-bs"]);
+  for (const g of gone) assert(g.label.length > 0, "and in the user's words");
+
+  // Nothing to report for a build that has them, or for one never probed.
+  assertEquals(droppedFlags("server", { settings, caps: MODERN }).length, 0);
+  assertEquals(droppedFlags("server", { settings, caps: null }).length, 0);
+  // Nor for a setting sitting at llama.cpp's own default: nothing was going to
+  // be emitted, so nothing was dropped.
+  assertEquals(
+    droppedFlags("server", { settings: defaults(), caps: [] as string[] })
+      .length,
+    0,
+  );
+});
+
+// ── the compute buffer this file used to be blind to (src/lib/plan.ts) ──────
+
+Deno.test("plan: the attention mask is context x micro-batch", () => {
+  // llama.cpp builds `kq_mask` as `[n_kv, n_tokens]`, f16 under flash attention
+  // and f32 without (`llama-graph.cpp`). It is invisible at `-ub 512` and it
+  // dominates at `-ub 4096`, which is exactly where the tuner spends spare
+  // VRAM — so the tuner was growing the micro-batch against a budget that did
+  // not know what a micro-batch costs.
+  //
+  // Measured against the reported `CUDA_Host compute buffer` on two
+  // architectures that share nothing but llama.cpp: 2.00 bytes per pair on
+  // Ornith-1.5-35B-A3B over 14 points, 1.99 on Gemma-4-26B-A4B over 6.
+  const m = ornithMeta();
+  const fa = { ...defaults(), flashAttn: "on" };
+  assertEquals(attnMaskB(m, fa, 262144, 512), 262144 * 512 * 2);
+  assertEquals(attnMaskB(m, fa, 262144, 4096), 262144 * 4096 * 2);
+  // 256 MiB at the default micro-batch; 2 GiB at the one the tuner reached for.
+  assertEquals(attnMaskB(m, fa, 262144, 512) / 1024 ** 2, 256);
+  assertEquals(attnMaskB(m, fa, 262144, 4096) / 1024 ** 3, 2);
+
+  // Flash attention off is the f32 mask — and `auto` is llama.cpp's default,
+  // which turns it ON wherever the kernel exists, so only an explicit "off"
+  // doubles this.
+  assertEquals(
+    attnMaskB(m, { ...defaults(), flashAttn: "off" }, 65536, 1024),
+    65536 * 1024 * 4,
+  );
+  assertEquals(
+    attnMaskB(m, { ...defaults(), flashAttn: "auto" }, 65536, 1024),
+    65536 * 1024 * 2,
+  );
+
+  // A sparse-attention model is measured end to end by `computeScratch`; adding
+  // an estimate on top of a measurement refuses placements the machine runs.
+  assertEquals(attnMaskB(meta({ indexerTopK: 2048 }), fa, 262144, 4096), 0);
+});
+
+Deno.test("plan: a big micro-batch at a long context is priced, not free", () => {
+  // The regression in one line. Same model, same machine, same context — only
+  // `-ub` differs, and the difference has to show up in the VRAM the plan says
+  // it needs. Before the mask term the two plans were within 250 MB of each
+  // other and llama-server asked for 9.2 GB more.
+  const m = ornithMeta();
+  const machine = hw({
+    gpus: [gpu(24, 0.5), gpu(24, 0.5)],
+    backend: "cuda",
+    mem: {
+      totalB: 186 * GB,
+      availableB: 160 * GB,
+      usedB: 26 * GB,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+  });
+  const at = (ub: number) =>
+    plan(m, machine, {
+      ...defaults(),
+      ngl: 999,
+      nCpuMoe: 41,
+      ctxSize: 262144,
+      ubatchSize: ub,
+      batchSize: Math.max(2048, ub),
+      flashAttn: "on",
+    });
+  const small = at(512);
+  const big = at(4096);
+  const grew = big.vram.usedB - small.vram.usedB;
+  // Two cards, each charged the mask: 3.5 GB of extra VRAM at the very least.
+  assert(
+    grew >= 3.5 * GB,
+    `-ub 512 → 4096 must cost real VRAM, got ${
+      (grew / GB).toFixed(2)
+    } GB (was ~0.25 GB before the mask term)`,
+  );
+});
+
+Deno.test("plan: MTP drafting is billed as a second context", () => {
+  // Measured by A/B on the real model, one card, `--n-cpu-moe 41`, ctx 32,768,
+  // `-ub 512` — the only difference between the runs is `--spec-type draft-mtp`:
+  //   draft KV cache        +64 MiB   (one dense block at f16 = 2 KiB/token)
+  //   recurrent state       x4        (62.81 → 251.25 MiB, exactly three more)
+  //   compute, per device   +259 MiB
+  //   compute, host         +40 MiB   (its own copy of the mask)
+  // The old estimate called all of that "one block's KV, so it is small" and
+  // charged it once to the pool. The run died with `failed to create MTP
+  // context` AFTER the main context had loaded, on a plan that said it fitted.
+  const m = ornithMeta();
+  const on = {
+    ...defaults(),
+    ctxSize: 32768,
+    ubatchSize: 512,
+    specType: "draft-mtp",
+  };
+  const off = { ...on, specType: "" };
+
+  assertEquals(mtpDraft(m, off, 32768, 512).perDeviceB, 0, "off costs nothing");
+  assertEquals(mtpDraft(m, off, 32768, 512).onceB, 0);
+
+  const d = mtpDraft(m, on, 32768, 512);
+  // The draft cache is one dense block at f16 — 2 KiB per token on this model —
+  // and it ignores `-ctk`, so it is computed from the geometry.
+  const draftKvB = 32768 * (256 + 256) * 2 * 2;
+  assertEquals(draftKvB / 32768, 2048, "2 KiB per token, as measured");
+  assertEquals(d.onceB, draftKvB + 3 * recurrentStateB(m, 1));
+  // And the second graph is per DEVICE, because that is where it was allocated.
+  assert(
+    d.perDeviceB >= 299 * 1024 ** 2,
+    `the draft graph measured 259 MiB device + 40 MiB host; got ${
+      (d.perDeviceB / 1024 ** 2).toFixed(0)
+    } MiB`,
+  );
+
+  // A model with no MTP block never pays, whatever the flag says.
+  assertEquals(mtpDraft(meta(), on, 32768, 512).perDeviceB, 0);
+});
+
+Deno.test("plan: a hybrid model's per-context scratch is charged", () => {
+  // The residual left over once the flat backend figure, the activations and
+  // the mask are taken out of the measured `CUDA0 compute buffer` at `-ub 512`:
+  // 78 MiB at 32k and 65k, 132 at 131k, 388 at 262k. 2 KiB per context token
+  // covers the top of that with a tenth to spare.
+  const m = ornithMeta();
+  assertEquals(hybridScratch(m, 262144), 262144 * 2048);
+  assertEquals(hybridScratch(m, 262144) / 1024 ** 2, 512);
+  // Only for a model that declares recurrent layers — nothing changes for the
+  // models the flat estimate already fitted.
+  assertEquals(hybridScratch(meta(), 262144), 0);
+  assertEquals(hybridScratch(meta({ indexerTopK: 2048 }), 262144), 0);
+});
+
+// ── the ladder's cheapest rungs (src/lib/fitladder.ts) ──────────────────────
+
+/** Captured from the real run: ctx 262,144, `-ub 4096`, two cards. */
+const COMPUTE_OOM = [
+  "0.05.254.318 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 9249.83 MiB on device 0: cudaMalloc failed: out of memory",
+  "0.05.254.324 E ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 9699148288",
+  "0.05.254.325 E graph_reserve: failed to allocate compute buffers",
+];
+
+/** And the one after it, where the MAIN context loaded and the draft did not. */
+const MTP_OOM = [
+  ...COMPUTE_OOM,
+  "0.06.554.751 E llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers",
+  "0.06.554.762 E common_speculative_init_result: failed to create MTP context",
+  "0.06.554.770 E srv    load_model: failed to create MTP context",
+];
+
+Deno.test("fitladder: a compute overflow takes the micro-batch back first", () => {
+  // The compute graph is sized context x micro-batch, so halving either frees
+  // the same bytes — and they do not cost the same thing. Halving `-c` takes
+  // away the length the user asked for; halving `-ub` takes away prefill speed,
+  // which is what the tuner spent spare VRAM to buy in the first place.
+  const d = fitDecision({
+    lines: COMPUTE_OOM,
+    ctx: 262144,
+    tries: 0,
+    auto: true,
+    autoUbatch: true,
+    ubatch: 4096,
+  });
+  assertEquals(d.kind, "ubatch");
+  if (d.kind === "ubatch") assertEquals(d.ubatch, 2048);
+
+  // Down to llama.cpp's own default and no further: below that the PLACEMENT
+  // may have chosen 256 to buy layers, and undoing that is the ladder working
+  // against the plan.
+  const floor = fitDecision({
+    lines: COMPUTE_OOM,
+    ctx: 262144,
+    tries: 0,
+    auto: true,
+    autoUbatch: true,
+    ubatch: 512,
+  });
+  assertEquals(floor.kind, "retry", "then, and only then, the context");
+});
+
+Deno.test("fitladder: a pinned context still gives the micro-batch back", () => {
+  // "Max on Hybrid" pins a context, which turns `auto` off — shrinking a length
+  // the user asked for is not a fix. It does not pin the MICRO-BATCH: the tuner
+  // raised that from 512 on its own, so the tuner may take it back, and the
+  // user keeps every token they asked for.
+  const pinned = fitDecision({
+    lines: COMPUTE_OOM,
+    ctx: 262144,
+    tries: 0,
+    auto: false,
+    autoUbatch: true,
+    ubatch: 4096,
+  });
+  assertEquals(pinned.kind, "ubatch");
+
+  // With the tuner off entirely, both are the user's and neither moves.
+  assertEquals(
+    fitDecision({
+      lines: COMPUTE_OOM,
+      ctx: 262144,
+      tries: 0,
+      auto: false,
+      autoUbatch: false,
+      ubatch: 4096,
+    }).kind,
+    "none",
+  );
+  // And a pinned context is never quietly shortened once `-ub` is at the floor.
+  assertEquals(
+    fitDecision({
+      lines: COMPUTE_OOM,
+      ctx: 262144,
+      tries: 0,
+      auto: false,
+      autoUbatch: true,
+      ubatch: 512,
+    }).kind,
+    "none",
+  );
+});
+
+Deno.test("fitladder: the draft context not fitting stops drafting", () => {
+  // llama.cpp names it: the main context loaded, then `failed to create MTP
+  // context`. Speculative decoding is a second full context that buys SPEED and
+  // nothing else, so it is the cheapest thing on the table — cheaper than the
+  // micro-batch, which at least buys prefill.
+  const d = fitDecision({
+    lines: MTP_OOM,
+    ctx: 262144,
+    tries: 0,
+    auto: true,
+    autoUbatch: true,
+    ubatch: 4096,
+  });
+  assertEquals(d.kind, "nospec");
+
+  // NOT recorded as something the build cannot do — that is the `drop` rung,
+  // and it is a different claim. This build can draft; this machine had no room
+  // for it today, and tomorrow it might.
+  assertEquals(unsupportedFeature(MTP_OOM), null);
+});
+
+Deno.test("fitladder: the micro-batch rung rewrites the command that ran", () => {
+  const ran = [
+    "llama-server",
+    "-m",
+    "/m.gguf",
+    "-c",
+    "262144",
+    "-b",
+    "4096",
+    "-ub",
+    "4096",
+    "-ts",
+    "17.5,24.5",
+  ];
+  assertEquals(ubatchOf(ran), 4096);
+  const next = withUbatch(ran, 2048);
+  assertEquals(next[next.indexOf("-ub") + 1], "2048");
+  // `-b` is the LOGICAL batch and only has to cover `-ub`; it is left where it
+  // was, because lowering it is not what the rung is for.
+  assertEquals(next[next.indexOf("-b") + 1], "4096");
+  // But it is raised when it would end up under `-ub` — `-b` below `-ub` is not
+  // a command llama.cpp runs as written, it clamps, and the panel would then
+  // describe something that is not happening.
+  const raised = withUbatch(["s", "-b", "256", "-ub", "256"], 512);
+  assertEquals(raised[raised.indexOf("-b") + 1], "512");
+  // Everything else is untouched: a rung is the same run, one number smaller.
+  assertEquals(next[next.indexOf("-c") + 1], "262144");
+  assertEquals(next[next.indexOf("-ts") + 1], "17.5,24.5");
+  // A command with no `-ub` at all gets one rather than being left alone.
+  assert(withUbatch(["llama-server", "-c", "4096"], 512).includes("-ub"));
+});
+
+Deno.test("caps: the help says which VALUES a flag takes, in four shapes", () => {
+  // llama.cpp writes the list four different ways, and which one an option uses
+  // is not something this app gets to choose. Verbatim shapes from a real
+  // `llama-server --help`.
+  const help = [
+    "-ctk,  --cache-type-k TYPE              KV cache data type for K",
+    "                                        allowed values: f32, f16, bf16, q8_0",
+    "                                        (default: f16)",
+    "-lzm,  --lazy-mode MODE                 on-demand reading of certain tensors",
+    "                                        (default: auto)",
+    "                                        - on: read the rows from disk on demand",
+    "                                        - auto: on, but only over 4 GiB",
+    "                                        - off: always keep them resident",
+    "-sm,   --split-mode {none,layer,row,tensor}",
+    "                                        how to split the model, one of:",
+    "                                        - layer (default): split layers and KV",
+    "--spec-type none,draft-simple,draft-mtp,ngram-cache",
+    "                                        types of speculative decoding",
+    "-ts,   --tensor-split N0,N1,N2,...      fraction to offload to each GPU",
+    "-dev,  --device <dev1,dev2,..>          comma-separated list of devices",
+  ].join("\n");
+  const f = parseHelpFlags(help);
+  const valuesOf = (flag: string) =>
+    [...f].filter((x) => x.startsWith(flag + "=")).map((x) =>
+      x.slice(flag.length + 1)
+    ).sort();
+
+  assertEquals(valuesOf("-ctk"), ["bf16", "f16", "f32", "q8_0"]);
+  assertEquals(valuesOf("--cache-type-k"), ["bf16", "f16", "f32", "q8_0"]);
+  assertEquals(valuesOf("--lazy-mode"), ["auto", "off", "on"]);
+  assertEquals(
+    valuesOf("-lzm"),
+    ["auto", "off", "on"],
+    "every alias carries it",
+  );
+  // Both the braces in the placeholder and the bullets below are read; the
+  // "(default)" parenthetical is llama.cpp's, not part of the value.
+  assertEquals(valuesOf("-sm"), ["layer", "none", "row", "tensor"]);
+  assertEquals(valuesOf("--spec-type"), [
+    "draft-mtp",
+    "draft-simple",
+    "ngram-cache",
+    "none",
+  ]);
+  // A SHAPE is not a list of choices, and it says so with the ellipsis. Without
+  // that check `-ts` would "allow" the literal value `N0`.
+  assertEquals(valuesOf("-ts"), []);
+  assertEquals(valuesOf("-dev"), []);
+});
+
+Deno.test("command: a VALUE this build does not take is left out too", () => {
+  // `--lazy-mode` is in master; its `on-direct` value came with PR #28136 and
+  // is not. Master answers `--lazy-mode on-direct` with `error while handling
+  // argument: invalid value` and exits — from the user's side the same blank
+  // failure an unknown flag gives, so it gets the same answer.
+  const settings = { ...defaults(), lazyMode: "on-direct" };
+  const withPr = [
+    ...MODERN,
+    "--lazy-mode=on",
+    "--lazy-mode=on-direct",
+    "--lazy-mode=auto",
+    "--lazy-mode=off",
+  ];
+  const plain = [
+    ...MODERN,
+    "--lazy-mode=on",
+    "--lazy-mode=auto",
+    "--lazy-mode=off",
+  ];
+
+  const a = argv("server", { bin: "s", model: "m", settings, caps: withPr });
+  assertEquals(a[a.indexOf("--lazy-mode") + 1], "on-direct");
+
+  const b = argv("server", { bin: "s", model: "m", settings, caps: plain });
+  assert(
+    !b.includes("--lazy-mode"),
+    `master must not be handed it: ${b.join(" ")}`,
+  );
+  assertEquals(
+    droppedFlags("server", { settings, caps: plain }).map((g) => g.flag),
+    ["--lazy-mode"],
+    "and it is named, like any other dropped setting",
+  );
+
+  // A value the build DOES list is untouched, and so is every flag whose help
+  // lists no values at all — silence means "the help does not say".
+  const ok = argv("server", {
+    bin: "s",
+    model: "m",
+    settings: { ...defaults(), lazyMode: "on", tensorSplit: "18.5,23.5" },
+    caps: plain,
+  });
+  assertEquals(ok[ok.indexOf("--lazy-mode") + 1], "on");
+  assertEquals(ok[ok.indexOf("-ts") + 1], "18.5,23.5");
 });

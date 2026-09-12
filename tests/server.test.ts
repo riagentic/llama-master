@@ -314,6 +314,75 @@ Deno.test({
 });
 
 Deno.test({
+  name:
+    "srv: the user's environment variables reach the real process, and the ladder's rungs keep them",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // `GGML_CUDA_DISABLE_GRAPHS=1` and kin are process ENVIRONMENT, not argv —
+    // no flag exists for them, so the spawn carries them as `env` and the only
+    // honest way to test that is to read them back out of the running process
+    // itself. The ladder check matters just as much: a rung re-spawns from the
+    // cell's own state, and one that forgot the env there would quietly drop
+    // the user's setting exactly when the run needed the retry.
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv]);
+
+    const env = [{ name: "GGML_TEST_VAR", value: "42" }];
+    await srv.start(
+      [
+        bin,
+        "-m",
+        "/m.gguf",
+        "--port",
+        String(port),
+        "--print-env",
+        "GGML_TEST_VAR",
+        "PATH",
+      ],
+      url,
+      { model: "/m.gguf", settings: {} as Settings, env },
+    );
+
+    // `--print-env` makes the stub report the variable and exit — the process
+    // reads its own environment, which is the thing under test.
+    await waitFor(
+      async () => {
+        await srv.poll();
+        return srv.status === "crashed";
+      },
+      "the print-env stub to run and exit",
+      15_000,
+    );
+
+    // The variable reached the child AND the inherited environment survived
+    // (Deno merges `env` over the parent's — a replace would have stranded the
+    // loader's own PATH).
+    assert(
+      srv.log.some((l) => l.includes("GGML_TEST_VAR=42")),
+      `the child saw the variable; got ${JSON.stringify(srv.log)}`,
+    );
+    assert(
+      srv.log.some((l) => /PATH=/.test(l)),
+      "the inherited environment survived the merge",
+    );
+    // The `$` line — the log's restatement of what was asked for — carries
+    // the prefix first, the way the command preview shows it.
+    assert(
+      srv.log[0]?.startsWith("$ GGML_TEST_VAR=42 "),
+      `the log opens with the prefixed command; got ${srv.log[0]}`,
+    );
+    // And the run remembers its own environment, which is what the ladder and
+    // the update-restart inherit from.
+    assertEquals(srv.runEnv, [{ name: "GGML_TEST_VAR", value: "42" }]);
+
+    await srv.stop();
+  },
+});
+
+Deno.test({
   name: "srv: refuses to run a binary outside its own builds directory",
   sanitizeOps: false,
   sanitizeResources: false,

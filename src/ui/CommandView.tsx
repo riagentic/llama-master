@@ -18,10 +18,17 @@
 import { cfg } from "../cell/cfg.ts";
 import { hw } from "../cell/hw.ts";
 import { ui } from "../cell/ui.ts";
-import { commandBlock } from "../lib/command.ts";
+import { commandBlock, droppedFlags } from "../lib/command.ts";
 import { cliBin, serverBin } from "./actions.ts";
-import { shownModel, shownSettings } from "./derive.ts";
-import { CopyButton, Panel } from "./kit.tsx";
+import {
+  activeCaps,
+  envProblems,
+  shownEnv,
+  shownModel,
+  shownSettings,
+} from "./derive.ts";
+import { LOCK_REASON, runLocked } from "./actions.ts";
+import { CopyButton, DraftInput, Panel } from "./kit.tsx";
 
 /** The argv of one target, as one pasteable line. */
 function commandFor(target: "server" | "cli"): string[] {
@@ -33,6 +40,12 @@ function commandFor(target: "server" | "cli"): string[] {
     bin,
     model: model?.path ?? "",
     settings: shownSettings(),
+    // The same probe `srv.start` composes against, so the preview cannot show
+    // a flag the spawn will leave out (`command.ts:emitFor`).
+    caps: activeCaps(),
+    // The prefix the run carries — the working ones while nothing runs, the
+    // running process's own while it is up (`derive.ts:shownEnv`).
+    env: shownEnv(),
     // Display compaction only: `$HOME/...` reads shorter and pastes back to
     // the same absolute path. The spawned argv is untouched.
     home: hw.osHome,
@@ -56,15 +69,20 @@ function CommandBlock(props: {
 }) {
   const parts = commandFor(props.target);
   const name = NAME[props.target];
+  // The env prefix, when present, is parts[0] — not an arg, so the count
+  // subtracts it too.
+  const env = shownEnv();
+  const args = parts.length - 1 - (env.length > 0 ? 1 : 0);
   return (
     <div class="codeblock">
       {props.bare ? null : (
         <div class="codeblock-head">
           <span class="codeblock-name">{name}</span>
-          <span class="codeblock-lang">{parts.length - 1} args</span>
+          <span class="codeblock-lang">{args} args</span>
           {
             /* Copied as ONE line: the display wraps it for reading, but what
-               lands in a shell has to be a command. */
+               lands in a shell has to be a command — and the prefix leads it,
+               so the paste reproduces the environment too. */
           }
           <CopyButton
             text={parts.join(" ").replace(/\s+/g, " ")}
@@ -74,6 +92,84 @@ function CommandBlock(props: {
         </div>
       )}
       <pre class="codeblock-body cmd-body" t={props.t}>{parts.join(" ")}</pre>
+      <Dropped target={props.target} t={`${props.t}-dropped`} />
+    </div>
+  );
+}
+
+/**
+ * Settings this build has no flag for, named under the command they are absent
+ * from.
+ *
+ * The app asks each build what it accepts (`builds.probe`) and `command.ts`
+ * leaves out anything it has never heard of — which is the only way a command
+ * composed from a catalog can survive upstream REMOVING a flag, as it did with
+ * `--mlock` and `--no-mmap`. But a setting that vanishes with no explanation is
+ * a setting the user believes in that does not exist, which is the same failure
+ * the environment box refuses to commit. So the panel says which, and why.
+ *
+ * Silent for an unprobed build: nothing is dropped there, so there is nothing
+ * to report.
+ */
+function Dropped(props: { target: "server" | "cli"; t: string }) {
+  const gone = droppedFlags(props.target, {
+    settings: shownSettings(),
+    caps: activeCaps(),
+  });
+  if (gone.length === 0) return null;
+  const list = gone.map((g) => `${g.label} (${g.flag})`).join(" · ");
+  return (
+    <div class="cmd-dropped" t={props.t}>
+      {`Left out — this llama.cpp build has no such flag: ${list}. Build or download a newer one to use ${
+        gone.length === 1 ? "it" : "them"
+      }.`}
+    </div>
+  );
+}
+
+/**
+ * The user's own environment variables for llama-server, as one text input.
+ *
+ * Above the blocks it explains, because it changes them: `GGML_CUDA_DISABLE_GRAPHS=1`
+ * in front of the command is how a shell reads it, and the prefix appears in
+ * the block the moment the line is committed.
+ *
+ * Locked while a server runs, like every control that describes the next
+ * start — the running process's own variables are what the block then shows.
+ * A token that is not a `NAME=value` this app can honour is refused and NAMED
+ * below the box rather than dropped: a setting that disappears silently is a
+ * setting the user believes in that does not exist.
+ */
+function EnvVarsInput(props: { t: string }) {
+  const id = props.t;
+  const locked = runLocked();
+  const problems = envProblems();
+  return (
+    <div class="cmd-env" t={`${id}-env`}>
+      <label
+        class="cmd-env-row"
+        title="Environment variables the llama-server process is spawned with, exactly as a shell would read them — e.g. GGML_CUDA_DISABLE_GRAPHS=1. They appear as the prefix on the command below, and a copy-paste carries them."
+      >
+        <span class="cmd-env-label">Environment</span>
+        <DraftInput
+          type="text"
+          class="cmd-env-input"
+          ariaLabel="Environment variables for llama-server"
+          placeholder="NAME=value, space-separated"
+          t={`${id}-env-input`}
+          disabled={locked}
+          title={locked ? LOCK_REASON : undefined}
+          value={cfg.envVars}
+          onCommit={(v) => cfg.setEnvVars(v)}
+        />
+      </label>
+      {problems.length > 0
+        ? (
+          <span class="cmd-env-bad" t={`${id}-env-bad`}>
+            {problems.map((p) => `${p.token} — ${p.why}`).join(" · ")}
+          </span>
+        )
+        : null}
     </div>
   );
 }
@@ -129,6 +225,7 @@ export function CommandPanel(props: {
       {ui.showCommand
         ? (
           <div class="cmd-blocks" t={id}>
+            <EnvVarsInput key="env" t={id} />
             {targets.map((target) => (
               <CommandBlock
                 key={target}

@@ -13,8 +13,8 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.0-alpha75`**, vendored at `dep/aio` → symlink to the
-  provisioned release (`~/.local/lib/aio-versions/v1.0.0-alpha75`). Never
+- **Deno 2.9+ + aio `1.0.0-beta`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.0-beta`). Never
   `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
   `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
   version the symlink actually resolves to — `deno task aiol` says so when they
@@ -31,6 +31,16 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
   Adopting transactions is a per-cell decision (`s.$commit()` to publish
   mid-method, `s.$live` to read past a pinned snapshot), not a default to drift
   into. Effects go through `s.$do(effect)`; returning them is deprecated.
+- **The surface is frozen at beta.** alpha75 → alpha76 was the last release that
+  broke anything, and this app carried none of the six retired spellings (no
+  returned effects, no spread selector deps, no `killExisting`, no `--zero-port`
+  / `--backup-logs` / bare `--server-url`), so the move was a pin change and
+  nothing else. `am pin` refuses an unfixed app; it also refused this one over
+  three FALSE positives — `perfBudget: { reduce: 100 }` read as the cell key
+  `reduce:` removed in alpha27, and a `const machine: Hw = {` annotation read as
+  a `machine:` key — so `--force` was the right answer and the finding went to
+  the framework's feedback file. Anything that breaks from here is a bug in aio,
+  not a step this app missed.
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.
@@ -48,8 +58,18 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
   is older than the source.
 - `deno task aiol` — the aio framework linter
 - `deno task am <cmd>` — the live app: `am state '<dot-path>'`, `am dispatch`,
-  `am surface 0`, `am trigger 0 "<path>" click`. This is the debugging tool;
-  reach for it before curl.
+  `am surface 0`, `am trigger 0 "<path>" click`, `am eval '<expr>'` (geometry
+  and computed styles, 1.0.0-beta), `am migrations` (declared vs stored cell
+  versions + shape drift — the check after any `version:` bump), `am expect`,
+  `am timeline`. This is the debugging tool; reach for it before curl.
+- **The app's LIFECYCLE is `am` too: `am start` / `am stop` / `am restart`, from
+  this directory.** They are scoped to THIS project and go through the lock.
+  Never `pkill` an aio app: every aio app on the machine is
+  `deno run -A src/app.ts`, so a pattern that looks specific matches all of them
+  — `pkill -f "deno run -A src/app.ts"` killed two of the developer's unrelated
+  apps mid-session. `am instances` lists what is running and is the thing to
+  check first. `am kill --stale` reaps orphans without touching anything that
+  still holds its lock.
 - `deno task verify` — the pre-merge gate: `fmt --check` → `lint` → `check` →
   `test`. Plus `deno task test:rust` when Rust changed.
 
@@ -372,6 +392,24 @@ Data flow worth knowing:
   the user's own — pin included — when it is off. `placements()`/`measuredCtx()`
   live in `derive.ts` for this reason (re-exported from `actions.ts`): they are
   derived values, and the projection needs them without an import cycle.
+- **The user's own environment variables are a PREFIX, not argv.**
+  `GGML_CUDA_DISABLE_GRAPHS=1` and kin are process ENVIRONMENT — no llama.cpp
+  flag exists for them — so they enter through one input in the Command panel
+  (`cfg.envVars`, `src/lib/envvars.ts`), appear as the prefix on the command the
+  way a shell reads it, and ride the spawn as `env` while `argv` stays
+  byte-identical: everything that indexes argv (the fit ladder's `-c`/`-ts`
+  surgery, the builds-root sandbox check) cannot be moved by one position.
+  `commandLine`/`commandBlock` render the prefix; `argv` does not. The input is
+  shell-shaped (quotes group, quotes are syntax and stripped) and REFUSES what
+  it cannot honour — a bare word, `NAME=`, a `$` expansion — naming each under
+  the box, because a token that disappears silently is a setting the user
+  believes in that does not exist. While a server runs the preview shows the
+  RUNNING process's own variables (`srv.runEnv`, the same promise `runSettings`
+  makes) and the box is locked. The ladder's rungs inherit the env untouched
+  (`s.runEnv`), and `updateNow` carries it across its restart. Verified against
+  a real child: the variable reaches the process and the inherited environment
+  survives (Deno MERGES `env` over the parent's — a replace would strand the
+  loader's PATH).
 - **`-ngl` counts the output head, and never moves the embeddings.** There are
   `nLayer + 1` slots, so `-ngl 43` on a 43-layer model offloads layers 1..42 AND
   the output, leaving layer 0 on the host; only `-ngl > nLayer` takes every
@@ -380,20 +418,61 @@ Data flow worth knowing:
   input layer"), so billing it to VRAM spent ~1 GB of a card's budget on bytes
   that were never going there. Both rules live in `devsplit.ts:offloadRange` and
   `plan.ts` reads them.
-- **`--mlock` and `--no-mmap` are ONE setting.** Both assign `params.load_mode`
-  (`common/arg.cpp`), so emitting both is not "locked and unmapped" — it is
-  whichever came last, silently, while the app prints a reason claiming the
-  other. With routed experts on the host the tuner now emits NEITHER flag —
-  llama.cpp's mmap default — and it was measured: `--no-mmap` copies the whole
-  145 GB file on every start (148 s cold, 160 s even warm, because its own copy
-  evicts the page cache), while mapped the same start is 73 s cold and **6 s
-  warm**, and generation is slightly FASTER mapped (9.6 against 8.9 tok/s, same
-  CUDA build, same cards). Every fit-ladder rung reloads the model, so this is
-  also what makes the retry ladder affordable. `--mlock` is not emitted there
-  either: it would ask to pin more than stock `RLIMIT_MEMLOCK` allows (23 GB on
-  the machine that motivated this, against ~110 GB of experts), and llama.cpp
-  would warn and run unpinned — a flag whose stated effect does not happen. A
-  test in `tests/lib.test.ts` fails if any placement emits both flags.
+- **`--mlock` and `--no-mmap` were ONE setting, and upstream has now DELETED
+  them.** Both assigned `params.load_mode` (`common/arg.cpp`), so emitting both
+  was never "locked and unmapped" — it was whichever came last, silently, while
+  the app printed a reason claiming the other. Upstream finished the job:
+  deprecated in favour of `-lm/--load-mode`, then removed, so a **master build
+  answers `--mlock` with `unknown argument` and exits before it has read the
+  model path**. That is what "llama.cpp master fails" looked like from the
+  outside — no diagnosis, no model name, nothing on screen naming a flag. The
+  catalog now holds one enum (`params.ts:loadMode`,
+  `auto|none|mmap|mlock|
+  mmap+mlock|dio`) and `Param.legacy` carries the old
+  spelling for a build that still wants it. `cfg` is `version: 4` and CARRIES
+  the old value forward, unlike the reserve in version 2 — the pair and the enum
+  say the same thing about the same file. With routed experts on the host the
+  tuner still chooses `auto` and emits nothing at all, and that was measured:
+  `--no-mmap` copies the whole 145 GB file on every start (148 s cold, 160 s
+  even warm, because its own copy evicts the page cache), while mapped the same
+  start is 73 s cold and **6 s warm**, and generation is slightly FASTER mapped
+  (9.6 against 8.9 tok/s, same CUDA build, same cards). Every fit-ladder rung
+  reloads the model, so this is also what makes the retry ladder affordable.
+  `mlock` is not chosen there either: it would ask to pin more than stock
+  `RLIMIT_MEMLOCK` allows (23 GB on the machine that motivated this, against
+  ~110 GB of experts), and llama.cpp would warn and run unpinned — a setting
+  whose stated effect does not happen.
+
+- **The command is composed against the build's OWN vocabulary, flags AND
+  values.** `builds.probe` already asked each binary what it accepts; only the
+  tuner read the answer, so the app could still hand a build a flag it had never
+  heard of — and upstream removes flags, not just adds them.
+  `command.ts:emitFor` now leaves out anything a PROBED build does not declare,
+  `droppedFlags` names what it left out under the command
+  (`src/ui/CommandView.tsx`), and `Param.legacy` maps the value to an older
+  spelling where one exists. The default is the OPPOSITE of
+  `caps.ts:supportsFlag` and deliberately so: there the question is "may the
+  tuner switch an extra thing ON?" and silence means no; here it is "should the
+  app DELETE a setting the user can see?", so an unprobed build (`null`,
+  `undefined` or `[]`) is given everything.
+  - **A VALUE can be missing while the flag is present, and it fails the same
+    way.** `--lazy-mode` is in master; its `on-direct` value arrived in PR
+    #28136 and is not, and master answers `--lazy-mode on-direct` with
+    `error while handling argument: invalid value` and exits. So `caps.ts`
+    records the listed values as `flag=value` entries beside the flag, reading
+    all four shapes llama.cpp writes them in — `allowed values: …`,
+    `- value:
+    description` bullets, `{none,layer,row}` in the placeholder,
+    and a bare comma list (`--spec-type none,draft-simple,…`). A placeholder
+    containing `...` is a SHAPE and not a list of choices (`-ts N0,N1,N2,...`),
+    or `-ts` would "allow" the literal value `N0`. A flag whose help lists no
+    values is never judged: silence means "the help does not say".
+  - **The test stub is now load-bearing.** `tests/stub-llama-server.ts` must
+    declare the whole catalog or every test build looks like an ancient
+    llama.cpp; it cannot import `params.ts` (it is COPIED into a temp builds
+    directory) so it holds its own copy and `tests/guards.test.ts` fails if the
+    two drift. `--old-build` still answers a llama.cpp from before `-bs` and
+    `--fit`.
 
 - **Some models cannot be sized from their header, so the app measures.**
   `plan.ts` is arithmetic over facts and that is still true for almost every
@@ -455,6 +534,68 @@ Data flow worth knowing:
   behaviour is visible in the verdicts: Flash-Next pinned at 250k grows to 1024
   (the ctx×ub term prices 2048 out), aimFull at 262,144 grows nothing, a small
   dense model on a big card reaches 4096.
+- **The attention mask is `context × micro-batch`, and that was the hole under
+  the micro-batch growth above.** llama.cpp builds `kq_mask` as
+  `[n_kv,
+  n_tokens]` — f16 with flash attention, f32 without
+  (`llama-graph.cpp`, `llm_graph_input_attn_kv`). It is invisible at `-ub 512`
+  (256 MiB at a 262,144 context, inside the flat backend figure) and it
+  DOMINATES at `-ub 4096`, where the same context costs 2 GiB — per card, plus a
+  pinned-host copy. `plan.ts` knew nothing about it, so the tuner grew `-ub` to
+  4096 against a budget that did not know what a micro-batch costs, and
+  Ornith-1.5-35B-A3B at its full 262,144 died in `graph_reserve` asking for
+  **9,249 MiB on a card with 1.3 GB free**, with no flag named anywhere in the
+  error. Measured on two architectures that share nothing but llama.cpp: **2.00
+  bytes per (context token × micro-batch token)** on Ornith over 14 points,
+  fitting the reported `CUDA_Host compute buffer` to ±0.0 MiB, and 1.99 on
+  Gemma-4-26B-A4B over 6. Charged to RAM once (that is where the mask is built
+  on a CUDA run) and to each DEVICE once (the working copy: 1.4 bytes per pair
+  on Ornith, 3.0 on Gemma-4, so the same 2 is the honest middle). Not multiplied
+  by `-np` — `[n_kv, n_tokens/n_stream, 1, n_stream]` divides rather than
+  repeats, unlike `computeScratch`, whose per-slot graphs really are copies.
+  Zero for a sparse-attention model, whose scratch is measured end to end
+  already.
+- **`--spec-type draft-mtp` is a SECOND CONTEXT, not a rounding error.**
+  `plan.ts` billed it as "one block's KV over the same window, so it is small"
+  plus half the flat backend figure, charged once to the pool. The failure mode
+  is the worst kind: the main context allocates and succeeds, then llama.cpp
+  builds the draft context and runs out, and the log says
+  `failed to create MTP context` about a plan that said the model fitted. A/B on
+  Ornith, one card, `--n-cpu-moe 41`, ctx 32,768, `-ub 512`, the flag the only
+  difference: draft KV **+64 MiB** (exactly one dense block at f16 —
+  `(keyLength + valueLength) × nHeadKv × 2` = 2 KiB/token, and it ignores
+  `-ctk`), recurrent state **×4** (62.81 → 251.25 MiB — three more copies, for
+  rollback, exact), compute **+259 MiB per device** (flat in the context, linear
+  in the micro-batch) and **+40 MiB host** (its own copy of the mask).
+  `plan.ts:mtpDraft` sits 13-34% above every point measured, which is the right
+  direction: being short here fails a load that had already half succeeded.
+- **A hybrid linear-attention model carries per-context working set beyond its
+  KV cache.** Neither the cache (`kvTotal`) nor the constant recurrent state
+  (`recurrentStateB`): the delta-net trunk's own scratch. Residual on Ornith at
+  `-ub 512`, once the flat figure, the activations and the mask are removed — 78
+  MiB at 32k and 65k, 132 at 131k, 388 at 262k. `HYBRID_SCRATCH_B_PER_CTX` is 2
+  KiB per context token, which covers the top of that with a tenth to spare and
+  over-bills the short contexts by ~100 MiB, where the flat backend figure
+  already dwarfs it.
+- **The ladder's two cheapest rungs cost nothing the user asked for.** Both fire
+  on a `context` fault, both BEFORE the rung that shortens `-c`:
+  - **Stop drafting** (`fitDecision` → `nospec`) when llama.cpp names it —
+    `failed to create MTP context`. Speculative decoding buys SPEED and nothing
+    else; the answer is identical without it. Deliberately NOT written to
+    `cfg.unsupported`, unlike the `drop` rung: that rung means "this build
+    cannot do it", and this means "this machine had no room for it today".
+  - **Take the micro-batch back** (`ubatch`, halving to a floor of llama.cpp's
+    own 512). The graph is sized `ctx × ub`, so halving either frees the same
+    bytes — and they do not cost the same thing. `-c` is what the user asked
+    for; `-ub` is what the TUNER raised from 512 on the theory that VRAM was
+    going spare. So it has its own permission, `autoUbatch`, separate from
+    `autoFit`: pressing **Max·Hybrid** pins a context and turns `autoFit` off,
+    and the micro-batch is still the app's to give back. A 256 set by the
+    placement to buy layers is never touched — that would undo the trade.
+- **Verified end to end on the model that started this**: Ornith-1.5-35B-A3B
+  Q6_K, hybrid, its full 262,144 context, `--spec-type draft-mtp`, two 24 GB
+  cards — the tuner's answer now keeps `-ub 512`, starts, and generates. Before,
+  the same gesture produced `-ub 4096` and `cudaMalloc failed`.
 - **The sparse-attention scratch is measured, and the biggest term was SLOTS.**
   llama.cpp's `-np` default is `-1 = auto`, and auto chose **four**. Each server
   slot runs its own graph, so each one costs another copy of the context-sized
@@ -578,6 +719,72 @@ When adding a way to fail, add its signature and steps. A message the user
 cannot act on is a bug.
 
 ## Rules that bite
+
+- **A nested same-cell call reads COMMITTED state, so it cannot see what the
+  caller is halfway through writing — and that shipped as a real bug.**
+  `builds.update` set `ref`, `origin` and `backend` from the active build and
+  then called `builds.start()`. That is a SECOND DISPATCH with its own draft:
+  `start` read the values from before, and the job came out labelled
+  `Install b1111` — the version already on disk. **The Update button reinstalled
+  what you had, reported success, and said it updated**, and it could change the
+  backend under you the same way. Measured with a throwaway `testCell`, because
+  reasoning about commit points is how it got there.
+  - **`s.$commit()` does NOT fix it** — verified: the sibling still reads the
+    pre-call snapshot. Only sharing the draft does. `s.$call.start()` runs the
+    sibling's body against THIS draft in THIS commit
+    (`dep/aio/docs/state/methods.md`).
+  - **`$call` moves the cancel wiring with it.** The sibling gets the CALLER's
+    signal, so `cancelOn` needs `update: ["builds:cancel"]` beside `start`'s —
+    without it Cancel stopped a Build and did nothing at all to an Update.
+  - **Reached through a local cast, not `MethodDraftCalls`.** That type names
+    the siblings, `start`'s return type is inferred from the same object literal
+    the methods live in, and TypeScript answers the circularity by widening the
+    WHOLE method map to `undefined` — surfacing as
+    `builds.checkUpdates is possibly undefined` in `app.ts`, one file away.
+  - The other three nested calls in this repo are safe and say why in a comment:
+    `prereq.fixAll` wants separate commits (one dispatch per item is what makes
+    the queue watchable), `builds.setOrigin` → `loadAssets` reads only `s.ref`
+    which it does not write, `hw.togglePause` → `refresh(true)` is safe
+    _because_ of the `true`, and the client's `discover` → `connect(url)` passes
+    the URL as an argument. A sync method cannot `$call` an async sibling at all
+    — there is nowhere to await it.
+- **A cell read inside `afterRender`/`onMount` subscribes to NOTHING.** A
+  component re-renders only for what its render BODY touched, so a value read
+  first inside the callback never triggers the render that would run the
+  callback again — it fires once and the feature "works sometimes". `RunStrip`
+  read `chat.lastTps` that way, and the symptom had already been seen and
+  mis-diagnosed once ("pressing Measure changed nothing until the user happened
+  to say something afterwards" — the bench was added to the key, which treated
+  the symptom). The key is built in the body now and closed over. aio 1.0.0-beta
+  names the value, the component and the consequence at dev time.
+- **Every colour in this app is measured now, and one had never been.**
+  `--text-faint` was #5b6577: 3.11:1 on the panel, 2.42:1 on a selected card's
+  accent wash, where WCAG AA asks 4.5:1 for body text — and it IS body text
+  (units, sub-lines, parameter tips), on twelve elements at once. Raising it
+  alone would have collapsed it into `--text-dim` (4.53 against 4.70) and
+  silently cost the design a level, so the whole ramp moved: worst case over
+  every background this app paints, 11.2 / 7.0 / 4.5 in both themes and in the
+  client. Found by aio 1.0.0-beta's dev-time contrast walk, which composites
+  translucent layers — the accent wash is `rgba(240,169,46,0.14)` over the
+  panel, and nothing that reads the stylesheet alone would have seen it.
+- **A container's children are all keyed or none of them are.** Five here mixed
+  a keyed `.map()` with static siblings (`nav.rail`, `.map-track`,
+  `.cmd-blocks`, `.ctx-bands`, `.ctx-range-track`), which leaves the reconciler
+  matching one half by key and the other by position. The static ones carry keys
+  now.
+- **Two components must not spell a class the same way and want opposite
+  things.** `.cores`/`.core` was the CPU panel's one-row-per-core grid AND the
+  dashboard's 26px strip of bare bars, 1,200 lines apart in one stylesheet — so
+  the later rule won in both places and the dashboard strip was being laid out
+  as a three-column grid it has no children for. Renamed to `.core-rows` /
+  `.core-row`. `aiol` finds these; a shared rule followed by an override of it
+  (`.log, .cmd` then `.cmd`) is the same finding and is answered by giving each
+  class its own home, so the shared block is only what is genuinely shared.
+- **`force?: boolean` and `force = false` are the same to TypeScript and not to
+  aio.** Only the DEFAULT is visible at runtime, and aio counts a method's
+  declared parameters against what a dispatch actually passed — so
+  `hw.refresh.action()` on the 1 s schedule was a short dispatch reported on
+  every boot. Give an optional parameter a default in the signature.
 
 - **Read cell properties, not selectors, from a component.** Until aio alpha38 a
   selector call registered **no** reactive dependency and the component silently
@@ -880,9 +1087,9 @@ cannot act on is a bug.
   `lastBenchCode` beside it): a drafted token is not a token the memory bus paid
   for, and calibrating off accepted drafts would report a machine several times
   faster than it is.
-- **`-bs` is a real lever, and checking it against the local source cache is
-  how this app got it wrong once.** `--backend-sampling` picks the next token on
-  the GPU instead of copying the model's output row to the CPU every token —
+- **`-bs` is a real lever, and checking it against the local source cache is how
+  this app got it wrong once.** `--backend-sampling` picks the next token on the
+  GPU instead of copying the model's output row to the CPU every token —
   megabytes per token on a large vocabulary, and worse than its size because the
   copy is a SYNCHRONISATION POINT that stalls the device mid-loop. In the
   catalog (`params.ts:backendSampling`, `llamaDef: false`, so the default emits
@@ -890,9 +1097,10 @@ cannot act on is a bug.
   says the flag exists — it costs no memory, it composes with drafting, and a
   build that has never heard of it is never handed it. A probed build that lacks
   it is told so, because "the same model is quicker on a newer build" is
-  otherwise an unexplained difference. llama-server still drops it silently for a grammar,
-  a JSON schema or a reasoning budget (`common/sampling.cpp`, warns in the log);
-  `stability.ts` names the reasoning case, which is the one visible in the argv.
+  otherwise an unexplained difference. llama-server still drops it silently for
+  a grammar, a JSON schema or a reasoning budget (`common/sampling.cpp`, warns
+  in the log); `stability.ts` names the reasoning case, which is the one visible
+  in the argv.
   - **It DOES stack with speculative decoding, and this file said the opposite
     for one round of work.** `tools/server/server-context.cpp` used to carry
     `backend_sampling &= !(slot.can_speculate())` — "requires multiple samples
@@ -900,22 +1108,23 @@ cannot act on is a bug.
     run. That line is gone from master; the two now compose, and it is the
     combination worth having (drafting makes a token cheaper to produce, this
     makes it cheaper to collect).
-  - **The cause is worth more than the fact: `~/.llama-master/cache/sources/`
-    is whatever the last BUILD fetched, not what upstream does today.**
-    `refMoves()` re-fetches `master` on every build, which is correct and is
-    not the same promise — with no master build since 2026-07-27, the checkout
-    sat six weeks behind while reading like the current source. It is the right
+  - **The cause is worth more than the fact: `~/.llama-master/cache/sources/` is
+    whatever the last BUILD fetched, not what upstream does today.**
+    `refMoves()` re-fetches `master` on every build, which is correct and is not
+    the same promise — with no master build since 2026-07-27, the checkout sat
+    six weeks behind while reading like the current source. It is the right
     place to check a flag's spelling, its default, and whether it exists at all;
     it is NOT evidence about behaviour that may have changed. For that, read
-    `raw.githubusercontent.com/ggml-org/llama.cpp/master/<path>` and compare.
-    A conclusion drawn from the cache alone was published here as a correction
-    to a third party who was right.
+    `raw.githubusercontent.com/ggml-org/llama.cpp/master/<path>` and compare. A
+    conclusion drawn from the cache alone was published here as a correction to
+    a third party who was right.
 - **A build is ASKED what it can do, and that is what lets the tuner turn
   something on.** Every default in this app is one a stale llama.cpp can safely
-  ignore — until `-bs`, which an older binary refuses outright with `unknown
-  argument`. Inferring support from the version is not available either: a
-  release is a `b`-number, `master` is a day, and a PR stack has no version that
-  means anything. So `llama-server --help` is run once per build
+  ignore — until `-bs`, which an older binary refuses outright with
+  `unknown
+  argument`. Inferring support from the version is not available
+  either: a release is a `b`-number, `master` is a day, and a PR stack has no
+  version that means anything. So `llama-server --help` is run once per build
   (`builds.probe` → `builds.server.ts:probeCaps`, sandboxed to the builds root
   the same way a start is, 5 s ceiling, both pipes because usage has gone to
   stderr before now) and `src/lib/caps.ts` parses it. The parse splits each
@@ -932,10 +1141,10 @@ cannot act on is a bug.
     a removed-and-rebuilt id is never answered from its predecessor's flags.
     Only the ACTIVE build is probed: a process per installed build, per scan,
     would be spent on builds nothing is going to run.
-  - The stub llama-server answers `--help` and exits for this reason. It did not,
-    and every `setActive` in the UI suite hung until the probe timed out — 23 s
-    of suite became 95 s, which is exactly what a wedged binary would do to the
-    app.
+  - The stub llama-server answers `--help` and exits for this reason. It did
+    not, and every `setActive` in the UI suite hung until the probe timed out —
+    23 s of suite became 95 s, which is exactly what a wedged binary would do to
+    the app.
 - **A multi-token-prediction head does not always live in the model file.**
   `tune` keys `draft-mtp` on `meta.nextnLayers > 0`, read from the header — and
   Gemma 4 publishes its heads as a SEPARATE GGUF beside the weights

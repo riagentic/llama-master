@@ -338,8 +338,15 @@ export function MemoryMap(props: {
               onHover={setHovered}
             />
           ))
-          : <Region pool={p.vram} kind="vram" onHover={setHovered} />}
-        <Region pool={p.ram} kind="ram" onHover={setHovered} />
+          : (
+            <Region
+              key="vram"
+              pool={p.vram}
+              kind="vram"
+              onHover={setHovered}
+            />
+          )}
+        <Region key="ram" pool={p.ram} kind="ram" onHover={setHovered} />
       </div>
       {p.devices.unplacedB > 0
         ? (

@@ -391,3 +391,30 @@ Deno.test("guard: no chat surface builds its own input row", async () => {
     "these hand-roll the chat input row instead of using <ChatComposer />",
   );
 });
+
+Deno.test("guard: the stub llama-server declares every flag in the catalog", async () => {
+  // The app stopped emitting flags a probed build does not declare
+  // (`command.ts:emitFor`), which makes the stub's `--help` load-bearing: a
+  // short illustrative list turns every test build into an ancient llama.cpp,
+  // and the symptom is a setting quietly missing from the command with nothing
+  // on screen explaining it. The stub cannot import the catalog — it is COPIED
+  // into a temporary builds directory, where a relative import does not resolve
+  // — so it holds its own copy and this is what stops the two drifting.
+  const { PARAMS } = await import("../src/lib/params.ts");
+  const { parseHelpFlags } = await import("../src/lib/caps.ts");
+  const out = await new Deno.Command(Deno.execPath(), {
+    args: ["run", "-A", join(ROOT, "tests/stub-llama-server.ts"), "--help"],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const declared = parseHelpFlags(new TextDecoder().decode(out.stdout));
+  const missing = PARAMS
+    .flatMap((p) => [p.flag, p.offFlag])
+    .filter((f): f is string => !!f)
+    .filter((f) => !declared.has(f));
+  assertEquals(
+    missing,
+    [],
+    "add these to tests/stub-llama-server.ts, or the test build looks like a llama.cpp that predates them",
+  );
+});

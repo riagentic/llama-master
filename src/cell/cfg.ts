@@ -99,6 +99,18 @@ export type CfgState = {
   advanced: boolean;
   /** Settings the user has changed away from the llama.cpp default. */
   touched: string[];
+  /**
+   * Environment variables for the llama-server process, as the user typed them
+   * (`GGML_CUDA_DISABLE_GRAPHS=1` …), parsed by `src/lib/envvars.ts`.
+   *
+   * Not a llama.cpp flag and deliberately not in `settings`: no argv token
+   * represents it, so the catalog has nothing to emit. It is part of what a
+   * run IS — the prefix on the command, the `env` of the spawn — and it is
+   * kept as the raw text so the box the user typed in stays the box they
+   * edit, bad tokens included (the UI says which ones, it does not rewrite
+   * them behind their back).
+   */
+  envVars: string;
 };
 
 export const cfg = cell("cfg", {
@@ -121,8 +133,12 @@ export const cfg = cell("cfg", {
     lowPriority: true,
     advanced: false,
     touched: [] as string[],
+    envVars: "",
   } as CfgState,
   /**
+   * 4 — `mlock` + `noMmap` became the one `loadMode` enum, because upstream
+   * deleted the flags they emitted (see the `from < 4` branch below).
+   *
    * 2 — the single machine-wide `reserveVramB` became a per-GPU figure and a
    * connected-GPU figure (`src/lib/reserve.ts`).
    *
@@ -139,7 +155,7 @@ export const cfg = cell("cfg", {
    * on the display card) take over — a visible control, on two pages, that says
    * what it is holding.
    */
-  version: 3,
+  version: 4,
   onMigrate(state: CfgState, from: number): CfgState {
     // Cast to delete a key that is no longer IN the type — which is the whole
     // point of a migration, and the only place in this app allowed to say it.
@@ -159,6 +175,41 @@ export const cfg = cell("cfg", {
         state.touched = state.touched.filter((k) =>
           k !== "noContextShift" && k !== "defragThold"
         );
+      }
+    }
+    if (from < 4) {
+      // `--mlock` and `--no-mmap` were deprecated upstream in favour of
+      // `-lm/--load-mode` and then REMOVED, so a current llama-server meets
+      // either with `unknown argument` and exits before it reads the model
+      // path. The two booleans become one enum (`params.ts:loadMode`).
+      //
+      // This one IS carried forward, unlike the reserve in version 2: the old
+      // pair and the new enum say the same thing about the same file, so the
+      // user's choice survives the rename instead of being silently reset.
+      // They were mutually exclusive in llama.cpp anyway — both assigned
+      // `params.load_mode`, which is exactly why upstream collapsed them — so
+      // ranking `mlock` over `no-mmap` here loses nothing that was real.
+      const old = state.settings as Record<string, unknown> | undefined;
+      if (old) {
+        const mode = old.mlock === true
+          ? "mlock"
+          : old.noMmap === true
+          ? "none"
+          : "";
+        if (mode) state.settings.loadMode = mode;
+        delete old.mlock;
+        delete old.noMmap;
+      }
+      if (Array.isArray(state.touched)) {
+        const renamed = state.touched.some((k) =>
+          k === "mlock" || k === "noMmap"
+        );
+        state.touched = state.touched.filter((k) =>
+          k !== "mlock" && k !== "noMmap"
+        );
+        if (renamed && !state.touched.includes("loadMode")) {
+          state.touched = [...state.touched, "loadMode"];
+        }
       }
     }
     return state;
@@ -316,6 +367,12 @@ export const cfg = cell("cfg", {
     },
     toggleAdvanced(s) {
       s.advanced = !s.advanced;
+    },
+    /** Set the environment-variable prefix for llama-server, verbatim. Parsing
+     *  is the UI's to display (`src/lib/envvars.ts`); this keeps what the
+     *  user typed so nothing is rewritten behind their back. */
+    setEnvVars(s, text: string) {
+      s.envVars = text;
     },
     clearReasons(s) {
       s.reasons = [];

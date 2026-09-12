@@ -575,30 +575,29 @@ export function plan(
   const ffActivation = whole(meta.indexerTopK) > 0
     ? 0
     : ubatch * ffWidth * 4 * 2;
+  // The attention mask, which is the term that makes a LARGE micro-batch
+  // expensive at a LONG context — and the one this file was blind to.
+  const maskB = attnMaskB(meta, s, ctx, ubatch);
+  // A hybrid linear-attention model carries working set per context token on
+  // top of all of the above (`HYBRID_SCRATCH_B_PER_CTX`).
+  const hybridB = hybridScratch(meta, ctx);
   const usingGpu = off.count > 0 && hw.gpus.length > 0;
 
-  // Speculative decoding with the model's own MTP block costs a SECOND context —
-  // llama.cpp measures "only context+compute are new", because the drafting
-  // block lives on the target model and its weights are already counted above.
-  // That second context is one block's KV over the same window, so it is small,
-  // but it is real and a plan that ignored it could hand back settings that no
-  // longer fit the moment the flag is emitted (server-context.cpp:1085).
-  // One layer's rate — divided by the KV-bearing layer count, because that is
-  // what `kvPerTokenB` is a sum over (17 on Qwen3.8-27B, not its 65 declared
-  // layers).
-  const mtpKvB = specMtpActive(meta, s)
-    ? whole(kvPerTokenB / Math.max(1, kvLayers(meta)) * ctx)
-    : 0;
-  const mtpDraftB = mtpKvB > 0 ? mtpKvB + BACKEND_CONTEXT_B / 2 : 0;
+  // Speculative decoding with the model's own MTP block costs a SECOND CONTEXT,
+  // and that is the whole point of `mtpDraft` — this file used to call it "one
+  // block's KV over the same window, so it is small". It is not small, and the
+  // measurement is in that function.
+  const mtp = mtpDraft(meta, s, ctx, ubatch, slots);
+  const mtpKvB = mtp.onceB;
 
   // The pool total is the sum of what the cards below are charged, and it has
   // to stay that way: one number for the bar and a different one for the packer
   // is how a plan came to say "fits" on one line and "nowhere to go" on the
   // next. Per-device costs times the devices, plus the scratch once.
   const gpuCompute = usingGpu
-    ? (activation * 4 + ffActivation + BACKEND_CONTEXT_B + scratchFloor(meta)) *
-        Math.max(1, hw.gpus.length) +
-      mtpDraftB + computeScratch(meta, ubatch, ctx, slots)
+    ? (activation * 4 + ffActivation + BACKEND_CONTEXT_B + scratchFloor(meta) +
+          maskB + hybridB + mtp.perDeviceB) * Math.max(1, hw.gpus.length) +
+      mtp.onceB + computeScratch(meta, ubatch, ctx, slots)
     : 0;
   // On a CPU-only run the draft context is just as real, minus the GPU backend
   // half — it lands in RAM, where a tight MTP run is exactly the case that
@@ -607,6 +606,12 @@ export function plan(
     (layersOnGpu < nLayer || !usingGpu
       ? activation * 2 + ffActivation / 2
       : 32 * MB) +
+    // The mask is built in PINNED HOST memory on a GPU run (llama.cpp's
+    // `CUDA_Host compute buffer`) and in the CPU compute buffer otherwise, so
+    // it is charged to RAM either way — once, not per device. Measured to the
+    // byte on two architectures; see `attnMaskB`.
+    maskB +
+    (usingGpu ? 0 : hybridB) +
     (usingGpu ? 0 : mtpKvB);
 
   // Where each slot actually lands. The aggregate above says whether the model
@@ -635,7 +640,8 @@ export function plan(
   // is safe to promise is all of it.
   const scratchB = computeScratch(meta, ubatch, ctx, slots);
   const fixedPerDeviceB = usingGpu
-    ? BACKEND_CONTEXT_B + activation * 4 + ffActivation + scratchFloor(meta)
+    ? BACKEND_CONTEXT_B + activation * 4 + ffActivation + scratchFloor(meta) +
+      maskB + hybridB + mtp.perDeviceB
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
 
@@ -990,6 +996,147 @@ const SCRATCH_B_PER_CTX_UBATCH = 4;
  * the few hundred MB `BACKEND_CONTEXT_B` allows.
  */
 const SCRATCH_FLOOR_PER_DEVICE_B = 2 * 1024 ** 3;
+
+/**
+ * What `--spec-type draft-mtp` costs — a SECOND CONTEXT, not a rounding error.
+ *
+ * This file used to bill it as "one block's KV over the same window, so it is
+ * small", plus half the flat backend figure, charged ONCE to the pool. The
+ * server log says otherwise, and it says it in the most expensive way: the main
+ * context allocates and succeeds, then llama.cpp builds the draft context and
+ * runs out, and the error is `failed to create MTP context` on a plan that said
+ * the model fitted with room to spare.
+ *
+ * MEASURED by A/B on Ornith-1.5-35B-A3B, one card, `--n-cpu-moe 41`, everything
+ * else held still — the only difference between the two runs is the flag:
+ *
+ *                        no MTP            with MTP          the draft's share
+ *   ctx 32,768 ub 512
+ *     KV buffer          340 MiB           340 + 64 MiB      64 MiB
+ *     recurrent state     62.81 MiB        251.25 MiB        +188.44 (= 3x)
+ *     compute (device)   492.02 MiB        492.02 + 259.00   259 MiB
+ *     compute (host)      40.28 MiB         40.28 + 40.02    40 MiB (its mask)
+ *   ctx 131,072 ub 512   draft KV 256 MiB, draft compute 259 MiB (unchanged)
+ *   ctx 32,768 ub 2,048  draft compute 406 MiB
+ *
+ * Three rules come out of that, and each lands where it belongs:
+ *
+ * - The draft KV is EXACTLY one dense block at f16 — 2,048 bytes per token on
+ *   this model, which is `(keyLength + valueLength) x nHeadKv x 2`. It ignores
+ *   `-ctk`/`-ctv`, so it is computed from the geometry rather than from the
+ *   main cache's rate. Once, not per device.
+ * - The recurrent state TRIPLES on top of itself — the draft needs its own
+ *   copies to roll back — and 3x is exact, not a fit. Zero for a model with no
+ *   recurrent layers. Once.
+ * - The draft graph is a second compute buffer on EVERY device, flat in the
+ *   context and linear in the micro-batch, plus its own copy of the mask. The
+ *   constants below sit 13-34% above every point measured, which is the right
+ *   direction: being short here is a load that fails after the main context has
+ *   already succeeded.
+ */
+const MTP_DRAFT_FLAT_B = 320 * 1024 * 1024;
+const MTP_DRAFT_B_PER_UBATCH = 96 * 1024;
+
+export function mtpDraft(
+  meta: ModelMeta,
+  s: Settings,
+  ctx: number,
+  ubatch: number,
+  slots = 1,
+): { perDeviceB: number; onceB: number } {
+  if (!specMtpActive(meta, s)) return { perDeviceB: 0, onceB: 0 };
+  const draftKvB = whole(ctx) *
+    (whole(meta.keyLength) + whole(meta.valueLength)) * whole(meta.nHeadKv) * 2;
+  return {
+    perDeviceB: whole(
+      MTP_DRAFT_FLAT_B + Math.max(1, ubatch) * MTP_DRAFT_B_PER_UBATCH +
+        attnMaskB(meta, s, ctx, ubatch),
+    ),
+    onceB: whole(draftKvB + 3 * recurrentStateB(meta, slots)),
+  };
+}
+
+/**
+ * The attention mask: `n_kv × n_ubatch`, f16 with flash attention and f32
+ * without (`llama-graph.cpp`, `llm_graph_input_attn_kv`).
+ *
+ * This is not a calibration, it is llama.cpp's own tensor read off its own
+ * source — and it is the term that made the app's compute estimate wrong by a
+ * factor of four on a long-context run. It is invisible while `-ub` is 512 (a
+ * 262,144-token context then costs 256 MiB, inside the flat backend figure) and
+ * dominant the moment something spends headroom on the micro-batch: at
+ * `-ub 4096` the SAME context costs 2 GiB. The tuner does spend that headroom
+ * (`tune.ts`, "leftover VRAM becomes micro-batch"), so it was growing `-ub` to
+ * 4096 against a budget that did not know what `-ub` costs, and the start died
+ * in `graph_reserve` with no flag named.
+ *
+ * MEASURED, on two architectures that share nothing but llama.cpp:
+ *
+ *   Ornith-1.5-35B-A3B (qwen35moe, hybrid linear attention), 14 points from
+ *   4,096×512 to 262,144×4,096: 2.00 bytes per (context token × micro-batch
+ *   token), fitting the reported `CUDA_Host compute buffer` to ±0.0 MiB.
+ *   Gemma-4-26B-A4B (dense attention + sliding window, MoE), 6 points:
+ *   1.99 bytes, ±1.5 MiB.
+ *
+ * WHERE it lands differs by backend and is why it is charged twice. On a CUDA
+ * run the mask itself is built in PINNED HOST memory (`CUDA_Host compute
+ * buffer` — that is the buffer the two fits above are of), and each DEVICE
+ * additionally carries a working copy: 1.4 bytes per pair on Ornith, 3.0 on
+ * Gemma-4, so the same 2 bytes is the honest middle and lands inside both. A
+ * CPU-only run pays it once, in the CPU compute buffer.
+ *
+ * Not multiplied by `-np`: the tensor is `[n_kv, n_tokens/n_stream, 1,
+ * n_stream]`, so more streams divide it rather than repeat it — unlike
+ * `computeScratch`, whose per-slot graphs really are copies.
+ *
+ * Zero for a sparse-attention model: `computeScratch` measures that family end
+ * to end, micro-batch term included, and stacking an estimate on a measurement
+ * refuses placements the machine runs.
+ */
+export function attnMaskB(
+  meta: ModelMeta,
+  s: Settings,
+  ctx: number,
+  ubatch: number,
+): number {
+  if (whole(meta.indexerTopK) > 0) return 0;
+  // `auto` is llama.cpp's default and it turns flash attention ON wherever the
+  // backend has the kernel, so the f32 mask is only the answer when the user
+  // has switched it OFF. Guessing the other way would double this term for
+  // almost every run.
+  const fp32 = str(s, "flashAttn") === "off";
+  return whole(ctx) * Math.max(1, ubatch) * (fp32 ? 4 : 2);
+}
+
+/**
+ * Per context token, per device, for a hybrid linear-attention model.
+ *
+ * The delta-net trunk keeps a working set that grows with the context and is
+ * not the KV cache (that is `kvTotal`) and not the recurrent state (that is
+ * `recurrentStateB`, constant). Measured on Ornith-1.5-35B-A3B at `-ub 512`,
+ * one card, everything else held still, as the residual once the flat backend
+ * figure, the activations and the mask above are taken out:
+ *
+ *     ctx       measured CUDA0   residual over the rest
+ *     32,768      492 MiB         78 MiB
+ *     65,536      524 MiB         78 MiB
+ *     131,072     642 MiB        132 MiB
+ *     262,144   1,026 MiB        388 MiB
+ *
+ * 2 KiB per context token covers the top of that with about a tenth to spare,
+ * and over-bills the short contexts by ~100 MiB — which the flat backend figure
+ * already dwarfs. Pessimism here costs context; optimism costs a failed load.
+ *
+ * Keyed on the model declaring recurrent geometry at all, so nothing changes
+ * for the models the flat estimate already fitted.
+ */
+const HYBRID_SCRATCH_B_PER_CTX = 2 * 1024;
+
+export function hybridScratch(meta: ModelMeta, ctx: number): number {
+  if (whole(meta.indexerTopK) > 0) return 0;
+  if (whole(meta.ssmDInner) <= 0 || whole(meta.fullAttnInterval) < 2) return 0;
+  return whole(ctx) * HYBRID_SCRATCH_B_PER_CTX;
+}
 
 /** The flat, per-device part of a sparse-attention model's compute buffer. */
 export function scratchFloor(meta: ModelMeta): number {

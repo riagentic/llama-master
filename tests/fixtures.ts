@@ -87,6 +87,44 @@ export function moeMeta(): ModelMeta {
   });
 }
 
+/**
+ * Ornith-1.5-35B-A3B, from its real header — a hybrid linear-attention MoE.
+ *
+ * The model that found the compute-buffer hole: 41 layers of which one in four
+ * holds a KV cache, an MTP block, 660 MB of routed experts per layer, and a
+ * 262,144 trained context. Its numbers are here rather than invented because
+ * the terms that were missing (`plan.ts:attnMaskB`, `hybridScratch`,
+ * `mtpDraft`) were measured against THIS shape on a real card.
+ */
+export function ornithMeta(over: Partial<ModelMeta> = {}): ModelMeta {
+  return meta({
+    arch: "qwen35moe",
+    name: "Ornith-1.5-35B",
+    quant: "Q6_K",
+    nLayer: 41,
+    nCtxTrain: 262144,
+    nEmbd: 2048,
+    nHead: 16,
+    nHeadKv: 2,
+    keyLength: 256,
+    valueLength: 256,
+    fullAttnInterval: 4,
+    ssmDConv: 4,
+    ssmDInner: 4096,
+    ssmDState: 128,
+    ssmNGroup: 16,
+    nextnLayers: 1,
+    nExpert: 256,
+    nExpertUsed: 8,
+    nFf: 0,
+    nFfExp: 512,
+    embdBytes: 398 * MB,
+    outputBytes: 398 * MB,
+    layers: layers(41, 661 * MB, 630 * MB),
+    ...over,
+  });
+}
+
 /** A card. `display` is left undefined on purpose — that is what a machine
  *  which does not report display attachment looks like, and it is the reading
  *  the connected-GPU reserve has to cope with (`src/lib/reserve.ts`). Pass it

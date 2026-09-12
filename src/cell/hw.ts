@@ -117,7 +117,14 @@ export const hw = cell("hw", {
         s.diskError = `disk usage: ${e}`;
       }
     },
-    async refresh(s, force?: boolean) {
+    // `force = false`, not `force?: boolean`. The two mean the same thing to
+    // TypeScript, and only the default is visible to the RUNTIME — aio counts a
+    // method's declared parameters against what a dispatch actually passed, and
+    // the 1 s schedule (`hw.refresh.action()`, src/app.ts) passes none. Without
+    // the default that is a short dispatch and aio says so on every boot, which
+    // is the same "a check that fires on correct code" this app refuses to ship
+    // anywhere else.
+    async refresh(s, force = false) {
       // Re-entrancy guard, still needed even though the 1 s schedule now carries
       // `skipIfRunning`: that de-duplicates the SCHEDULE, and this method is also
       // called directly — at boot, by Resume, by the Refresh button, and by
@@ -145,8 +152,13 @@ export const hw = cell("hw", {
             s.prevCoreStats, // aiol-ok — see the note above
             snap.cpu.coreStats,
           );
+          // aiol-ok — a DELTA against the previous sample is the whole point
+          // of this method: utilisation is the difference between two
+          // /proc/stat reads, so the earlier one has to be read back here.
           s.prevStat = snap.cpu.stat;
-          s.prevCoreStats = snap.cpu.coreStats;
+          s.prevCoreStats = snap.cpu.coreStats; // aiol-ok — see above
+          // aiol-ok — a rolling window, appended to; the previous samples are
+          // exactly what it has to read back.
           s.cpuHistory = pushHistory(s.cpuHistory.slice(), snap.cpu.utilPct);
         }
         const gpuUtil = snap.gpus.length
@@ -184,6 +196,11 @@ export const hw = cell("hw", {
     },
     togglePause(s) {
       s.paused = !s.paused;
+      // aiol-ok — `refresh` does read `s.paused`, and it reads the value from
+      // before this line flipped it. `true` is exactly why that is safe: it is
+      // `force`, and the only thing `s.paused` gates is the early return that
+      // `force` overrides. A sync method cannot `$call` an async sibling
+      // anyway. Dropping the argument would make this silently do nothing.
       if (!s.paused) hw.refresh(true);
     },
   },

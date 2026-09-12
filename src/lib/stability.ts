@@ -89,7 +89,10 @@ export function stability(
       });
     }
 
-    if (bool(s, "mlock") && p.ram.usedB > (hw.mem?.availableB ?? 0) * 0.85) {
+    if (
+      str(s, "loadMode").includes("mlock") &&
+      p.ram.usedB > (hw.mem?.availableB ?? 0) * 0.85
+    ) {
       warnings.push({
         severity: "risk",
         key: "mlock",

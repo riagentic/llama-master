@@ -650,7 +650,7 @@ export function tune(
   s.cacheTypeK = str(d, "cacheTypeK");
   s.cacheTypeV = str(d, "cacheTypeV");
   s.tensorSplit = str(d, "tensorSplit");
-  s.noMmap = false;
+  s.loadMode = str(d, "loadMode");
 
   // Say it first, because it changes every number that follows. A user who has
   // set a reserve and then reads "context 32,768 — the most this placement can
@@ -1090,24 +1090,20 @@ function finish(
     );
   }
 
-  // llama.cpp's own advice for this configuration: "tensor overrides to CPU are
-  // used with mmap enabled - consider using --no-mmap for better performance".
-  // How the weights get into memory. ONE choice, not two flags.
+  // How the weights get into memory. ONE choice, and now ONE flag: upstream
+  // deprecated `--mlock`/`--no-mmap`/`--direct-io` in favour of
+  // `-lm/--load-mode` (they all assigned the same `params.load_mode`, so two of
+  // them on a command line was never "locked and unmapped" — it was whichever
+  // came last, silently, while the app printed a reason claiming the other) and
+  // has since REMOVED them. The catalog holds the one enum; `command.ts` spells
+  // it the old way for a build that still wants that (`params.ts:loadMode`).
   //
-  // `--mlock` and `--no-mmap` are the same setting in llama.cpp: both assign
-  // `params.load_mode`, so emitting them together is not "locked and unmapped",
-  // it is whichever came last silently winning (`common/arg.cpp`). The app would
-  // have printed a reason claiming --mlock while shipping an argv that cancelled
-  // it — precisely the "what you see is what runs" promise, broken.
-  //
-  // So they are ranked. `mlock` mode still memory-maps (`use_mmap = MMAP ||
-  // MLOCK`, llama-model-loader.cpp:545), which is what llama.cpp warns about the
-  // moment any tensor is overridden to the CPU: "tensor overrides to CPU are
-  // used with mmap enabled - consider using --no-mmap for better performance".
-  // With the routed experts on the host that warning is about the bytes crossing
-  // the bus on every token, so it wins — and it is only taken when the host side
-  // has real room, because unmapped weights are anonymous pages with no file to
-  // fall back to.
+  // `mlock` mode still memory-maps (`use_mmap = MMAP || MLOCK`,
+  // llama-model-loader.cpp), which is what llama.cpp warns about the moment any
+  // tensor is overridden to the CPU: "tensor overrides to CPU are used with
+  // mmap enabled - consider using --no-mmap for better performance". With the
+  // routed experts on the host that warning is about the bytes crossing the bus
+  // on every token — and the measurement below says mmap wins anyway.
   const availB = hw.mem?.availableB ?? 0;
   const hostNeed = p.ram.usedB;
   const margin = ramMarginB(availB);
@@ -1131,13 +1127,12 @@ function finish(
     // and continue unpinned — a flag whose stated effect does not happen.
     // With `roomToSpare` guarding this branch, the page cache keeps the hot
     // expert pages by itself. So: llama.cpp's default, and no flag at all.
-    s.noMmap = false;
-    s.mlock = false;
+    s.loadMode = "auto";
     reasons.push(
       "Memory-mapped (llama.cpp's default): the routed experts run from the page cache, so a warm restart re-reads nothing — measured 6 s instead of 160 s on a 145 GB model, and every automatic retry reloads the model. --no-mmap would copy the whole file on every start, and --mlock would ask to pin more than stock memlock limits allow, so llama.cpp would warn and run unpinned anyway.",
     );
   } else if (roomToSpare && lockable >= hostNeed) {
-    s.mlock = true;
+    s.loadMode = "mlock";
     reasons.push(
       "--mlock on: the host-side weights fit in free RAM with room to spare, so pinning them stops the OS paging the model out mid-generation.",
     );
@@ -1151,7 +1146,7 @@ function finish(
     // paging the model out" about something that did not happen. The limit is
     // read, not assumed (`hw.server.ts:lockable`), and 0 means unknown, which
     // is also a reason not to promise.
-    s.mlock = false;
+    s.loadMode = "auto";
     if (lockable > 0) {
       reasons.push(
         `Memory-mapped: --mlock would ask to pin ${
@@ -1162,7 +1157,7 @@ function finish(
       );
     }
   } else if (hostNeed > 0) {
-    s.mlock = false;
+    s.loadMode = "auto";
   }
   if (p.ram.overB > 0) {
     reasons.push(

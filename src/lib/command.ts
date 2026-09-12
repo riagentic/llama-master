@@ -10,6 +10,8 @@
 
 import { PARAMS } from "./params.ts";
 import type { Param, Settings } from "./types.ts";
+import type { EnvVar } from "./envvars.ts";
+import { envPrefix } from "./envvars.ts";
 
 export type Target = "server" | "cli";
 
@@ -45,19 +47,117 @@ function emit(p: Param, value: unknown): string[] {
   return [p.flag, s];
 }
 
+/**
+ * What a build declares it accepts (`src/lib/caps.ts`), or nothing.
+ *
+ * `null`, `undefined` and `[]` all mean NOT PROBED, and the answer to that is
+ * "emit everything" — the opposite of `caps.ts:supportsFlag`, deliberately.
+ * There the question is "may the tuner switch this extra thing ON?", and the
+ * safe reading of silence is no. Here the question is "should the app DELETE a
+ * setting the user can see?", and deleting on a guess would quietly drop flags
+ * for every build the app never managed to probe. Silence changes nothing; only
+ * a build that has answered, and answered that it does not know the flag, can
+ * take a flag off the command line.
+ */
+export type BuildFlags = readonly string[] | null | undefined;
+
+/** Has this build ANSWERED that it does not know `flag`? */
+function absent(caps: BuildFlags, flag: string): boolean {
+  return !!caps && caps.length > 0 && !caps.includes(flag);
+}
+
+/**
+ * Has this build answered that `flag` does not take this VALUE?
+ *
+ * The flag existing is only half the question. `--lazy-mode` is in master and
+ * its `on-direct` value is not — that arrived in PR #28136 — and master answers
+ * `--lazy-mode on-direct` with `error while handling argument: invalid value`
+ * and exits, which from the user's side is the same blank failure an unknown
+ * flag gives. `caps.ts` records the listed values as `flag=value` entries, so
+ * this is a lookup.
+ *
+ * A flag whose help lists NO values (`--host`, `-ts`, every number) has no
+ * entries and is never judged here: silence means "the help does not say", not
+ * "nothing is allowed".
+ */
+function valueAbsent(caps: BuildFlags, flag: string, value: string): boolean {
+  if (!caps || caps.length === 0) return false;
+  const prefix = flag + "=";
+  if (!caps.some((c) => c.startsWith(prefix))) return false;
+  return !caps.includes(prefix + value);
+}
+
+/** One parameter's tokens, with the build's own vocabulary respected.
+ *
+ *  Three outcomes, in order:
+ *  - the build knows the flag (or has not been probed) — emit it;
+ *  - it does not, but it knows this setting's OLDER spelling — emit that, so a
+ *    release from before the rename still gets what the user asked for;
+ *  - it knows neither — emit nothing, and `droppedFlags` says so. A flag the
+ *    binary has never heard of is not a setting that is ignored, it is
+ *    `unknown argument` and an exit before the model path is read. */
+function emitFor(p: Param, value: unknown, caps: BuildFlags): string[] {
+  const tokens = emit(p, value);
+  if (tokens.length === 0) return tokens;
+  const used = tokens[0] as string;
+  // `p.flag === ""` is the extra-arguments escape hatch: the user typed raw
+  // argv and owns it. Nothing here can tell a flag from a value in it.
+  if (p.flag === "") return tokens;
+  const known = !absent(caps, used) &&
+    (tokens.length < 2 || !valueAbsent(caps, used, tokens[1] as string));
+  if (known) return tokens;
+  const old = p.legacy?.[String(value)];
+  if (old && old.every((t) => !absent(caps, t))) return old;
+  return [];
+}
+
+/** Settings this build cannot be told about, with the flag each one wanted.
+ *
+ *  Two reasons, reported the same way because the consequence is the same: the
+ *  flag is not in this build at all, or it is and this VALUE is not.
+ *
+ *  For the UI: a setting silently dropped is a setting the user believes in
+ *  that does not exist, which is the same failure the environment-variable box
+ *  refuses to commit (`src/lib/envvars.ts`). Empty for an unprobed build, and
+ *  empty for a setting sitting at llama.cpp's own default — there is nothing to
+ *  drop when nothing was going to be emitted. */
+export function droppedFlags(
+  target: Target,
+  opts: { settings: Settings; caps: BuildFlags },
+): { key: string; label: string; flag: string }[] {
+  const out: { key: string; label: string; flag: string }[] = [];
+  for (const p of PARAMS) {
+    if (!applies(p, target)) continue;
+    const value = opts.settings[p.key] ?? p.def;
+    const wanted = emit(p, value);
+    if (wanted.length === 0 || p.flag === "") continue;
+    if (emitFor(p, value, opts.caps).length === 0) {
+      out.push({ key: p.key, label: p.label, flag: wanted[0] as string });
+    }
+  }
+  return out;
+}
+
 /** Build argv for `llama-server` / `llama-cli`.
  *
  *  `bin` is the absolute binary path and `model` the absolute GGUF path; both
  *  are passed through untouched so the preview and the spawn agree exactly. */
 export function argv(
   target: Target,
-  opts: { bin: string; model: string; settings: Settings },
+  opts: {
+    bin: string;
+    model: string;
+    settings: Settings;
+    /** The flags this build declares (`builds.caps`). Omitted = not probed,
+     *  which emits everything — see `BuildFlags`. */
+    caps?: BuildFlags;
+  },
 ): string[] {
   const out: string[] = [opts.bin];
   if (opts.model) out.push("-m", opts.model);
   for (const p of PARAMS) {
     if (!applies(p, target)) continue;
-    out.push(...emit(p, opts.settings[p.key] ?? p.def));
+    out.push(...emitFor(p, opts.settings[p.key] ?? p.def, opts.caps));
   }
   return out;
 }
@@ -90,14 +190,23 @@ function displayToken(token: string, home: string): string {
   return quote(token);
 }
 
-/** The copy-pasteable one-liner shown read-only in the UI. */
+/** The copy-pasteable one-liner shown read-only in the UI. The environment
+ * prefix, when there is one, leads the way a shell would read it — the argv
+ * below is unchanged, so the preview and the spawn cannot drift. */
 export function commandLine(
   target: Target,
-  opts: { bin: string; model: string; settings: Settings; home?: string },
+  opts: {
+    bin: string;
+    model: string;
+    settings: Settings;
+    home?: string;
+    env?: readonly EnvVar[];
+    caps?: BuildFlags;
+  },
 ): string {
-  return argv(target, opts).map((t) => displayToken(t, opts.home ?? "")).join(
-    " ",
-  );
+  const prefix = opts.env?.length ? envPrefix(opts.env) + " " : "";
+  return prefix +
+    argv(target, opts).map((t) => displayToken(t, opts.home ?? "")).join(" ");
 }
 
 /** Is an argv token a flag rather than a value? A value, even a numeric one,
@@ -111,10 +220,23 @@ function isFlag(token: string): boolean {
 }
 
 /** The same command, wrapped for reading: one flag per line with a continuation
- *  marker. Long llama.cpp invocations are unreadable on one line. */
+ * marker. Long llama.cpp invocations are unreadable on one line.
+ *
+ * The environment prefix is one line of its own ABOVE the binary, because it
+ * is not part of the argv and a `\`-continuation line that began with
+ * `NAME=value` would not be one the shell reads as an assignment for the
+ * command at the end of it. Copy is unaffected — the copy button takes
+ * `commandLine`. */
 export function commandBlock(
   target: Target,
-  opts: { bin: string; model: string; settings: Settings; home?: string },
+  opts: {
+    bin: string;
+    model: string;
+    settings: Settings;
+    home?: string;
+    env?: readonly EnvVar[];
+    caps?: BuildFlags;
+  },
 ): string[] {
   const parts = argv(target, opts).map((t) => displayToken(t, opts.home ?? ""));
   const lines: string[] = [];
@@ -129,6 +251,9 @@ export function commandBlock(
     cur = value ? `  ${flag} ${value}` : `  ${flag}`;
   }
   lines.push(cur);
+  // The env prefix leads, as its own line — never appended after the command,
+  // because a shell reads `NAME=value` only in FRONT of the program.
+  if (opts.env?.length) lines.unshift(envPrefix(opts.env));
   return lines;
 }
 

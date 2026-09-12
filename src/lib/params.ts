@@ -480,26 +480,46 @@ export const PARAMS: readonly Param[] = [
       "Precision of the value cache. Quantising V usually needs flash attention on; keep it at least as precise as K.",
   },
   {
-    key: "mlock",
-    flag: "--mlock",
-    label: "Lock in RAM",
-    kind: "bool",
+    // ONE setting, because llama.cpp has one: `--mlock`, `--no-mmap` and
+    // `--direct-io` all assigned the same `params.load_mode`, so emitting two
+    // of them was never "locked and unmapped" — it was whichever came last,
+    // silently, while the app printed a reason claiming the other.
+    //
+    // Upstream finished the job: the three old flags were deprecated in favour
+    // of `-lm/--load-mode` and then REMOVED. A master build meets `--mlock`
+    // with `unknown argument` and exits before it has read the model path, so
+    // the catalog speaks the new spelling and `legacy` below carries the old
+    // one for a build that still wants it (`command.ts`, gated on the probe —
+    // never on a version number, which a PR stack does not have).
+    key: "loadMode",
+    flag: "--load-mode",
+    label: "Model loading",
+    kind: "enum",
     group: "performance",
     scope: "both",
-    def: false,
+    def: "auto",
+    llamaDef: "auto",
+    options: ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"],
+    optionLabels: [
+      "auto (mmap where possible)",
+      "none (read into RAM)",
+      "mmap",
+      "mlock (pin in RAM)",
+      "mmap + mlock",
+      "direct I/O",
+    ],
+    legacy: {
+      // Older llama.cpp, same meanings. `auto` and `mmap` were the default
+      // there too, so they emit nothing at all.
+      auto: [],
+      mmap: [],
+      none: ["--no-mmap"],
+      mlock: ["--mlock"],
+      "mmap+mlock": ["--mlock"],
+      dio: ["--direct-io"],
+    },
     tip:
-      "Pin the model in physical memory so the OS can never swap it out. Only safe when the CPU-side weights comfortably fit in free RAM.",
-  },
-  {
-    key: "noMmap",
-    flag: "--no-mmap",
-    label: "Disable mmap",
-    kind: "bool",
-    group: "performance",
-    scope: "both",
-    def: false,
-    tip:
-      "Read the whole file into RAM up front instead of mapping it. Slower to start and uses more RAM; occasionally helps on network filesystems.",
+      "How the weights get into memory. auto memory-maps the file, so a warm restart re-reads almost nothing. mlock pins it so the OS can never page it out — only safe when the host-side weights fit in free RAM and under this machine's memlock limit. none reads the whole file up front: slower to start, more RAM, occasionally helps on a network filesystem.",
   },
   {
     key: "numa",

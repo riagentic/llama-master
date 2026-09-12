@@ -286,6 +286,23 @@ export type Param = {
   optionLabels?: string[];
   /** Plain-language explanation shown as a tooltip. Every param has one. */
   tip: string;
+  /**
+   * How this setting was spelled before upstream renamed the flag.
+   *
+   * A map from this parameter's value to the argv tokens an OLDER llama.cpp
+   * wants for the same thing. Used only when the build has been probed, does
+   * NOT declare `flag`, and does declare the legacy spelling — so a current
+   * build always gets the current flag and nothing has to be guessed from a
+   * version number.
+   *
+   * It exists because upstream removes flags, not just adds them: `--mlock`
+   * and `--no-mmap` were deprecated in favour of `-lm/--load-mode` and then
+   * DELETED, so a master build meets `--mlock` with `unknown argument` and
+   * exits before it reads the model path. A catalog that only ever knew the
+   * new spelling would break every release still in the wild; one that only
+   * knew the old spelling is what broke master.
+   */
+  legacy?: Record<string, string[]>;
   /** Hidden behind the "advanced" toggle — rarely needed, never removed. */
   advanced?: boolean;
   /** Placeholder / unit hint for text and number inputs. */

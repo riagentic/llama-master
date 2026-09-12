@@ -232,6 +232,11 @@ export const builds = cell("builds", {
   cancelOn: {
     // Declared against the method below; `cancel` aborts a running `start`.
     start: ["builds:cancel"],
+    // …and against `update`, which runs `start`'s BODY inside its own action
+    // (`s.$call.start()`). `$call` hands the sibling the CALLER's signal, so
+    // without this line Cancel stopped a Build and did nothing at all to an
+    // Update — a button that is present, enabled, and inert.
+    update: ["builds:cancel"],
   },
   methods: {
     setRef(s, ref: string) {
@@ -309,6 +314,10 @@ export const builds = cell("builds", {
     },
     setOrigin(s, origin: Origin) {
       s.origin = origin;
+      // aiol-ok — `loadAssets` reads `s.ref`, which this method does not
+      // write, so there is nothing of ours for it to read stale. `$call` is not
+      // an option either way: an async sibling cannot be called from a sync
+      // method, because there is nowhere to await it.
       if (origin === "release" && s.assets.length === 0) builds.loadAssets();
     },
     setJobs(s, jobs: number) {
@@ -415,7 +424,34 @@ export const builds = cell("builds", {
 
     /** Re-acquire the active build at the newest upstream version, by whichever
      *  route it came from originally. Same button for both. */
-    async update(s): Promise<Job["status"]> {
+    /**
+     * Rebuild/reinstall the active build at whatever upstream offers now.
+     *
+     * `s.$call.start()`, never `builds.start()`.
+     *
+     * The ordinary spelling is a SECOND DISPATCH with its own draft, and it
+     * reads state as COMMITTED — which is before the four lines above it.
+     * Measured, not reasoned: `builds.start()` here set `ref` to the update
+     * target and then started a job labelled `Install b1111`, the version
+     * already installed. An Update button that reinstalls what you have,
+     * reports success, and says it updated. `origin` and `backend` were stale
+     * the same way, so an update could also change the backend under you.
+     * `s.$commit()` does NOT fix it — verified: the sibling still reads the
+     * pre-call snapshot. Only sharing the draft does.
+     *
+     * `$call` runs the sibling's body against THIS draft, in THIS commit
+     * (`dep/aio/docs/state/methods.md`, "One method calling another"). Reached
+     * through a local cast rather than by annotating the draft with
+     * `MethodDraftCalls`: that type names the siblings, `start`'s return type
+     * is being inferred from the same object literal these methods live in, and
+     * TypeScript answers the circularity by widening the WHOLE method map to
+     * `undefined` — which surfaces as `builds.checkUpdates is possibly
+     * undefined` in app.ts, thirty lines and one file away from the cause.
+     * `tests/cells.test.ts` pins the label this produces.
+     */
+    async update(
+      s: BuildsState & Partial<MethodDraftMeta>,
+    ): Promise<Job["status"]> {
       const active = s.installed.find((b) => b.id === s.activeId) ?? null;
       if (!active || s.job?.status === "running") return "cancelled";
       const target = updateTarget(active, s.upstream);
@@ -425,7 +461,10 @@ export const builds = cell("builds", {
       s.assetName = "";
       // Hand the status back rather than making the caller read state across
       // the bridge — see `start`.
-      return await builds.start();
+      const call = (s as unknown as {
+        $call: { start(): Promise<Job["status"]> };
+      }).$call;
+      return await call.start();
     },
 
     async scan(s) {
@@ -469,7 +508,13 @@ export const builds = cell("builds", {
       try {
         const io = await import("./builds.server.ts");
         await io.removeBuild(id);
+        // aiol-ok — deliberately read AFTER the disk removal, not before: the
+        // list must only stop claiming a build once the files are actually
+        // gone, or a failed delete leaves the UI describing a directory that is
+        // still there.
         s.installed = s.installed.filter((b) => b.id !== id);
+        // aiol-ok — and the selection follows the list it was just filtered
+        // out of; both reads are of the line above, not of a stale snapshot.
         if (s.activeId === id) s.activeId = s.installed[0]?.id ?? "";
       } catch (e) {
         s.lastError = `Could not remove ${id}: ${e}`;
@@ -524,6 +569,11 @@ export const builds = cell("builds", {
 
       try {
         const io = await import("./builds.server.ts");
+        // aiol-ok — the run's parameters, read at the moment the run starts.
+        // `start` is the method the whole cell is arranged around: nothing else
+        // may write `ref`/`backend` while a job is running (every setter is
+        // disabled in the UI and `start` refuses re-entry), so these are the
+        // values the user pressed the button on.
         const signal = s.$signal;
         const built = source
           ? await io.buildFromSource(

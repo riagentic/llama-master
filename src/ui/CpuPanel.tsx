@@ -21,7 +21,7 @@ import { mappedModelB } from "./derive.ts";
  *  see whether a run is using the machine evenly or hammering two cores. */
 function Core(props: { i: number; pct: number }) {
   return (
-    <div class="core">
+    <div class="core-row">
       <span class="core-n">{props.i}</span>
       <Bar value={props.pct} max={100} tone="accent" height={6} />
       <span class="core-pct">{Math.round(props.pct)}%</span>
@@ -157,7 +157,7 @@ export function CpuPanel() {
                   />
                 )
                 : (
-                  <div class="cores">
+                  <div class="core-rows">
                     {c.coresUtil.map((p, i) => (
                       <Core key={String(i)} i={i} pct={p} />
                     ))}

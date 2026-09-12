@@ -14,14 +14,17 @@ import {
   ctxOf,
   fitDecision,
   nCpuMoeOf,
+  ubatchOf,
   withCtx,
   withNCpuMoe,
   withoutFlag,
+  withUbatch,
 } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
 import { benchRequest, EMPTY_BENCH, parseBench } from "../lib/bench.ts";
 import type { BenchKind, BenchResult } from "../lib/bench.ts";
+import type { EnvVar } from "../lib/envvars.ts";
 
 export type ServerStatus =
   | "stopped"
@@ -42,6 +45,14 @@ export type SrvState = {
    *  typed into the panel — those are different things the moment they edit. */
   runSettings: Settings | null;
   runModel: string;
+  /** The environment variables this process was STARTED with (`cfg.envVars`,
+   *  parsed). NULL when it was started with none — the command preview shows
+   *  the working ones while nothing runs, and while a server is up it must
+   *  show the prefix the running process actually carries, not whatever the
+   *  box has drifted to since (the same promise `runSettings` makes).
+   *  Cleared on stop, and the ladder's retries inherit it untouched: a rung
+   *  is the same run one number smaller, not a new one. */
+  runEnv: readonly EnvVar[] | null;
   /** Device-wide free memory the moment this run was spawned — the baseline
    *  the "roomier" drift note measures against. Without it, "memory has come
    *  free since this model started" fired on any machine that simply had
@@ -101,6 +112,12 @@ export type SrvState = {
   /** Whether this run may be retried at all: off when the user is driving the
    *  settings by hand, because shrinking a context they chose is not a fix. */
   autoFit: boolean;
+  /** Whether the ladder may take the MICRO-BATCH back. Separate from `autoFit`
+   *  on purpose: a pinned context turns that off, and `-ub` is not what was
+   *  pinned — the tuner raised it to spend spare VRAM, so the tuner may give it
+   *  back without touching the length the user asked for
+   *  (`fitladder.ts:autoUbatch`). */
+  autoUbatch: boolean;
   /** What the last automatic step-down did, in words, for the panel. */
   fitNote: string;
   /** Settings this RUN proved the build cannot honour — dropped from the argv
@@ -283,6 +300,7 @@ export const srv = cell("srv", {
     argv: [] as string[],
     runSettings: null as Settings | null,
     runModel: "",
+    runEnv: null as readonly EnvVar[] | null,
     startFreeVramB: 0,
     startFreeRamB: 0,
     rssB: 0,
@@ -305,6 +323,7 @@ export const srv = cell("srv", {
     runShape: null as { nLayer: number; expertPerLayerB: number } | null,
     runCardFreeB: [] as number[],
     autoFit: false,
+    autoUbatch: false,
     fitNote: "",
     unsupported: [] as string[],
     lastBench: EMPTY_BENCH as BenchResult,
@@ -380,6 +399,9 @@ export const srv = cell("srv", {
         /** May this run be retried at a smaller context if it dies for want of
          *  memory? On when the tuner chose the settings, off when the user did. */
         autoFit?: boolean;
+        /** May the ladder lower `-ub`? On whenever the TUNER chose the
+         *  micro-batch, even when the context is pinned. */
+        autoUbatch?: boolean;
         /** Set only by the retry itself, so the ladder is not reset by its own
          *  next rung. */
         retry?: boolean;
@@ -387,6 +409,12 @@ export const srv = cell("srv", {
          *  Applied to the process after the spawn — the argv on screen stays
          *  the argv that ran (`src/lib/priority.ts`). */
         lowPriority?: boolean;
+        /** Environment variables to spawn with (`cfg.envVars`, parsed by
+         *  `src/lib/envvars.ts`). They are process environment, not argv, so
+         *  they ride here rather than in the command — the ladder's retries
+         *  pass `s.argv` on with this untouched, because a rung is the same
+         *  run one number smaller. */
+        env?: readonly EnvVar[];
         /** What the ladder needs to answer a WEIGHTS overflow, which no smaller
          *  context can fix: the layer count and one layer's routed experts,
          *  both exact from the header. */
@@ -407,6 +435,7 @@ export const srv = cell("srv", {
         s.fitNote = "";
         s.unsupported = [];
         s.autoFit = run?.autoFit ?? false;
+        s.autoUbatch = run?.autoUbatch ?? false;
       }
       s.lastError = "";
       s.exitCode = null;
@@ -430,6 +459,7 @@ export const srv = cell("srv", {
       s.url = url;
       s.runSettings = run?.settings ?? null;
       s.runModel = run?.model ?? "";
+      s.runEnv = run?.env?.length ? run.env.slice() : null;
       s.runLowPriority = run?.lowPriority !== false;
       if (!run?.retry) {
         s.runShape = run?.shape ?? null;
@@ -441,7 +471,7 @@ export const srv = cell("srv", {
       s.rssFileB = 0;
       try {
         const io = await import("./srv.server.ts");
-        const { pid } = io.start(argv);
+        const { pid } = io.start(argv, run?.env);
         s.pid = pid;
         s.startedAt = Date.now();
         // Not awaited: two tiny subprocesses must not stand between the spawn
@@ -509,6 +539,7 @@ export const srv = cell("srv", {
         s.props = null;
         s.runSettings = null;
         s.runModel = "";
+        s.runEnv = null;
         s.startFreeVramB = 0;
         s.startFreeRamB = 0;
         s.rssB = 0;
@@ -545,6 +576,10 @@ export const srv = cell("srv", {
         // `clearLog` undone by the next poll — and, worse, in the gap between
         // a Start being dispatched and its spawn (status "starting", no
         // process yet) it ran the fit ladder against the PREVIOUS run's lines.
+        // aiol-ok — `poll` is an OBSERVER. Its whole job is to report state
+        // that moved under it while it was asking the OS a question, and this
+        // guard exists precisely because the pid may have changed during the
+        // await (a Start dispatched into the gap).
         if (s.pid === 0 && was !== "stopping") return;
         if (was === "stopping") {
           s.status = "stopped";
@@ -568,6 +603,8 @@ export const srv = cell("srv", {
             ctx: ctxOf(s.argv),
             tries: s.fitTries,
             auto: s.autoFit,
+            autoUbatch: s.autoUbatch,
+            ubatch: ubatchOf(s.argv),
             nCpuMoe: nCpuMoeOf(s.argv),
             nLayer: s.runShape?.nLayer ?? 0,
             expertPerLayerB: s.runShape?.expertPerLayerB ?? 0,
@@ -581,6 +618,10 @@ export const srv = cell("srv", {
             // retry.
             const next = decision.kind === "retry"
               ? withCtx(s.argv, decision.ctx)
+              : decision.kind === "ubatch"
+              ? withUbatch(s.argv, decision.ubatch)
+              : decision.kind === "nospec"
+              ? withoutFlag(s.argv, "--spec-type", 1)
               : decision.kind === "drop"
               ? withoutFlag(
                 s.argv,
@@ -594,6 +635,19 @@ export const srv = cell("srv", {
             if (s.runSettings) {
               if (decision.kind === "retry") {
                 s.runSettings.ctxSize = decision.ctx;
+              } else if (decision.kind === "ubatch") {
+                // The panel must stop claiming the micro-batch the argv no
+                // longer asks for — and `-b` follows it, exactly as
+                // `withUbatch` rewrote the command.
+                s.runSettings.ubatchSize = decision.ubatch;
+                if (Number(s.runSettings.batchSize) < decision.ubatch) {
+                  s.runSettings.batchSize = decision.ubatch;
+                }
+              } else if (decision.kind === "nospec") {
+                // The panel stops claiming a flag the argv no longer carries —
+                // but this is NOT written to `cfg.unsupported`: the build can
+                // do it, the machine had no room for it this time.
+                s.runSettings.specType = "";
               } else if (decision.kind === "drop") {
                 // The settings must stop claiming a feature the argv no longer
                 // asks for, or the Setup pills and the process disagree about
@@ -633,7 +687,10 @@ export const srv = cell("srv", {
             s.rssFileB = 0;
             try {
               const dead = s.pid;
-              const { pid } = io.start(next);
+              // A rung inherits the run's environment untouched — the same
+              // promise it makes about every setting it does not rewrite: the
+              // run is the same run one number smaller.
+              const { pid } = io.start(next, s.runEnv ?? undefined);
               s.pid = pid;
               s.startedAt = Date.now();
               // Every rung is a fresh process, so every rung is reniced.
@@ -775,6 +832,8 @@ export const srv = cell("srv", {
           }
         }
         s.orphans = await io.findOrphans();
+        // aiol-ok — reading back the line above, which is the freshly measured
+        // answer: "nothing is left" is the only thing that may clear the error.
         if (s.orphans.length === 0) s.lastError = "";
       } finally {
         s.freeing = false;

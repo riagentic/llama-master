@@ -345,11 +345,22 @@ function RunStrip() {
   // the same machine, the bench wins when it applies (`speedCalFromLastReply`),
   // and keying on the chat rate alone meant pressing Measure changed nothing
   // until the user happened to say something afterwards.
+  //
+  // Read in the RENDER BODY, not inside the callback. A component subscribes
+  // only to what its render touches, and this one touches `srv` (the buttons)
+  // but nothing of `chat` — so reading `chat.lastTps` inside `afterRender`
+  // subscribed to nothing, the component never re-rendered when a reply
+  // finished, and the callback ran once and never again. Half of that was
+  // already known and mis-diagnosed: adding the bench to the key fixed
+  // "pressing Measure changed nothing" without fixing why. aio 1.0.0-beta says
+  // it outright (`docs/ui/reactivity-tracking.md`), which is what found the
+  // other half. `lastTps` is written once per FINISHED reply, not per streamed
+  // flush, so subscribing here costs one re-render per answer.
   const calFor = useRef("");
+  const calKey = `${chat.lastTps}|${srv.lastBench.at}`;
   afterRender(() => {
-    const key = `${chat.lastTps}|${srv.lastBench.at}`;
-    if (calFor.current === key) return;
-    calFor.current = key;
+    if (calFor.current === calKey) return;
+    calFor.current = calKey;
     const cal = speedCalFromLastReply();
     if (cal.gpuBps || cal.ramBps) cfg.setSpeedCal(cal);
   });
