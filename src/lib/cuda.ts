@@ -197,7 +197,10 @@ export function cudaUpgradeFor(
  * do".
  */
 export function driverCudaVersion(smiText: string): number {
-  const m = /CUDA(?:\s+UMD)?\s+Version:?\s*([0-9]+\.[0-9]+)/i.exec(smiText);
+  // `\s*:?\s*`: the banner writes "CUDA UMD Version: 13.3", while
+  // `nvidia-smi --version` pads the label ("CUDA UMD version    : 13.3") and
+  // prints a "CUDA version : Deprecated" line first, which must not match.
+  const m = /CUDA(?:\s+UMD)?\s+Version\s*:?\s*([0-9]+\.[0-9]+)/i.exec(smiText);
   return m ? Number(m[1]) : 0;
 }
 

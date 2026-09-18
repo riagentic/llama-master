@@ -51,7 +51,19 @@ export type SrcRef =
    * is why it is a separate kind rather than a list on the one above. A single
    * PR keeps taking the tarball path and keeps needing nothing installed.
    */
-  | { kind: "stack"; prs: number[] };
+  | { kind: "stack"; prs: number[] }
+  /**
+   * Another repository's llama.cpp — a FORK, built from source.
+   *
+   * Some model families ship before their kernels reach upstream, and the
+   * only runtime that can load them is the vendor's fork: PrismML's ternary
+   * `PQ2_0`/`PTQ1_0` types live in `PrismML-Eng/llama.cpp` (default branch
+   * `prism`), and the one upstream PR for them is CPU-only and was asked to
+   * wait for PrismML. A fork is still a codeload tarball, so it needs no git.
+   * `ref` null = the fork's default branch (codeload's `HEAD`), which is what
+   * a user pasting the repository's URL means.
+   */
+  | { kind: "fork"; repo: string; ref: string | null };
 
 /** How a ref is spelled in `cfg`/`builds` state and in a build id. */
 export function formatRef(r: SrcRef): string {
@@ -64,7 +76,45 @@ export function formatRef(r: SrcRef): string {
       return r.mode === "head" ? `pr/${r.pr}@head` : `pr/${r.pr}`;
     case "stack":
       return `master+${r.prs.map((n) => `pr/${n}`).join("+")}`;
+    case "fork":
+      return `fork:${r.repo}${r.ref ? `@${r.ref}` : ""}`;
   }
+}
+
+/** Upstream. Every ref kind but `fork` names something in it. */
+const REPO = "ggml-org/llama.cpp";
+
+/** `owner/name` as GitHub spells it — the only shape a repo may take here,
+ *  because it lands in a URL and (via `refDirName`) in a path. */
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
+/** A branch or tag name, conservatively: git allows more, a URL and a path
+ *  want less, and every real llama.cpp fork ref fits this. */
+const GITREF_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,200}$/;
+
+function forkRef(repo: string, ref: string | null): SrcRef | null {
+  const r = repo.replace(/\.git$/, "");
+  if (!REPO_RE.test(r) || r.includes("..")) return null;
+  if (ref !== null && (!GITREF_RE.test(ref) || ref.includes(".."))) return null;
+  // The upstream repository is not a fork of itself: its refs already have
+  // spellings (`master`, `b7421`), and a second one is a second cache entry.
+  if (r.toLowerCase() === REPO.toLowerCase()) return null;
+  return { kind: "fork", repo: r, ref };
+}
+
+/**
+ * A fork out of whatever the user pasted: the repository's URL, a
+ * `/tree/<branch>` URL, `owner/name`, or `owner/name@ref`. Null when it is not
+ * one — and a pull request URL is deliberately NOT one, since it has its own
+ * reader and meaning.
+ */
+export function parseForkInput(text: string): SrcRef | null {
+  const s = text.trim();
+  const url =
+    /^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+\/[^/\s#?]+)(?:\/tree\/([^\s#?]+))?\/?$/i
+      .exec(s);
+  if (url) return forkRef(url[1]!, url[2] ? decodeURIComponent(url[2]) : null);
+  const bare = /^([^/@\s]+\/[^/@\s]+)(?:@(\S+))?$/.exec(s);
+  return bare ? forkRef(bare[1]!, bare[2] ?? null) : null;
 }
 
 /** Read a stored ref back. Anything unrecognised is treated as a tag, which is
@@ -72,6 +122,13 @@ export function formatRef(r: SrcRef): string {
 export function parseRef(ref: string): SrcRef {
   const s = ref.trim();
   if (s === "master" || s === "") return { kind: "master" };
+  if (s.startsWith("fork:")) {
+    const f = parseForkInput(s.slice("fork:".length));
+    // An unreadable fork spelling is NOT a tag — that would send a hostile
+    // stored string to codeload as `refs/tags/fork:…`. Master is the one ref
+    // that is always buildable.
+    return f ?? { kind: "master" };
+  }
   if (s.startsWith("master+")) {
     const prs = s
       .slice("master+".length)
@@ -166,6 +223,10 @@ export function refPrs(r: SrcRef): number[] {
  * code than its name claims is the exact class of thing this app refuses.
  */
 export function refMoves(r: SrcRef): boolean {
+  // A fork's ref may be a branch or a tag, and nothing here can tell which
+  // without asking GitHub — so it is treated as moving. Re-fetching an
+  // immutable tag costs one download; reusing a moved branch costs a build
+  // that is not what its name says.
   return r.kind !== "tag";
 }
 
@@ -184,8 +245,6 @@ export function refNeedsGit(r: SrcRef): boolean {
   return r.kind === "stack";
 }
 
-const REPO = "ggml-org/llama.cpp";
-
 /** Where to download this ref's source tarball. */
 export function tarballUrl(r: SrcRef, repo = REPO): string {
   const base = `https://codeload.github.com/${repo}/tar.gz`;
@@ -201,6 +260,9 @@ export function tarballUrl(r: SrcRef, repo = REPO): string {
       // checks `refNeedsGit` first; this is the honest answer to a question
       // that should not have been asked.
       return "";
+    case "fork":
+      // `HEAD` is the fork's default branch, whatever it is called.
+      return `https://codeload.github.com/${r.repo}/tar.gz/${r.ref ?? "HEAD"}`;
   }
 }
 
@@ -242,6 +304,10 @@ export function refDirName(r: SrcRef): string {
       // Order matters — merging A then B is not merging B then A when they
       // touch the same lines — so it is part of the name, not sorted away.
       return `stack-${r.prs.join("-")}`;
+    case "fork": {
+      const safe = (x: string) => x.replace(/[^A-Za-z0-9._-]/g, "_");
+      return `fork-${safe(r.repo)}${r.ref ? `-${safe(r.ref)}` : ""}`;
+    }
   }
 }
 
@@ -258,6 +324,8 @@ export function refLabel(r: SrcRef): string {
         : `master + PR #${r.pr}`;
     case "stack":
       return `master + ${r.prs.map((n) => `PR #${n}`).join(" + ")}`;
+    case "fork":
+      return `${r.repo}${r.ref ? ` @ ${r.ref}` : " (default branch)"}`;
   }
 }
 
@@ -283,6 +351,10 @@ export function refProvenance(r: SrcRef, at: number): string {
       return `master as of ${when}, with pull requests ${
         r.prs.map((n) => `#${n}`).join(", ")
       } merged into it in that order`;
+    case "fork":
+      return `the fork ${r.repo} (${
+        r.ref ?? "default branch"
+      }) as it stood on ${when} — not upstream llama.cpp`;
   }
 }
 
@@ -377,6 +449,18 @@ export function refNotFound(r: SrcRef): { reason: string; steps: string[] } {
         }.`,
         steps: [
           "One of the pull requests could not be fetched. Check each number on its own first — a stack is only as buildable as its parts.",
+        ],
+      };
+    case "fork":
+      return {
+        reason: `GitHub has no ${
+          r.ref ? `branch or tag "${r.ref}" in` : "public repository"
+        } ${r.repo}.`,
+        steps: [
+          `Open https://github.com/${r.repo} and check the spelling — owner and name are exactly as the page's title shows them.`,
+          r.ref
+            ? "Paste the repository's URL alone to build its default branch."
+            : "A private or deleted repository cannot be downloaded from here.",
         ],
       };
   }

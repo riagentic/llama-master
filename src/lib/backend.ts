@@ -111,12 +111,32 @@ export function targetReadiness(
     /** The ref being targeted, when it is a pull request. Only the source
      *  route can produce one, and saying so early is the whole job here. */
     pr?: number;
+    /** The fork (`owner/name`) being targeted, when it is one. Source only,
+     *  for the reason `forkNoRelease` gives. */
+    fork?: string;
   },
 ): { ok: boolean; diagnosis: Diagnosis | null; pending: boolean } {
   // A pull request has no prebuilt binaries — nobody publishes releases for
   // unmerged code — so the release route cannot serve it at any backend. This
   // is the same promise the rest of this function makes, one step earlier:
   // answer before the button is pressed, never after a download fails.
+  if (origin === "release" && ctx.fork) {
+    return {
+      ok: false,
+      pending: false,
+      diagnosis: {
+        reason:
+          `${ctx.fork} is a fork of llama.cpp, and the prebuilt route installs upstream's own releases only.`,
+        steps: [
+          {
+            text:
+              "Build it from source. That also gives CUDA builds the runtime libraries a fork's own Linux download leaves out, and compiles for this machine's GPUs natively.",
+            action: { kind: "switch-origin" as const, to: "source" as const },
+          },
+        ],
+      },
+    };
+  }
   if (origin === "release" && ctx.pr) {
     return {
       ok: false,

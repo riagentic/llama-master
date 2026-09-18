@@ -6,9 +6,16 @@
 
 import { builds } from "../cell/builds.ts";
 import { useLocal } from "aio/air";
-import { parsePrList, parseRef, refPrs } from "../lib/srcref.ts";
+import {
+  formatRef,
+  parseForkInput,
+  parsePrList,
+  parseRef,
+  refLabel,
+  refPrs,
+} from "../lib/srcref.ts";
 import { hw } from "../cell/hw.ts";
-import { availableBackends, pickAsset } from "../lib/assets.ts";
+import { availableBackends, isBinaryAsset, pickAsset } from "../lib/assets.ts";
 import { SCHED_SPLIT_CAP, targetReadiness } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
 import { bytes, duration, stamp } from "../lib/format.ts";
@@ -23,7 +30,13 @@ import {
   Segmented,
   Toggle,
 } from "./kit.tsx";
-import { buildBusy, buildsSizeB, foundPrereqs, prereqById } from "./derive.ts";
+import {
+  buildBusy,
+  buildsSizeB,
+  cudaMax,
+  foundPrereqs,
+  prereqById,
+} from "./derive.ts";
 import { optimalForThisPc } from "./actions.ts";
 import { Guidance } from "./Guidance.tsx";
 
@@ -45,9 +58,11 @@ function Chooser() {
   const arch = hw.arch || "x86_64";
   const assets = builds.assets;
   const auto = assets.length
-    ? pickAsset(assets, os, arch, builds.backend)
+    ? pickAsset(assets, os, arch, builds.backend, cudaMax())
     : null;
-  const available = assets.length ? availableBackends(assets, os, arch) : null;
+  const available = assets.length
+    ? availableBackends(assets, os, arch, cudaMax())
+    : null;
 
   // ONE question, asked for the exact route+backend the user has selected, and
   // asked before the button is enabled: will this produce a build?
@@ -63,7 +78,11 @@ function Chooser() {
     // makes about a missing toolchain.
     ...(() => {
       const r = parseRef(builds.ref);
-      return r.kind === "pr" ? { pr: r.pr } : {};
+      return r.kind === "pr"
+        ? { pr: r.pr }
+        : r.kind === "fork"
+        ? { fork: r.repo }
+        : {};
     })(),
   });
   const canBuild = ready.ok;
@@ -106,11 +125,19 @@ function Chooser() {
                 tag rendered as "master (latest)". Same bug 0.1.2 fixed on the
                 Tune page dropdowns. */
             }
-            {(builds.refs.length ? builds.refs : [builds.ref]).map((r) => (
-              <option key={r} value={r} selected={r === builds.ref}>
-                {r === "master" ? "master (latest)" : r}
-              </option>
-            ))}
+            {
+              /* The current ref is always an option: a pull request or a
+                fork is chosen below and is never in the tag list, and a
+                select whose value has no option shows its FIRST option — a
+                fork build displayed as "master (latest)". */
+            }
+            {(builds.refs.includes(builds.ref)
+              ? builds.refs
+              : [builds.ref, ...builds.refs]).map((r) => (
+                <option key={r} value={r} selected={r === builds.ref}>
+                  {refLabel(parseRef(r))}
+                </option>
+              ))}
           </select>
           <button
             type="button"
@@ -185,10 +212,10 @@ function Chooser() {
                   /* `selected` for the same async-options reason as the Version
                     select above. */
                 }
-                <option value="" selected={builds.assetName === ""}>
+                <option key="" value="" selected={builds.assetName === ""}>
                   {auto ? `auto — ${auto.name}` : "auto"}
                 </option>
-                {assets.map((a) => (
+                {assets.filter((a) => isBinaryAsset(a.name)).map((a) => (
                   <option
                     key={a.name}
                     value={a.name}
@@ -394,29 +421,34 @@ function Installed() {
  */
 function PrPicker() {
   const cur = parseRef(builds.ref);
-  const on = cur.kind === "pr" || cur.kind === "stack";
+  const on = cur.kind === "pr" || cur.kind === "stack" || cur.kind === "fork";
   const [text, setText] = useLocal("");
   // One box for one pull request and for five: "27773, 28136, 27269" is how
   // people write a list, and three fields would be three chances to get the
   // ORDER wrong — which is load-bearing, because merging A then B is not
   // merging B then A when they touch the same lines.
   const typed = parsePrList(text);
+  // The same box takes a FORK's URL: a model whose kernels live only in its
+  // vendor's llama.cpp (PrismML's ternary types) arrives with a repository
+  // link, and a second box for it would be a second place to look.
+  const fork = typed.length === 0 ? parseForkInput(text) : null;
   const apply = () => {
-    if (typed.length === 1) builds.setPr(typed[0]!, "merge");
+    if (fork) builds.setRef(formatRef(fork));
+    else if (typed.length === 1) builds.setPr(typed[0]!, "merge");
     else if (typed.length > 1) builds.setPrs(typed);
   };
   const prs = refPrs(cur);
   return (
     <div class="field-row">
-      <label>Pull request</label>
+      <label>PR or fork</label>
       <div class="pr-picker">
         <div class="field-inline">
           <input
             type="text"
             class="pr-input"
             t="pr-number"
-            aria-label="Pull request number or URL"
-            placeholder="numbers or URLs, e.g. 27773, 28136, 27269"
+            aria-label="Pull request number or URL, or a fork's URL"
+            placeholder="PRs, e.g. 27773, 28136 — or a fork's URL"
             value={text}
             onInput={(e) =>
               setText((e.currentTarget as HTMLInputElement).value)}
@@ -430,9 +462,11 @@ function PrPicker() {
             type="button"
             class="btn small primary"
             t="pr-use"
-            disabled={typed.length === 0}
-            title={typed.length === 0
-              ? "Type a pull request number, or paste its URL"
+            disabled={typed.length === 0 && !fork}
+            title={fork
+              ? `Build ${refLabel(fork)} instead of upstream llama.cpp`
+              : typed.length === 0
+              ? "Type a pull request number, paste its URL, or paste a fork's URL"
               : typed.length === 1
               ? `Build llama.cpp master with pull request #${
                 typed[0]
@@ -442,7 +476,9 @@ function PrPicker() {
               } merged into it, in that order`}
             onClick={() => apply()}
           >
-            {typed.length > 1
+            {fork
+              ? "Use this fork"
+              : typed.length > 1
               ? `Use ${typed.length} with master`
               : "Use with master"}
           </button>
@@ -464,7 +500,11 @@ function PrPicker() {
           ? (
             <div class="pr-note" t="pr-note">
               <span class="pr-what">
-                {cur.kind === "stack"
+                {cur.kind === "fork"
+                  ? `Building ${
+                    refLabel(cur)
+                  } — a fork, not upstream llama.cpp. It runs what upstream cannot (a vendor's own kernels) and lags upstream in everything else.`
+                  : cur.kind === "stack"
                   ? `Building master with ${
                     prs.map((n) => `#${n}`).join(", ")
                   } merged into it, in that order. More than one pull request cannot be merged by GitHub, so this one is assembled here and needs git.`
@@ -480,9 +520,9 @@ function PrPicker() {
                 ? <span class="pr-title">{builds.prTitle}</span>
                 : null}
               <span class="pr-dated">
-                A pull request build is dated: this is master as it stands
-                today, and rebuilding next week gives you a different one.
-                Existing builds are kept, so nothing you already have is lost.
+                {cur.kind === "fork"
+                  ? "A fork build is dated: this is the fork as it stands today, and Update follows the fork, never upstream. Existing builds are kept, so nothing you already have is lost."
+                  : "A pull request build is dated: this is master as it stands today, and rebuilding next week gives you a different one. Existing builds are kept, so nothing you already have is lost."}
               </span>
               {
                 /* A pull request that has LANDED turns its own ref into an

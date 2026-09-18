@@ -22,7 +22,12 @@ import {
 } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
-import { benchRequest, EMPTY_BENCH, parseBench } from "../lib/bench.ts";
+import {
+  BENCH_TOKENS,
+  benchRequest,
+  EMPTY_BENCH,
+  parseBench,
+} from "../lib/bench.ts";
 import type { BenchKind, BenchResult } from "../lib/bench.ts";
 import type { EnvVar } from "../lib/envvars.ts";
 
@@ -347,7 +352,7 @@ export const srv = cell("srv", {
      * timing out against a closed port, because "not running" is an answer and
      * a stack trace is not.
      */
-    async bench(s, kind: BenchKind = "prose", tokens?: number) {
+    async bench(s, kind: BenchKind = "prose", tokens: number = BENCH_TOKENS) {
       await runBench(s, kind, tokens);
     },
 
@@ -367,7 +372,7 @@ export const srv = cell("srv", {
      * about nothing. It costs twice as long and is the only honest way to run
      * it.
      */
-    async benchBoth(s, tokens?: number) {
+    async benchBoth(s, tokens: number = BENCH_TOKENS) {
       if (s.benching) return;
       // Both dispatches go through `bench`, which re-checks liveness and
       // discards a result whose process changed underneath it. If the first
@@ -392,7 +397,7 @@ export const srv = cell("srv", {
        *  from, so the memory view can describe reality rather than the form —
        *  and how much was free at the moment of the spawn, so drift can tell
        *  "memory came back" apart from "there was always room". */
-      run?: {
+      run: {
         model: string;
         settings: Settings;
         freeAtStart?: { vramB: number; ramB: number };
@@ -423,7 +428,7 @@ export const srv = cell("srv", {
          *  allocation can be turned into a shortfall instead of being taken at
          *  face value. */
         cardFreeB?: number[];
-      },
+      } | undefined = undefined,
     ): Promise<void> {
       if (s.status === "starting" || s.status === "ready") return;
       // The pid this start REPLACES, captured before anything overwrites it —

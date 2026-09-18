@@ -808,7 +808,10 @@ testUI(
     await ui_.settle();
     await prereq.scan();
     await builds.setOrigin("release");
-    await builds.setBackend("cuda");
+    // Metal on Linux: refused whatever upstream publishes this week. It was
+    // CUDA until upstream began shipping Linux CUDA builds (b11039), which
+    // turned this test's premise false overnight.
+    await builds.setBackend("metal");
     await builds.loadAssets();
     // `setOrigin` fires its own un-awaited `loadAssets`, and the guarded call
     // above returns at once while that one runs — so wait on the FLAG, not the
@@ -828,7 +831,7 @@ testUI(
     if (builds.assets.length >= 6) {
       // The user's report: prerequisites all green, then the build failed with a
       // list of filenames. It must be refused HERE, with a reason and a button.
-      assertStringIncludes(html, "Windows only");
+      assertStringIncludes(html, "only on macOS");
       assert(!html.includes(".tar.gz,"), "no filename dumps in the banner");
       assertEquals(ui_.App["get-llama"].disabled, true);
       assertExists(

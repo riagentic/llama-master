@@ -108,6 +108,7 @@ if (args.includes("--help")) {
     "--no-webui                              disable web ui",
     "-to N                                   read timeout",
     "-v                                      verbose log",
+    "-lv N                                   log verbosity",
     "-p FNAME                                prompt",
     "-n N                                    tokens to predict",
     "-cnv                                    conversation mode",

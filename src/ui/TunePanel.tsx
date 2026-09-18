@@ -361,6 +361,7 @@ export function TunePanel() {
         </div>
         <div class="tune-params">
           <ErrorNote
+            key="error"
             message={m && !meta
               ? `Model header unreadable: ${m.metaError}`
               : ""}

@@ -30,11 +30,13 @@ import {
   activeBuild,
   activeCaps,
   ctxOverride,
+  cudaMax,
   currentModel,
   foundPrereqs,
   hwSnapshot,
   maxTunings,
   measuredCtx,
+  modelRuntime,
   paramBlocker,
   placements,
   planningHw,
@@ -51,8 +53,8 @@ export { activeBuild, currentModel };
  * Which backend this machine can actually run, so the default is not a lie.
  *
  * When the asset list has been fetched, a backend with no prebuilt binary is
- * skipped — upstream ships CUDA for Windows only, and suggesting it on Linux
- * would send the user down a dead end.
+ * skipped — upstream shipped CUDA for Windows only before b11039, and a
+ * release without it must not send the user down a dead end.
  *
  * Which backend suits this hardware is a decision, so it lives in `src/lib`
  * where it is tested (`preferredBackends`); this only intersects it with what is
@@ -69,6 +71,7 @@ export function suggestedBackend(): Backend {
       builds.assets,
       hw.os || "linux",
       hw.arch || "x86_64",
+      cudaMax(),
     );
     return wish.find((b) => have.includes(b)) ?? "cpu";
   }
@@ -178,7 +181,13 @@ export function startBlocker(): string {
     return "No llama.cpp build installed — go to the Build tab.";
   }
   if (!serverBin()) return "The active build has no llama-server binary.";
+  const lib = builds.broken[builds.activeId];
+  if (lib) {
+    return `The active build cannot start: it cannot load ${lib}. It was built by an older version of this app that left its libraries in the build cache, and that cache has since been replaced. Rebuild it on the Build tab, or pick another build.`;
+  }
   if (!currentModel()) return "No model selected — scan for models first.";
+  const need = modelRuntime();
+  if (need) return need.reason;
   // Backstop for a restored session or any selection path around
   // `selectModel`: spawning with a stale `--spec-type` is a server that
   // refuses to load, and with auto-optimal off nothing else would clear it

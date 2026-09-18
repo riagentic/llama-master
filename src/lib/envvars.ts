@@ -114,6 +114,30 @@ export function parseEnvVars(text: string): {
  * line, and a duplicate is the user editing in place far more often than two
  * variables competing.
  */
+/**
+ * The environment a server is spawned with: the app's own, minus any
+ * `LLAMA_ARG_*` the user did not put in the Command panel, plus theirs.
+ *
+ * llama.cpp reads every flag from `LLAMA_ARG_<NAME>` when the flag is absent
+ * — and this app omits a flag whenever the setting is at llama.cpp's default.
+ * So a `LLAMA_ARG_CTX_SIZE` or `LLAMA_ARG_N_GPU_LAYERS` left in a shell
+ * profile or a service unit would silently rewrite a run whose command line
+ * says otherwise. Pure: the parent environment is handed in.
+ */
+export function spawnEnv(
+  parent: Readonly<Record<string, string>>,
+  vars: readonly EnvVar[],
+): { env: Record<string, string>; dropped: string[] } {
+  const mine = new Set(vars.map((v) => v.name));
+  const env: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [k, v] of Object.entries(parent)) {
+    if (k.startsWith("LLAMA_ARG_") && !mine.has(k)) dropped.push(k);
+    else env[k] = v;
+  }
+  return { env: { ...env, ...envRecord(vars) }, dropped: dropped.sort() };
+}
+
 export function envRecord(vars: readonly EnvVar[]): Record<string, string> {
   const out: Record<string, string> = {};
   for (const v of vars) out[v.name] = v.value;

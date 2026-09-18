@@ -21,6 +21,34 @@ const CACHE_TYPES = [
   "q4_0",
 ];
 
+/**
+ * Defaults this catalog USED to have, per key.
+ *
+ * `cfg.settings` stores values, not intentions, so a default changed here
+ * never reached anyone who had run the app before: v0.8.0 moved `-to` from
+ * 600 to 3600 and turned `--jinja` and `--slots` back on (both are ON
+ * upstream), and older stores kept launching `-to 600 --no-slots` — and
+ * `--no-jinja`, which breaks every chat template with tool calls or
+ * reasoning. `cfg`'s migration resets a stored value found here to today's
+ * default.
+ *
+ * `cfg.touched` cannot vet this: it records every key that DIFFERS from the
+ * default, including every value the tuner wrote — so it names `ngl` and
+ * `ctxSize` beside the old `timeout`, and says nothing about intent. Hence the
+ * list holds only values nobody would choose on purpose: a read timeout
+ * shorter than a long prefill takes (~690 s at 250k tokens measured), and a
+ * template engine switched off. `slots: false` is NOT here — hiding
+ * `/slots` (which shows every prompt in flight) is a reasonable choice, and
+ * costs nothing but the LAN client's occupancy reading.
+ *
+ * When a `def:` below changes, its old value goes here if keeping it would be
+ * a defect, and `cfg.version` goes up by one.
+ */
+export const FORMER_DEFAULTS: Readonly<Record<string, readonly unknown[]>> = {
+  timeout: [600],
+  jinja: [false],
+};
+
 export const PARAMS: readonly Param[] = [
   // ── offload ──────────────────────────────────────────────────────────────
   {
@@ -275,7 +303,7 @@ export const PARAMS: readonly Param[] = [
     llamaDef: false,
     advanced: true,
     tip:
-      "Pick the next token on the GPU instead of copying the model's output row back to the CPU every token. The copy is megabytes per token on a large vocabulary, and worse than its size: it stalls the GPU mid-loop. It stacks with speculative decoding — drafting makes each token cheaper to produce, this makes each one cheaper to collect. Experimental upstream, and llama.cpp turns it off by itself, with a warning in the log, when a grammar, a JSON schema or a reasoning budget is in use. Measure it with the Speed panel: it needs a restart, so run the pair before and after.",
+      "Pick the next token on the GPU instead of copying the model's output row back to the CPU every token. Experimental upstream, and measured here as a LOSS: 0.2-0.8 s added before the first token of every reply (more at long contexts) for no measurable generation speed, on upstream master and on PrismML's fork alike. llama.cpp also turns it off by itself, with a warning in the log, when a grammar, a JSON schema or a reasoning budget is in use. The tuner leaves it off; measure with the Speed panel if your build differs.",
   },
   {
     key: "overrideTensor",
@@ -859,6 +887,26 @@ export const PARAMS: readonly Param[] = [
     def: false,
     advanced: true,
     tip: "Log every request and the full model load trace.",
+  },
+  {
+    key: "logVerbosity",
+    flag: "-lv",
+    label: "Log verbosity",
+    kind: "int",
+    group: "server",
+    scope: "both",
+    // llama.cpp's default (3) hides every `load_tensors`, buffer-size and
+    // `sched_reserve` line — measured on b10144, b10151, master and the
+    // PrismML fork: ~22 startup lines at 3, ~210 at 4. Those are the lines
+    // the load-progress phases read and the lines a person reads to see
+    // where memory went, so the app asks for 4. Errors print at any level.
+    def: 4,
+    llamaDef: 3,
+    min: 0,
+    max: 4,
+    advanced: true,
+    tip:
+      "How much llama-server writes to the log. 4 includes the model load trace and the per-device buffer sizes — what the load progress and a memory diagnosis read. 3 is llama.cpp's own default and hides them.",
   },
 
   // ── cli-only ─────────────────────────────────────────────────────────────

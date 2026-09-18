@@ -188,6 +188,7 @@ export function StackBar(props: {
         {over > 0
           ? (
             <div
+              key="over"
               class="stack-seg seg-over"
               style={{
                 width: `${Math.min(100, pctOf(over, cap)).toFixed(3)}%`,

@@ -270,7 +270,7 @@ Deno.test("guard: every chat surface shows that it is waiting", async () => {
   for (const f of files) {
     const src = await read(f);
     const hasBox = /class="(chat-log|one-chatlog)"/.test(src);
-    if (hasBox && !src.includes("<Waiting />")) {
+    if (hasBox && !/<Waiting[ />]/.test(src)) {
       offenders.push(relative(ROOT, f));
     }
   }

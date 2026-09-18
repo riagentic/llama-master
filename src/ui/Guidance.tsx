@@ -32,6 +32,13 @@ function run(action: FixAction): void {
     case "open-url":
       globalThis.open?.(action.url, "_blank");
       break;
+    case "use-ref":
+      builds.setRef(action.ref);
+      ui.go("build");
+      break;
+    case "use-build":
+      builds.setActive(action.id);
+      break;
   }
 }
 
@@ -53,6 +60,10 @@ function label(action: FixAction): string {
         : "Open Build";
     case "open-url":
       return "Open docs ↗";
+    case "use-ref":
+      return "Set it up";
+    case "use-build":
+      return "Switch";
   }
 }
 

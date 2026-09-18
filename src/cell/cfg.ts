@@ -7,7 +7,7 @@
 // implementation of each and it is testable without booting a cell.
 
 import { cell } from "aio";
-import { coerce, defaults, param } from "../lib/params.ts";
+import { coerce, defaults, FORMER_DEFAULTS, param } from "../lib/params.ts";
 import {
   DEFAULT_RESERVE_CONNECTED_VRAM_B,
   DEFAULT_RESERVE_PER_GPU_VRAM_B,
@@ -155,7 +155,7 @@ export const cfg = cell("cfg", {
    * on the display card) take over — a visible control, on two pages, that says
    * what it is holding.
    */
-  version: 4,
+  version: 6,
   onMigrate(state: CfgState, from: number): CfgState {
     // Cast to delete a key that is no longer IN the type — which is the whole
     // point of a migration, and the only place in this app allowed to say it.
@@ -209,6 +209,25 @@ export const cfg = cell("cfg", {
         );
         if (renamed && !state.touched.includes("loadMode")) {
           state.touched = [...state.touched, "loadMode"];
+        }
+      }
+    }
+    if (from < 6) {
+      // Version 6, not 5: a first cut of this gated on `touched` and ran as 5
+      // without effect, and a store already at 5 would never see a fix.
+      // Idempotent, so running it on a store that was at 4 is the same.
+      // Defaults that moved under a store which had saved the old ones
+      // (`params.ts:FORMER_DEFAULTS`). Deleted rather than overwritten: a
+      // missing key IS the catalog default, so the next change to it needs
+      // no migration of its own.
+      // `touched` is not consulted: it lists every non-default value,
+      // tuner-written ones included, so it cannot say who chose what
+      // (`FORMER_DEFAULTS` says why the list is safe without it).
+      for (const [key, olds] of Object.entries(FORMER_DEFAULTS)) {
+        if (!state.settings || !olds.includes(state.settings[key])) continue;
+        delete state.settings[key];
+        if (Array.isArray(state.touched)) {
+          state.touched = state.touched.filter((k) => k !== key);
         }
       }
     }

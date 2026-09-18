@@ -99,6 +99,7 @@ export function ChatPanel() {
                 {chat.partial || chat.partialThink
                   ? (
                     <ChatMessage
+                      key="live"
                       role="assistant"
                       content={chat.partial}
                       thinking={chat.partialThink}
@@ -107,7 +108,7 @@ export function ChatPanel() {
                   )
                   : null}
                 {chat.streaming && !chat.partial && !chat.partialThink
-                  ? <Waiting />
+                  ? <Waiting key="waiting" />
                   : null}
               </>
             )}

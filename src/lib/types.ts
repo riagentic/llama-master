@@ -51,6 +51,23 @@ export type ModelMeta = {
    *  attention, which is the overwhelming majority of models. */
   swaWindow: number;
   swaPattern: number;
+  /** Per-layer sliding-window flags (1 = windowed) when the file states them
+   *  as an array — Gemma-4 and newer. Empty/absent = not stated per layer.
+   *  The optional fields below are absent in metadata cached before they
+   *  existed; a re-scan fills them in (`plan.ts:kvByLayer` reads all six). */
+  swaLayers?: number[];
+  /** Was `swaPattern` stated by the file, or is it the reader's default of 1?
+   *  llama.cpp substitutes a per-architecture default when it is absent
+   *  (Gemma-3: 6), so the two must be told apart. */
+  swaPatternStated?: boolean;
+  /** Per-layer KV head counts when the file states them as an array. */
+  headKvLayers?: number[];
+  /** Head sizes of the windowed layers, when they differ (Gemma-4: 256
+   *  against 512 on the global layers). 0/absent = same as the global ones. */
+  keyLengthSwa?: number;
+  valueLengthSwa?: number;
+  /** Trailing layers that reuse an earlier layer's cache (Gemma-3n/-4 E). */
+  sharedKvLayers?: number;
   /** Multi-head latent attention rank (DeepSeek-V2/V3). 0 = not MLA. */
   kvLoraRank: number;
   /** Hybrid linear attention (`full_attention_interval`, Qwen3-Next /
@@ -112,6 +129,12 @@ export type ModelMeta = {
   /** Tensors across every part (`split.tensors.count`) — the check that a merge
    *  actually saw the whole model. */
   splitTensors: number;
+  /** The runtime this file needs when it is not upstream llama.cpp
+   *  (`src/lib/runtime.ts`). `"prism"` = PrismML's fork: Prism-private types
+   *  upstream rejects, or Hadamard-folded weights upstream loads and answers
+   *  in garbage. Optional because metadata cached before this field existed
+   *  has none — read as "" (any llama.cpp), and re-scanning fills it in. */
+  vendor?: string;
   layers: LayerBytes[];
 };
 
@@ -135,6 +158,11 @@ export type Gpu = {
    *  when the machine has answered and every card is headless
    *  (`src/lib/reserve.ts:displayGpus`). */
   display?: boolean;
+  /** Newest CUDA runtime the installed DRIVER can run (`CUDA UMD Version` in
+   *  `nvidia-smi`). A prebuilt CUDA binary newer than this does not load, so
+   *  the asset picker caps to it (`src/lib/assets.ts`). NVIDIA only;
+   *  undefined when it could not be read. */
+  cudaDriver?: number;
 };
 
 export type Cpu = {

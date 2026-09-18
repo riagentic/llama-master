@@ -14,7 +14,7 @@ import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
 import { exec, paths, PLATFORM } from "./host.server.ts";
 import type { EnvVar } from "../lib/envvars.ts";
-import { envPrefix, envRecord } from "../lib/envvars.ts";
+import { envPrefix, spawnEnv } from "../lib/envvars.ts";
 
 /** Trailing separator so `/builds-evil` cannot pass a `/builds` prefix test. */
 const BIN_NAME = PLATFORM === "windows" ? "llama-server.exe" : "llama-server";
@@ -291,14 +291,24 @@ export function start(
   push(`$ ${envPrefixText(env)}${argv.join(" ")}`);
   const startedAtGeneration = stopGeneration;
 
+  // The app's environment, minus stray `LLAMA_ARG_*` (`envvars.ts:spawnEnv`
+  // says why), plus the user's own — passed whole with `clearEnv`, because
+  // Deno MERGES `env` over the parent's and a merge cannot remove anything.
+  const spawn = spawnEnv(Deno.env.toObject(), env ?? []);
+  if (spawn.dropped.length > 0) {
+    push(
+      `Ignored ${
+        spawn.dropped.join(", ")
+      } from the app's own environment: llama.cpp would read it in place of a flag this command leaves at its default, and the run would differ from the command shown. Put it in the Command panel's environment box to use it.`,
+    );
+  }
+
   let child: Deno.ChildProcess;
   try {
     child = new Deno.Command(bin, {
       args,
-      // Deno MERGES `env` over the inherited environment rather than replacing
-      // it, so PATH and the app's own variables survive — verified, because the
-      // opposite behaviour would strand a binary whose loader needs them.
-      env: env?.length ? envRecord(env) : undefined,
+      clearEnv: true,
+      env: spawn.env,
       stdout: "piped",
       stderr: "piped",
       stdin: "null",

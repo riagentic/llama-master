@@ -71,7 +71,7 @@ export function QuantAdvice() {
         than the size alone.
       </p>
       <div class="quant-table" t="quant-table">
-        <div class="quant-head">
+        <div class="quant-head" key="head">
           <span>Quant</span>
           <span>Bits</span>
           <span>Weights</span>

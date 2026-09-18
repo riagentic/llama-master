@@ -35,9 +35,46 @@ const CACHE_BYTES: Record<string, number> = {
   q4_0: 18 / 32,
 };
 
-/** Backend context + kernels a GPU pays for merely by being used. Measured
- *  around 250-450 MB for CUDA; the mid-point is the honest planning number. */
-const BACKEND_CONTEXT_B = 350 * 1024 * 1024;
+/** Backend context + kernels a GPU pays for merely by being used — what the
+ *  card loses BEYOND the buffers llama.cpp itself reports. Measured
+ *  2026-09-18 on two 24 GB Blackwell cards after a real generation: 0.39 and
+ *  0.37 GiB (Ternary-Bonsai-2-27B, PrismML's fork). It was 350 MB here. */
+const BACKEND_CONTEXT_B = 420 * 1024 * 1024;
+
+/**
+ * The compute graph's working set per micro-batch token, per device — the part
+ * of llama.cpp's `CUDA<n> compute buffer` that is not the attention mask.
+ *
+ * Fitted 2026-09-18 on current llama.cpp (upstream master and PrismML's fork
+ * agree to the MiB) over five architectures, subtracting the mask
+ * (`attnMaskB`) from each reported buffer:
+ *
+ *     Qwen3-14B        344 KiB/token   (n_embd 5120, n_ff 17408)
+ *     Qwen3.8-27B      324             (5120, 17408, hybrid)
+ *     Bonsai-2-27B     356 / 438       (same shape; the second card holds the head)
+ *     gemma-3-12b      298-310         (3840, 15360)
+ *     Ornith-35B-A3B   232             (2048, MoE 8 x 512)
+ *
+ * The form below lands 1-26% ABOVE every point — above on purpose: this is a
+ * budget, and being short here fails `graph_reserve` at load. The old estimate
+ * (four `n_embd` activations plus two FFN-wide ones) was 25-55% SHORT on all
+ * eighteen points measured.
+ */
+export function graphBytesPerToken(meta: ModelMeta): number {
+  const e = whole(meta.nEmbd);
+  const moe = whole(meta.nFfExp) > 0 && whole(meta.nExpertUsed) > 0;
+  const ffDense = whole(meta.nFf) || (moe ? 0 : 4 * e);
+  const dense = 4 * (2 * e + 4.5 * ffDense) + 16 * e;
+  const experts = moe
+    ? 4 * whole(meta.nExpertUsed) * (2 * e + 5 * whole(meta.nFfExp))
+    : 0;
+  return whole(dense + experts);
+}
+
+/** Pinned-host working set per micro-batch token on a GPU run, beside the
+ *  mask: 40 KiB measured on every model above (20.07 MiB at -ub 512, 80.3 at
+ *  2048; gemma-3-12b 54 at 2048), billed at 56. */
+const HOST_GRAPH_B_PER_TOKEN = 56 * 1024;
 
 /**
  * Is speculative decoding actually going to run?
@@ -137,8 +174,6 @@ export type DevicePlan = {
   unplacedB: number;
 };
 
-const MB = 1024 * 1024;
-
 /**
  * A byte count that can be reasoned about: finite and not negative.
  *
@@ -219,74 +254,190 @@ export function recurrentStateB(meta: ModelMeta, seqs = 1): number {
 export function kvPerToken(meta: ModelMeta, s: Settings): number {
   const bk = cacheBytes(str(s, "cacheTypeK"));
   const bv = cacheBytes(str(s, "cacheTypeV"));
-  // head_dim falls back to n_embd / n_head when the model omits key_length —
-  // and `0 / 0` is NaN, which is why every value below is passed through
-  // `whole`. A header this app cannot make sense of must produce a plan that
-  // says "nothing", not one that says "NaN GB" and defeats every fit check
-  // downstream (NaN comparisons are all false, so `overB === 0` and
-  // `freeB >= margin` both quietly stop meaning anything).
-  const headDim = meta.nHead > 0 ? whole(meta.nEmbd) / meta.nHead : 0;
-  const kLen = whole(meta.keyLength) || headDim;
-  const vLen = whole(meta.valueLength) || headDim;
-  const heads = whole(meta.nHeadKv) || whole(meta.nHead);
   // MLA (DeepSeek-V2/V3) caches one compressed latent per token per layer
   // instead of one entry per head: the rank plus the 64-wide RoPE part. Billing
   // it as 128 heads x (192 + 128) overstates V3's cache by about seventy times.
-  // Only the layers that hold a per-token cache pay the rate — every layer on
-  // an ordinary model, one in four (plus the MTP block) on a hybrid one.
-  const nKv = kvLayers(meta);
   if (meta.kvLoraRank > 0) {
-    return whole(nKv * (meta.kvLoraRank + MLA_ROPE_DIM) * bk);
+    return whole(kvLayers(meta) * (meta.kvLoraRank + MLA_ROPE_DIM) * bk);
   }
-  return whole(nKv * heads * (kLen * bk + vLen * bv));
+  // Every layer that holds a per-token cache, at its OWN width (`layerKv`):
+  // every layer on an ordinary model, one in four (plus the MTP block) on a
+  // hybrid one, and on Gemma-4 two different shapes.
+  let total = 0;
+  for (const l of layerKv(meta)) {
+    if (l.kind !== "state") total += l.heads * (l.kLen * bk + l.vLen * bv);
+  }
+  return whole(total);
 }
 
 /** The RoPE-carrying part of an MLA cache entry, fixed by the architecture. */
 const MLA_ROPE_DIM = 64;
 
 /**
- * How many of a model's layers are windowed, and how many see the whole
- * context.
+ * llama.cpp's default sliding-window pattern per architecture, for files that
+ * do not state one: `[period, denseFirst]`, from each model's
+ * `load_swa_pattern(ml, N, dense_first)` / `set_swa_pattern` in upstream
+ * `src/models/*.cpp` (read 2026-09-18). A Gemma-3 GGUF carries NO pattern key
+ * — llama.cpp hardcodes 6 — and reading its absence as "every layer windowed"
+ * planned gemma-3-12b at 131,072 with 1.1 GiB of cache where llama.cpp
+ * allocated 8.5 (`CUDA0/1 KV buffer size = 3072 + 5120 MiB` for the 8 global
+ * layers). Period 0 = every layer windowed.
  *
- * Gemma-3 declares a 1024-token window with a pattern of 6: five local layers
- * then one global, repeating. A local layer's cache stops growing at the window,
- * so at a 32k context it holds 1/32 of what the formula above assumes.
+ * An architecture that declares a window, states no pattern, and is not listed
+ * here is planned with NO windowed layers: over-billing is a smaller plan,
+ * under-billing is an out-of-memory at load.
+ */
+const SWA_DEFAULTS: Readonly<Record<string, readonly [number, boolean]>> = {
+  gemma2: [2, false],
+  gemma3: [6, false],
+  gemma3n: [5, false],
+  "gemma-embedding": [6, false],
+  cohere2: [4, false],
+  cohere2moe: [4, true],
+  "exaone-moe": [4, false],
+  exaone4: [4, false],
+  afmoe: [4, false],
+  olmo2: [4, false],
+  mellum: [4, false],
+  plamo3: [8, false],
+  laguna: [4, true],
+  "muse-glimmer": [4, false],
+  "gpt-oss": [2, false],
+  smallthinker: [4, true],
+  llama4: [4, false],
+  deepseek4: [0, false],
+};
+
+/** `llama_hparams::set_swa_pattern`, verbatim. */
+function swaByPattern(i: number, n: number, denseFirst: boolean): boolean {
+  if (n === 0) return true;
+  return denseFirst ? i % n !== 0 : i % n < n - 1;
+}
+
+/** Is layer `i` a sliding-window layer, by llama.cpp's own rules? */
+export function isSwaLayer(meta: ModelMeta, i: number): boolean {
+  if (whole(meta.swaWindow) <= 0) return false;
+  const arr = meta.swaLayers ?? [];
+  if (arr.length > 0) return arr[i] === 1;
+  const def = SWA_DEFAULTS[meta.arch];
+  // Metadata cached before `swaPatternStated` existed: the reader defaults an
+  // absent pattern to 1, so anything above 1 came from the file.
+  const stated = meta.swaPatternStated ?? whole(meta.swaPattern) > 1;
+  if (stated) {
+    return swaByPattern(i, whole(meta.swaPattern), def?.[1] ?? false);
+  }
+  if (def) return swaByPattern(i, def[0], def[1]);
+  return false;
+}
+
+/**
+ * How many of a model's layers are windowed, and how many see the whole
+ * context. Summary of `isSwaLayer` for the UI.
  */
 export function swaSplit(meta: ModelMeta): { full: number; windowed: number } {
-  if (meta.swaWindow <= 0 || meta.nLayer <= 0) {
-    return { full: meta.nLayer, windowed: 0 };
-  }
-  const period = Math.max(1, meta.swaPattern || 1);
-  // One full-attention layer per period; with period 1 every layer is local.
-  const full = period <= 1 ? 0 : Math.ceil(meta.nLayer / period);
-  return { full, windowed: meta.nLayer - full };
+  const n = whole(meta.nLayer);
+  let windowed = 0;
+  for (let i = 0; i < n; i++) if (isSwaLayer(meta, i)) windowed++;
+  return { full: n - windowed, windowed };
+}
+
+type LayerKv =
+  /** A per-token cache over the whole context. */
+  | { kind: "full"; heads: number; kLen: number; vLen: number }
+  /** A per-token cache capped at the window. */
+  | { kind: "swa"; heads: number; kLen: number; vLen: number }
+  /** A recurrent layer's constant state, or a layer sharing another's cache. */
+  | { kind: "state"; heads: 0; kLen: 0; vLen: 0 };
+
+/** Each layer's cache SHAPE — llama.cpp's `n_head_kv(il)` × `n_embd_head_k(il)`,
+ *  `is_swa(il)`, `is_recurrent(il)` and `n_layer_kv_from_start`, per layer. */
+export function layerKv(meta: ModelMeta): LayerKv[] {
+  const nLayer = whole(meta.nLayer);
+  const headDim = meta.nHead > 0 ? whole(meta.nEmbd) / meta.nHead : 0;
+  // head_dim falls back to n_embd / n_head when the model omits key_length —
+  // and `0 / 0` is NaN, which is why every value is passed through `whole`.
+  const kLen = whole(meta.keyLength) || headDim;
+  const vLen = whole(meta.valueLength) || headDim;
+  const kSwa = whole(meta.keyLengthSwa ?? 0) || kLen;
+  const vSwa = whole(meta.valueLengthSwa ?? 0) || vLen;
+  const headsAll = whole(meta.nHeadKv) || whole(meta.nHead);
+  const perLayerHeads = meta.headKvLayers ?? [];
+  const interval = whole(meta.fullAttnInterval);
+  const nextn = Math.min(whole(meta.nextnLayers), nLayer);
+  const trunk = nLayer - nextn;
+  const sharedFrom = nLayer - Math.min(whole(meta.sharedKvLayers ?? 0), nLayer);
+  const STATE = { kind: "state", heads: 0, kLen: 0, vLen: 0 } as const;
+  return Array.from({ length: nLayer }, (_, i): LayerKv => {
+    // Hybrid: trunk layer i is full attention iff (i + 1) % interval == 0;
+    // the MTP block(s) at the end hold a cache; the rest are recurrent.
+    if (interval >= 2 && i < trunk && (i + 1) % interval !== 0) return STATE;
+    if (i >= sharedFrom) return STATE;
+    const heads = whole(perLayerHeads[i] ?? 0) || headsAll;
+    return isSwaLayer(meta, i)
+      ? { kind: "swa", heads, kLen: kSwa, vLen: vSwa }
+      : { kind: "full", heads, kLen, vLen };
+  });
 }
 
 /**
  * Total KV-cache bytes at this context — the number that decides the fit.
  *
- * Uniform for most models; for a sliding-window model the windowed layers are
- * capped at the window, which is the difference between "this fits" and "this
- * needs 3.7x the VRAM it actually does".
+ * A sliding-window layer's cache is capped, which is the difference between
+ * "this fits" and "this needs 3.7x the VRAM it actually does" — and getting
+ * WHICH layers are windowed wrong is the opposite error, 7.5x short.
  */
 export function kvTotal(meta: ModelMeta, s: Settings, ctx: number): number {
-  const nKv = kvLayers(meta);
-  const perLayer = nKv > 0 ? kvPerToken(meta, s) / nKv : 0;
-  // The recurrent layers' constant state rides along here because it is
-  // allocated by the same memory module and lives on the same devices as the
-  // cache — every consumer (the pools, the placement, `-nkvo`) treats it the
-  // way llama.cpp does. Zero for every non-hybrid model.
-  const stateB = recurrentStateB(meta, Math.max(1, num(s, "parallel")));
-  const { full, windowed } = swaSplit(meta);
-  // A hybrid model's KV-bearing layers all see the whole context; no known
-  // model interleaves a sliding window on top of them.
-  if (windowed === 0 || nKv < meta.nLayer) return perLayer * nKv * ctx + stateB;
-  // A windowed layer still has to hold the current batch alongside its window.
-  const windowTokens = Math.min(
-    ctx,
-    meta.swaWindow + Math.min(ctx, num(s, "batchSize")),
-  );
-  return perLayer * (full * ctx + windowed * windowTokens) + stateB;
+  return sum(kvByLayer(meta, s, ctx));
+}
+
+/**
+ * Cache bytes each LAYER holds at this context — `kvTotal`, itemised.
+ *
+ * The total used to be computed as one number and then divided evenly, which
+ * is true only when every layer is alike. On a hybrid model one layer in four
+ * holds the cache; on Gemma one in six sees the whole context. Placed across
+ * two cards the even slice put the cache on the wrong card: Ternary-Bonsai-2-
+ * 27B at 262,144 split 54.5/10.5 was planned at 2.48 GiB on card 1 where
+ * llama.cpp allocated 3.02 — short on exactly the card with the least room.
+ *
+ * A windowed layer holds `window + n_ubatch` cells per stream, padded to 256
+ * (`llama_kv_cache_iswa`), capped at the context; `-np` streams each hold
+ * their own. Measured to the MiB on gemma-3-12b (1,536 cells, 480 MiB over 40
+ * layers) and gemma-4-26B-A4B (2,560 + 300 MiB at 131,072).
+ */
+export function kvByLayer(
+  meta: ModelMeta,
+  s: Settings,
+  ctx: number,
+): number[] {
+  const nLayer = whole(meta.nLayer);
+  if (nLayer <= 0) return [];
+  const bk = cacheBytes(str(s, "cacheTypeK"));
+  const bv = cacheBytes(str(s, "cacheTypeV"));
+  const streams = Math.max(1, num(s, "parallel"));
+  const stateB = recurrentStateB(meta, streams);
+  const shapes = layerKv(meta);
+  const states = shapes.filter((l) => l.kind === "state").length;
+  // Only the hybrid model's recurrent layers carry state; a shared-cache
+  // layer (Gemma-3n/-4 E) carries nothing.
+  const perState = whole(meta.fullAttnInterval) >= 2 && states > 0
+    ? stateB / states
+    : 0;
+  // MLA caches one latent per token per layer, whatever the head shape; the
+  // window still caps it (DeepSeek-V4 windows every layer — its real,
+  // context-sized cost is the measured scratch in `computeScratch`).
+  const mlaPerTok = meta.kvLoraRank > 0
+    ? (meta.kvLoraRank + MLA_ROPE_DIM) * bk
+    : 0;
+  const ub = Math.max(1, num(s, "ubatchSize") || 512);
+  const perStream = Math.ceil(ctx / streams);
+  const swaCells = streams *
+    Math.min(perStream, Math.ceil((whole(meta.swaWindow) + ub) / 256) * 256);
+  return shapes.map((l) => {
+    if (l.kind === "state") return perState;
+    const perTok = mlaPerTok || l.heads * (l.kLen * bk + l.vLen * bv);
+    return perTok * (l.kind === "swa" ? Math.min(ctx, swaCells) : ctx);
+  });
 }
 
 /** The context llama.cpp will actually allocate: `-c 0` means "the model's". */
@@ -368,6 +519,7 @@ export const NO_MODEL: ModelMeta = {
   splitNo: 0,
   splitCount: 0,
   splitTensors: 0,
+  vendor: "",
   layers: [],
 };
 
@@ -495,13 +647,18 @@ export function plan(
   const moeOnCpu = Math.max(0, Math.min(num(s, "nCpuMoe"), nLayer));
   const ctx = effectiveCtx(meta, s);
   const kvPerTokenB = kvPerToken(meta, s);
-  const kvTotalB = kvTotal(meta, s, ctx);
+  const kvLayerB = kvByLayer(meta, s, ctx);
+  const kvTotalB = sum(kvLayerB);
   const kvOnCpu = bool(s, "noKvOffload");
   const outputOnGpu = slotOnGpu(nLayer, off);
 
   // Per-slot GPU bytes, in slot order — the shape `devsplit` needs to cut into
   // per-card ranges, and the sums the pools need. Slot `nLayer` is the output.
-  const kvPerLayerB = kvOnCpu || nLayer <= 0 ? 0 : kvTotalB / nLayer;
+  // Each layer's OWN cache (`kvByLayer`): a uniform slice put a hybrid model's
+  // cache on the wrong card.
+  const kvOfLayer = (i: number) => kvOnCpu ? 0 : kvLayerB[i] ?? 0;
+  const slotKvB: number[] = [];
+  let kvOnGpuB = 0;
   // Two parallel per-slot arrays: `slotCostsB` carries weights PLUS the KV so
   // the packer places the cache with its layers; `slotWeightsB` is the weights
   // alone, so the per-card picture can draw them separately without ever
@@ -527,8 +684,10 @@ export function plan(
       gpuDense += dense;
       gpuExperts += expertsHere;
       cpuWeights += expert - expertsHere;
-      slotCostsB.push(dense + expertsHere + kvPerLayerB);
+      slotCostsB.push(dense + expertsHere + kvOfLayer(i));
       slotWeightsB.push(dense + expertsHere);
+      slotKvB.push(kvOfLayer(i));
+      kvOnGpuB += kvOfLayer(i);
     } else {
       cpuWeights += bytes;
     }
@@ -538,14 +697,14 @@ export function plan(
     gpuDense += whole(meta.outputBytes);
     slotCostsB.push(whole(meta.outputBytes));
     slotWeightsB.push(whole(meta.outputBytes));
+    slotKvB.push(0);
   } else {
     cpuWeights += whole(meta.outputBytes);
   }
   cpuWeights += whole(meta.embdBytes);
 
   // KV follows its layer, unless -nkvo pins all of it to the host.
-  const kvGpuShare = nLayer > 0 ? layersOnGpu / nLayer : 0;
-  const kvOnGpu = kvOnCpu ? 0 : kvTotalB * kvGpuShare;
+  const kvOnGpu = kvOnCpu ? 0 : kvOnGpuB;
   const kvOnRam = kvTotalB - kvOnGpu;
 
   // Compute buffers scale with the micro-batch, not the batch: llama.cpp runs
@@ -558,6 +717,7 @@ export function plan(
   // panel said one (`params.ts:parallel`, `types.ts:Param.llamaDef`).
   const slots = Math.max(1, num(s, "parallel"));
   const activation = ubatch * whole(meta.nEmbd) * 4;
+  const sparse = whole(meta.indexerTopK) > 0;
   // The widest matmul in the prefill graph is the FFN, not the embedding: a
   // gate and an up projection at `n_ff` wide (the fired experts' combined
   // width on a MoE), f32. At `-ub 512` this is noise next to the flat backend
@@ -567,20 +727,17 @@ export function plan(
   // models: their scratch is measured end to end (`computeScratch`),
   // micro-batch term included, and stacking an estimate on a measurement
   // would refuse placements the machine runs.
-  const declaredFf = Math.max(
-    whole(meta.nFf),
-    whole(meta.nFfExp) * whole(meta.nExpertUsed),
-  );
-  const ffWidth = declaredFf > 0 ? declaredFf : whole(meta.nEmbd) * 4;
-  const ffActivation = whole(meta.indexerTopK) > 0
-    ? 0
-    : ubatch * ffWidth * 4 * 2;
+  // Sparse attention keeps its measured end-to-end model (`computeScratch`);
+  // everything else is the fitted graph (`graphBytesPerToken`).
+  const ffActivation = sparse ? 0 : ubatch * graphBytesPerToken(meta);
   // The attention mask, which is the term that makes a LARGE micro-batch
   // expensive at a LONG context — and the one this file was blind to.
   const maskB = attnMaskB(meta, s, ctx, ubatch);
-  // A hybrid linear-attention model carries working set per context token on
-  // top of all of the above (`HYBRID_SCRATCH_B_PER_CTX`).
-  const hybridB = hybridScratch(meta, ctx);
+  // The hybrid residual (`hybridScratch`) was the mask's growth seen from
+  // outside: measured at 2 bytes per pair on an older llama.cpp, the mask is
+  // 8 today and the hybrid models' compute buffers grow at exactly the dense
+  // models' rate. Billing both would count the same bytes twice.
+  const hybridB = 0;
   const usingGpu = off.count > 0 && hw.gpus.length > 0;
 
   // Speculative decoding with the model's own MTP block costs a SECOND CONTEXT,
@@ -595,17 +752,20 @@ export function plan(
   // is how a plan came to say "fits" on one line and "nowhere to go" on the
   // next. Per-device costs times the devices, plus the scratch once.
   const gpuCompute = usingGpu
-    ? (activation * 4 + ffActivation + BACKEND_CONTEXT_B + scratchFloor(meta) +
-          maskB + hybridB + mtp.perDeviceB) * Math.max(1, hw.gpus.length) +
+    ? ((sparse ? activation * 4 : 0) + ffActivation + BACKEND_CONTEXT_B +
+          scratchFloor(meta) + maskB + hybridB + mtp.perDeviceB) *
+        Math.max(1, hw.gpus.length) +
       mtp.onceB + computeScratch(meta, ubatch, ctx, slots)
     : 0;
   // On a CPU-only run the draft context is just as real, minus the GPU backend
   // half — it lands in RAM, where a tight MTP run is exactly the case that
   // cannot afford an unbilled block of KV.
+  // A layer computed on the CPU needs the whole graph there; a fully
+  // offloaded run keeps only the pinned staging beside the mask.
   const cpuCompute =
     (layersOnGpu < nLayer || !usingGpu
-      ? activation * 2 + ffActivation / 2
-      : 32 * MB) +
+      ? (sparse ? activation * 2 : ffActivation)
+      : ubatch * HOST_GRAPH_B_PER_TOKEN) +
     // The mask is built in PINNED HOST memory on a GPU run (llama.cpp's
     // `CUDA_Host compute buffer`) and in the CPU compute buffer otherwise, so
     // it is charged to RAM either way — once, not per device. Measured to the
@@ -640,8 +800,8 @@ export function plan(
   // is safe to promise is all of it.
   const scratchB = computeScratch(meta, ubatch, ctx, slots);
   const fixedPerDeviceB = usingGpu
-    ? BACKEND_CONTEXT_B + activation * 4 + ffActivation + scratchFloor(meta) +
-      maskB + hybridB + mtp.perDeviceB
+    ? BACKEND_CONTEXT_B + (sparse ? activation * 4 : 0) + ffActivation +
+      scratchFloor(meta) + maskB + hybridB + mtp.perDeviceB
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
 
@@ -715,9 +875,6 @@ export function plan(
     }
     displayCounts = dc;
   }
-  const slotsPlaced = displayCounts
-    ? displayCounts.reduce((a, c) => a + c, 0)
-    : 0;
   // The per-card picture splits each slot's cost back into weights and KV.
   // `slotCostsB` includes `kvPerLayerB` so the PACKER places the cache with its
   // layers, but `loadPerDevice` over it would give weights that ALREADY contain
@@ -746,8 +903,8 @@ export function plan(
         : 0;
       const kvB = measuredOursB
         ? whole(kvOnGpu * share)
-        : slotsPlaced > 0 && !kvOnCpu
-        ? whole(kvOnGpu * (n / slotsPlaced))
+        : displayCounts && !kvOnCpu
+        ? whole(loadPerDevice(slotKvB, displayCounts)[i] ?? 0)
         : 0;
       // Drawn as it is budgeted, so the picture and the packer cannot disagree
       // about the same card. See the note at `perDeviceOverheadB`: the pool
@@ -827,9 +984,16 @@ export function plan(
     // is what the cards say. Reading `counts !== null` here made every hand-
     // typed `-ts` fit by definition, including one that asks a 12 GB card for
     // 12.2 GB.
-    fits: pinnedCounts
-      ? cards.every((c) => c.overB === 0)
-      : counts !== null || placementSettled,
+    // Judged against the same per-card BUDGETS the packer uses — capacity less
+    // the safety margin, the user's reserve and the scratch. Judging a pinned
+    // split against raw capacity let it spend the margin the allocator needs,
+    // so a split the packer would refuse "fitted" the moment it was typed.
+    fits: placementSettled ||
+      (pinnedCounts
+        ? loadPerDevice(slotCostsB, pinnedCounts).every((b, i) =>
+          b <= (budgetsB[i] ?? 0)
+        )
+        : counts !== null),
     cards,
     unplacedB: placementSettled ? 0 : unplacedB,
   };
@@ -1104,8 +1268,16 @@ export function attnMaskB(
   // backend has the kernel, so the f32 mask is only the answer when the user
   // has switched it OFF. Guessing the other way would double this term for
   // almost every run.
+  //
+  // 8 bytes per pair on current llama.cpp — measured 2026-09-18 on five
+  // architectures, upstream master and PrismML's fork alike, host and each
+  // device: e.g. Qwen3-14B `CUDA_Host compute buffer` 52 → 148 MiB going
+  // 8,192 → 32,768 at -ub 512, exactly 8 × 24,576 × 512. It was 2 on the
+  // llama.cpp the note above was measured against; an older build now gets a
+  // pessimistic plan, which is the safe side. Without flash attention the
+  // f32 path is billed at twice that, unmeasured.
   const fp32 = str(s, "flashAttn") === "off";
-  return whole(ctx) * Math.max(1, ubatch) * (fp32 ? 4 : 2);
+  return whole(ctx) * Math.max(1, ubatch) * (fp32 ? 16 : 8);
 }
 
 /**

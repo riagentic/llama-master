@@ -25,3 +25,6 @@ dep/aio
 *.log
 *.swp
 *.deb
+
+# The author's own scratch notes. Not part of the app.
+untracked/

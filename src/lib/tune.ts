@@ -742,34 +742,27 @@ export function tune(
   }
   // ── GPU sampling ───────────────────────────────────────────────────────
   //
-  // Sampling on the CPU copies the model's output row off the device every
-  // token — megabytes on a large vocabulary, and worse than its size, because
-  // the copy is a synchronisation point that stalls the GPU inside the hot
-  // loop. `-bs` removes the stall, it composes with speculative decoding (one
-  // makes a token cheaper to produce, the other cheaper to collect), and it
-  // costs no memory.
+  // `-bs` was TAKEN here on every GPU placement, on the theory that copying
+  // the output row to the CPU every token stalls the device. MEASURED
+  // 2026-09-18, two builds and two models, same cards, the flag the only
+  // difference, three prompts each:
   //
-  // Taken only when the BUILD says it knows the flag. This is the first setting
-  // the tuner turns on that an older binary would refuse outright — every other
-  // default is one a stale build can safely ignore — and inferring support from
-  // a version string is not available: a PR stack has no version that means
-  // anything. So the binary was asked (`caps.ts`, `builds.probe`), and an
-  // unprobed build answers no and simply does not get the lever.
+  //   upstream master, Qwen3.8-27B Q4_K_XL, 64k   first token 200-244 ms with,
+  //                                                 38-128 ms without
+  //   same, 262k, -ub 4096                          815-886 ms with, 38-121 without
+  //   PrismML fork, Ternary-Bonsai-27B, 262k        740-870 ms with, 22-96 without
   //
-  // Not offered on a CPU-only placement: there is no device to keep the logits
-  // on, so the flag would be a claim about nothing.
-  const onGpu = placement !== "cpu" && hw.gpus.length > 0;
-  if (onGpu && supportsFlag(opts.caps, "-bs")) {
-    s.backendSampling = true;
+  // and generation 29-30 against 30 tok/s, 58-61 against 59 — inside the
+  // noise. A per-REQUEST cost of up to 0.8 s that grows with the context,
+  // bought for nothing, on every chat turn. So the tuner leaves it at
+  // llama.cpp's default (off) and says why; the switch stays in the catalog
+  // for anyone who wants to measure it on their own build.
+  s.backendSampling = false;
+  if (
+    placement !== "cpu" && hw.gpus.length > 0 && supportsFlag(opts.caps, "-bs")
+  ) {
     reasons.push(
-      "Sampling runs on the GPU (`-bs`) — the next token is picked on the device instead of copying the model's output row back to the CPU every token, which stalls the GPU mid-loop. It costs no memory and it stacks with speculative decoding. llama.cpp still falls back to CPU sampling for any request that uses a grammar, a JSON schema or a reasoning budget, and says so in the log.",
-    );
-  } else if (onGpu && opts.caps && opts.caps.length > 0) {
-    // Probed, and the flag is genuinely absent. Naming the build's age beats
-    // silence: the same model on a newer build is measurably quicker, and
-    // nothing else on screen would explain the difference.
-    reasons.push(
-      "This build does not know `-bs` (sample on the GPU), so each token's output row is copied back to the CPU before the next one starts — a stall in the hot loop. It is a newer llama.cpp flag; a fresher build under Builds would pick it up. Measure with the Speed panel before and after.",
+      "Sampling stays on the CPU (no `-bs`): measured on two builds and two models here, GPU sampling added 0.2-0.8 s before the first token of EVERY reply — growing with the context — and no measurable generation speed.",
     );
   }
 
@@ -930,7 +923,20 @@ export function tune(
   // step is not taken. Only ever grows from the untouched default: a 256 was
   // set above to BUY layers, and taking those bytes back here would undo the
   // trade the placement just made.
-  if (usesGpu && num(settings, "ubatchSize") === 512) {
+  //
+  // And only when weights are READ FROM THE HOST. The 150 → 364 win is PCIe
+  // amortisation: host-resident weights cross the bus once per micro-batch,
+  // so a bigger one moves them fewer times. With every weight in VRAM there
+  // is nothing to amortise, and on two cards it is a LOSS — llama.cpp
+  // pipelines the `-b` batch through the cards in `-ub` slices, and one
+  // 4096-token slice leaves a card idle. Measured 2026-09-18, all-VRAM on
+  // two 24 GB cards, 4.8k-token prompt: Qwen3.8-27B Q4 on upstream 1,622 /
+  // 1,471 / 1,179 / 1,055 tok/s at -ub 512 / 1024 / 2048 / 4096, and
+  // Ternary-Bonsai-27B on PrismML's fork 1,966 against 1,212 — with ~3 GB
+  // more VRAM spent per card at 4096. Generation identical throughout.
+  const hostWeights = num(settings, "nCpuMoe") > 0 ||
+    num(settings, "ngl") <= meta.nLayer;
+  if (usesGpu && hostWeights && num(settings, "ubatchSize") === 512) {
     let grown = 0;
     for (const ub of [1024, 2048, 4096]) {
       const cand: Settings = {

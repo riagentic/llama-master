@@ -77,6 +77,7 @@ import {
   loadingNow,
   mappedModelB,
   memoryIsLive,
+  modelRuntime,
   projectedSpeed,
   projectedStatePlan,
   quantAdviceNow,
@@ -585,6 +586,16 @@ function RunStrip() {
             {ctxNow.toLocaleString()} tokens.
           </div>
         )
+        : modelRuntime()
+        ? (
+          /* The mismatch gets its buttons ("Switch", "Set it up"), not just
+             the sentence the Start button's tooltip carries. */
+          <Guidance
+            diagnosis={modelRuntime()!}
+            tone="warn"
+            t="one-runtime"
+          />
+        )
         : blocker
         ? <div class="warn-note">{blocker}</div>
         : null}
@@ -719,16 +730,24 @@ function DriftNote() {
 function PlacementAdvice(
   props: { all: Record<Placement, Tuning> | null; locked: boolean },
 ) {
+  // Read before any early return: `betterPlacement` reads `cfg.placement` only
+  // when there is a tuning to compare, and an instance that rendered without
+  // it subscribed to nothing and could never show the advice by itself.
+  const current = cfg.placement;
   const better = betterPlacement(props.all);
-  if (!better || props.locked) return null;
+  if (!better || better === current || props.locked) return null;
   const label = PLACEMENTS.find((p) => p.id === better)?.label ?? better;
   const gain = props.all?.[better];
+  // One string, built here: adjacent conditional strings in JSX are separate
+  // text nodes, and the reconciler has left a stale one beside a new one.
+  const sentence = `would run this model${
+    gain && gain.ctx > 0
+      ? ` at ${gain.ctx.toLocaleString()} tokens of context`
+      : ""
+  } — the current choice leaves the GPU out.`;
   return (
     <div class="warn-note placement-advice" t="placement-advice">
-      <b>{label}</b> would run this model
-      {gain && gain.ctx > 0
-        ? ` at ${gain.ctx.toLocaleString()} tokens of context`
-        : ""} — the current choice leaves the GPU out.
+      <b>{label}</b> {sentence}
       <button
         type="button"
         class="btn tiny"
@@ -981,6 +1000,7 @@ function MiniChat() {
               {chat.partial || chat.partialThink
                 ? (
                   <ChatMessage
+                    key="live"
                     role="assistant"
                     content={chat.partial}
                     thinking={chat.partialThink}
@@ -989,7 +1009,7 @@ function MiniChat() {
                 )
                 : null}
               {chat.streaming && !chat.partial && !chat.partialThink
-                ? <Waiting />
+                ? <Waiting key="waiting" />
                 : null}
             </>
           )}

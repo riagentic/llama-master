@@ -534,6 +534,13 @@ Data flow worth knowing:
   behaviour is visible in the verdicts: Flash-Next pinned at 250k grows to 1024
   (the ctx×ub term prices 2048 out), aimFull at 262,144 grows nothing, a small
   dense model on a big card reaches 4096.
+  - **Revised 2026-09-18: only when weights stream from RAM.** With every layer
+    in VRAM across two cards, a bigger `-ub` is a LOSS: llama.cpp pipelines a
+    batch through the cards in `-ub` slices, and fewer slices means less
+    overlap. Measured all-VRAM, 512 → 4096: Qwen3.8-27B prefill 1622 → 1055
+    tok/s, Ternary-Bonsai-2 1966 → 1212. So `tune.ts` grows `-ub` only when
+    `--n-cpu-moe > 0` or a layer stays on the host (`hostWeights`) — that is
+    where the 150 → 364 above was measured.
 - **The attention mask is `context × micro-batch`, and that was the hole under
   the micro-batch growth above.** llama.cpp builds `kq_mask` as
   `[n_kv,
@@ -555,6 +562,15 @@ Data flow worth knowing:
   repeats, unlike `computeScratch`, whose per-slot graphs really are copies.
   Zero for a sparse-attention model, whose scratch is measured end to end
   already.
+  - **Re-measured 2026-09-18 on current llama.cpp: 8 bytes per pair, not 2** (16
+    without flash attention), on the host AND on each device. The 2 above was a
+    llama.cpp of July. `plan.ts` was refit to 18 measured compute buffers:
+    `graphBytesPerToken` (FFN- and embedding-wide activations per ub token,
+    dense and expert parts), `HOST_GRAPH_B_PER_TOKEN` 56 KiB,
+    `BACKEND_CONTEXT_B` 420 MiB (CUDA context + cuBLAS beyond the reported
+    buffers, per card), `HYBRID_SCRATCH` folded into the graph term. Host fits
+    ±3%, devices 1-15% OVER (the safe side). Live check, Ternary-Bonsai-2 at
+    262,144 on two cards: plan 15.80 / 9.97 GiB, nvidia-smi 15.67 / 9.92.
 - **`--spec-type draft-mtp` is a SECOND CONTEXT, not a rounding error.**
   `plan.ts` billed it as "one block's KV over the same window, so it is small"
   plus half the flat backend figure, charged once to the pool. The failure mode
@@ -1036,6 +1052,73 @@ cannot act on is a bug.
   rule for every setting added for an unmerged change: the app's promise that a
   plain-master build keeps working survives only if nothing PR-specific is ever
   emitted by default.
+- **A fork is a source ref too, for models upstream cannot load yet.** PrismML's
+  ternary `PQ2_0`/`PTQ1_0` (ggml types 142/143, parked high so they cannot
+  collide) exist only in `PrismML-Eng/llama.cpp`; the one upstream PR is
+  CPU-only (0.4 tok/s) and was asked to wait for PrismML.
+  `fork:<owner>/<name>
+  [@ref]` (`srcref.ts`, typed as the fork's URL into the
+  PR box) is a codeload tarball — `HEAD` = the fork's default branch — so it
+  needs no git, always re-fetches, records the FORK's commit (`movingSha`), and
+  Update follows the fork, never an upstream tag (which would swap in a runtime
+  that rejects the model). Source route only: the fork's Linux CUDA release
+  links `libcudart.so.13`/`libcublas.so.13` and ships neither, while a source
+  build gets them from the app's toolkit through RUNPATH. Verified 2026-09-18:
+  built in 3 min, native `sm_120a`, Ternary-Bonsai-27B Q2_0 at 262k on two
+  cards, coherent output, 51.6 tok/s. `gguf.rs` sizes all five newer types
+  (NVFP4, Q1_0, Q2_0, PQ2_0, PTQ1_0) — an unknown id bills its tensors at 0
+  bytes.
+- **A build must not borrow from the source cache.** cmake's build-tree RUNPATH
+  points into `cache/sources/<ref>/build/bin`, and the install copied
+  `libllama-server-impl.so.0` but not its `.so` symlinks — so a build worked
+  until the next build of that ref replaced the tree, then died with
+  `error while loading shared libraries`. Builds now pass
+  `-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON`, the install recreates symlinks, and
+  `finalize` runs `ldd` and REFUSES a build that resolves anything into the
+  cache or to "not found" (`borrowedLibs`). An existing build that fails its
+  `--help` probe that way is `builds.broken[id]` and Start is blocked with the
+  reason — rebuild it. Verified by hiding the cache and running the fork build.
+- **A model can need a specific runtime, and the header says which.** `gguf.rs`
+  sets `vendor` ("prism") from a `prism.*` key or a type 142/143;
+  `src/lib/runtime.ts:runtimeMismatch` blocks Start on any upstream build and
+  offers one button — switch to the vendor build already installed, or build it.
+  Another person's fork is `unknown` and never blocked: the app cannot see into
+  it. A Hadamard-folded `Q2_0` loads on upstream and answers GARBAGE, which is
+  why this is a block and not a warning.
+- **Upstream ships Linux CUDA again (b11039+), in two archives.** The binary
+  (`llama-bNNN-bin-ubuntu-cuda-13.3-x64.tar.gz`) and its runtime
+  (`cudart-<same name>`; Windows: `cudart-llama-bin-win-cuda-X.Y-x64.zip`, no
+  build number) — `assets.ts:companionAsset` pulls the second into the same
+  directory, whose `$ORIGIN` RUNPATH finds it. `pickAsset` never takes a CUDA
+  newer than the DRIVER (`Gpu.cudaDriver`, from `nvidia-smi --version`, whose
+  "CUDA version : Deprecated" line must not match).
+- **The parent's `LLAMA_ARG_*` would silently override the command.** llama.cpp
+  reads `LLAMA_ARG_<FLAG>` for every flag the argv leaves out, and the app omits
+  flags at their default — so a stray export changed the run while the screen
+  showed another. `envvars.ts:spawnEnv` spawns with `clearEnv` and the parent's
+  environment minus `LLAMA_ARG_*` (the user's own Command-panel variables still
+  win) and logs what it dropped.
+- **`-lv 4` is always asked for.** At llama.cpp's default verbosity 3 every
+  `load_tensors`, buffer-size and `sched_reserve` line is hidden — measured on
+  b10144, b10151, master and the fork (~22 startup lines at 3, ~210 at 4). Those
+  are what `loadprogress.ts` reads and what anyone reads to see where memory
+  went. Catalog entry `logVerbosity` (`def 4`, `llamaDef 3`).
+- **A default that moved upstream is reset once, not kept for ever.** `cfg`
+  persists every setting, so `-to 600` and `--jinja` off outlived the catalog
+  change that fixed them and were emitted on every run.
+  `params.ts:
+  FORMER_DEFAULTS` lists values that were once the app's default;
+  `cfg` version 6 drops a stored setting equal to one of them. Not gated on
+  `touched`: the tuner writes through the same path, so `touched` cannot tell a
+  choice from an old default.
+- **Per-layer KV follows llama.cpp's own per-layer rules.** Gemma-4 declares
+  per-layer `head_count_kv` arrays and a separate `key_length_swa`, and the
+  sliding-window pattern is an ARRAY key when present; a model that states no
+  pattern gets its arch's hardcoded default (`plan.ts:SWA_DEFAULTS`, from
+  `load_swa_pattern` in llama-model.cpp) and otherwise none. A windowed layer
+  holds `pad256(window × streams + ub)` cells, not `ctx`. Gemma was billed 7.5×
+  UNDER before; `kvByLayer` is the one source and the per-card KV bars sum it
+  over the layers each card actually holds.
 - **Only an immutable ref may be cached, and `master` is not one.** The source
   cache was keyed on the ref NAME and reused whenever `CMakeLists.txt` existed,
   so the first `master` build pinned that machine to that day's master for ever
@@ -1093,14 +1176,15 @@ cannot act on is a bug.
   megabytes per token on a large vocabulary, and worse than its size because the
   copy is a SYNCHRONISATION POINT that stalls the device mid-loop. In the
   catalog (`params.ts:backendSampling`, `llamaDef: false`, so the default emits
-  nothing) and the tuner TAKES it on a GPU placement whenever the build's probe
-  says the flag exists — it costs no memory, it composes with drafting, and a
-  build that has never heard of it is never handed it. A probed build that lacks
-  it is told so, because "the same model is quicker on a newer build" is
-  otherwise an unexplained difference. llama-server still drops it silently for
-  a grammar, a JSON schema or a reasoning budget (`common/sampling.cpp`, warns
-  in the log); `stability.ts` names the reasoning case, which is the one visible
-  in the argv.
+  nothing). **Measured 2026-09-18 and the tuner now leaves it OFF:** on two
+  Blackwell cards it added 0.2-0.8 s to EVERY request's first token (growing
+  with the context) and bought no generation rate at all. The reason text says
+  so; a user can still turn it on, and a build that has never heard of it is
+  never handed it. A probed build that lacks it is told so, because "the same
+  model is quicker on a newer build" is otherwise an unexplained difference.
+  llama-server still drops it silently for a grammar, a JSON schema or a
+  reasoning budget (`common/sampling.cpp`, warns in the log); `stability.ts`
+  names the reasoning case, which is the one visible in the argv.
   - **It DOES stack with speculative decoding, and this file said the opposite
     for one round of work.** `tools/server/server-context.cpp` used to carry
     `backend_sampling &= !(slot.can_speculate())` — "requires multiple samples

@@ -193,6 +193,7 @@ function Region(props: {
           {p.overB > 0
             ? (
               <div
+                key="over"
                 class="map-band seg-over"
                 style={{ width: "100%" }}
                 title={`Over capacity by ${bytes(p.overB)}`}

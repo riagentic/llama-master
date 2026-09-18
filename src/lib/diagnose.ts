@@ -18,7 +18,11 @@ export type FixAction =
   | { kind: "switch-backend"; to: Backend }
   | { kind: "fix-prereq"; id: string }
   | { kind: "open-tab"; tab: "dashboard" | "build" | "settings" }
-  | { kind: "open-url"; url: string };
+  | { kind: "open-url"; url: string }
+  /** Point the Build tab at a source ref (a vendor's fork) and open it. */
+  | { kind: "use-ref"; ref: string }
+  /** Make an already-installed build the active one. */
+  | { kind: "use-build"; id: string };
 
 export type Step = {
   text: string;
@@ -119,7 +123,7 @@ export function diagnoseNoAsset(
   if (c.backend === "cuda" && c.platform === "linux") {
     return {
       reason:
-        "llama.cpp publishes prebuilt CUDA binaries for Windows only. There is no Linux CUDA download — this is upstream's choice, not a problem with your machine.",
+        'This llama.cpp release has no prebuilt CUDA binary for Linux that this machine\'s driver can run. Upstream published Windows-only CUDA builds until b11039 (September 2026) — pick "master" as the version for one. Not a problem with your machine.',
       steps: alternatives(c),
     };
   }

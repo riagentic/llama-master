@@ -18,7 +18,12 @@ import { Guidance } from "./Guidance.tsx";
 import { CommandPanel } from "./CommandView.tsx";
 import { SpeedPanel } from "./SpeedPanel.tsx";
 import { SetupPanel } from "./SetupView.tsx";
-import { activeBuild, currentModel, serverRunning } from "./derive.ts";
+import {
+  activeBuild,
+  currentModel,
+  modelRuntime,
+  serverRunning,
+} from "./derive.ts";
 
 /**
  * Memory held by llama-servers this app is not running.
@@ -47,7 +52,7 @@ export function OrphanBanner() {
             </span>
           </li>
         ))}
-        <li class="guide-step">
+        <li class="guide-step" key="free">
           <span>
             Until they exit, their VRAM and RAM stay allocated and a new server
             cannot load.
@@ -199,7 +204,17 @@ export function ServerPanel() {
             </>
           }
         >
-          {blocker ? <div class="warn-note">{blocker}</div> : null}
+          {modelRuntime()
+            ? (
+              <Guidance
+                diagnosis={modelRuntime()!}
+                tone="warn"
+                t="srv-runtime"
+              />
+            )
+            : blocker
+            ? <div class="warn-note">{blocker}</div>
+            : null}
           <div class="kv-grid">
             <KV k="Build" v={build ? `${build.ref} · ${build.backend}` : "—"} />
             <KV k="Model" v={model?.file ?? "—"} tip={model?.path} />

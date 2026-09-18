@@ -68,6 +68,7 @@ export type BuildsState = {
    *  build's flags do not change while it sits on disk, and re-probing every
    *  boot would spawn a process per build for an answer already known. */
   caps: Record<string, string[]>;
+  broken: Record<string, string>;
   scanning: boolean;
   /** Monotonic scan generation — the last scan to START is the one whose
    *  result may land; a superseded one discards its own (see `scan`). */
@@ -143,7 +144,12 @@ function applyRef(s: BuildsState, ref: string): void {
   // Only the source route can build a pull request — nobody publishes
   // prebuilt binaries for unmerged code — so the route follows the ref rather
   // than leaving the user on one that is about to refuse them.
-  if (parseRef(ref).kind === "pr") s.origin = "source";
+  // A fork is source-only too: the release route installs upstream's own
+  // releases, and PrismML's Linux CUDA download leaves out the CUDA runtime
+  // it links against (measured: libcudart.so.13 / libcublas.so.13 "not
+  // found"), which a source build gets from the app's own toolkit.
+  const kind = parseRef(ref).kind;
+  if (kind === "pr" || kind === "fork") s.origin = "source";
 }
 
 /**
@@ -168,11 +174,15 @@ async function probeInto(
   if (!force && s.caps[id]) return;
   const bin = s.installed.find((b) => b.id === id)?.serverBin ?? "";
   if (!bin) return;
+  const io = await import("./builds.server.ts");
   try {
-    const io = await import("./builds.server.ts");
     s.caps[id] = await io.probeCaps(bin);
-  } catch {
+    delete s.broken[id];
+  } catch (e) {
     s.caps[id] = [];
+    // The one failure worth a sentence: the binary cannot load a library,
+    // so every Start would fail the same way (`startBlocker` reads this).
+    if (e instanceof io.BrokenBuild) s.broken[id] = e.lib;
   }
 }
 
@@ -223,6 +233,10 @@ export const builds = cell("builds", {
     installed: [] as Build[],
     activeId: "",
     caps: {} as Record<string, string[]>,
+    /** Builds whose binary cannot load a library it links against, with the
+     *  library. Not persisted: a rebuild or a restored library clears it on
+     *  the next probe. */
+    broken: {} as Record<string, string>,
     scanning: false,
     scanEpoch: 0,
     upstream: { latestTag: "", masterSha: "", checkedAt: 0 } as Upstream,
@@ -243,7 +257,8 @@ export const builds = cell("builds", {
       applyRef(s, ref);
       // Readiness for the release route is unknowable without the asset list,
       // and "press List assets first" is not an experience. Fetch it.
-      if (s.origin === "release" && parseRef(ref).kind !== "pr") {
+      const kind = parseRef(ref).kind;
+      if (s.origin === "release" && kind !== "pr" && kind !== "fork") {
         builds.loadAssets();
       }
     },
@@ -405,16 +420,26 @@ export const builds = cell("builds", {
       s.checkingUpdate = true;
       try {
         const io = await import("./builds.server.ts");
-        const [latestTag, masterSha] = await Promise.all([
+        // A fork build is compared against the FORK, so its ref is resolved
+        // before the await — the active build may change while it is out.
+        const active = s.installed.find((b) => b.id === s.activeId);
+        const fork = active && parseRef(active.ref).kind === "fork"
+          ? active.ref
+          : "";
+        const [latestTag, masterSha, forkSha] = await Promise.all([
           io.latestTag().catch(() => ""),
           io.masterSha().catch(() => ""),
+          fork ? io.movingSha(fork).catch(() => "") : Promise.resolve(""),
         ]);
-        if (!latestTag && !masterSha) return; // offline — keep what we had
+        if (!latestTag && !masterSha && !forkSha) return; // offline — keep what we had
         // aiol-ok: merging the fresh answer with whatever is in state is the
         // point — a field upstream could not tell us keeps its previous value.
         s.upstream = { // aiol-ok
           latestTag: latestTag || s.upstream.latestTag, // aiol-ok
           masterSha: masterSha || s.upstream.masterSha, // aiol-ok
+          forkShas: forkSha
+            ? { ...s.upstream.forkShas, [fork]: forkSha } // aiol-ok
+            : s.upstream.forkShas ?? {}, // aiol-ok
           checkedAt: Date.now(),
         };
       } finally {
@@ -490,7 +515,10 @@ export const builds = cell("builds", {
         // Forget builds that are no longer on disk, so a removed-and-rebuilt
         // id cannot be answered from the flags its predecessor had.
         for (const id of Object.keys(s.caps)) { // aiol-ok
-          if (!list.some((b) => b.id === id)) delete s.caps[id];
+          if (!list.some((b) => b.id === id)) {
+            delete s.caps[id];
+            delete s.broken[id]; // aiol-ok
+          }
         }
         // Only the ACTIVE build is probed. Probing all of them would spawn a
         // process per installed build on every scan for answers about builds

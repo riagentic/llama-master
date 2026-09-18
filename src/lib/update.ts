@@ -8,6 +8,7 @@
 //
 // Pure: upstream facts in, a decision out. The cell fetches, this decides.
 
+import { parseRef } from "./srcref.ts";
 import type { Build } from "./types.ts";
 
 /** What upstream currently offers, as fetched by the update poll. */
@@ -16,6 +17,9 @@ export type Upstream = {
   latestTag: string;
   /** Commit `master` points at right now. */
   masterSha: string;
+  /** Commit each FORK ref points at right now, keyed by the stored ref
+   *  (`fork:owner/name@ref`). Upstream's master says nothing about a fork. */
+  forkShas?: Record<string, string>;
   /** When this was fetched (epoch ms); 0 = never. */
   checkedAt: number;
 };
@@ -60,6 +64,34 @@ export function updateFor(
       from: build.ref,
       to: "",
       reason: "Upstream has not been checked yet.",
+    };
+  }
+
+  if (parseRef(build.ref).kind === "fork") {
+    const now = up.forkShas?.[build.ref] ?? "";
+    if (!now) {
+      return {
+        available: false,
+        from: build.ref,
+        to: "",
+        reason: "Could not read the fork's current commit.",
+      };
+    }
+    if (build.sourceSha === now) {
+      return {
+        available: false,
+        from: `${build.ref} ${shortSha(now)}`,
+        to: "",
+        reason: "Up to date with the fork.",
+      };
+    }
+    return {
+      available: true,
+      from: build.sourceSha
+        ? `${build.ref} ${shortSha(build.sourceSha)}`
+        : `${build.ref} (unknown commit)`,
+      to: `${build.ref} ${shortSha(now)}`,
+      reason: "The fork has moved on since this build.",
     };
   }
 
@@ -128,5 +160,8 @@ export function updateFor(
 /** The ref an update should install: the newest tag, or master again. */
 export function updateTarget(build: Build | null, up: Upstream): string {
   if (!build) return "master";
+  // A fork updates to its own newer commit, never to an upstream tag: that
+  // would silently swap the runtime a model NEEDS for one that rejects it.
+  if (parseRef(build.ref).kind === "fork") return build.ref;
   return build.ref === "master" ? "master" : up.latestTag || build.ref;
 }

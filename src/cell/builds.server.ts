@@ -15,7 +15,7 @@
 
 import { basename, dirname, join, resolve } from "@std/path";
 import type { Asset } from "../lib/assets.ts";
-import { availableBackends, pickAsset } from "../lib/assets.ts";
+import { availableBackends, companionAsset, pickAsset } from "../lib/assets.ts";
 import { progressOf } from "../lib/buildlog.ts";
 import { CAPS_TIMEOUT_MS, parseHelpFlags } from "../lib/caps.ts";
 import { cudaCmakeFlags, cudaPlan } from "../lib/cuda.ts";
@@ -155,6 +155,28 @@ export async function masterSha(): Promise<string> {
     );
     return shaFromCommitsAtom(xml) ?? "";
   }
+}
+
+/**
+ * The commit a FORK's ref points at now — what `masterSha` is for upstream.
+ * The commits atom feed, not the API: it has no quota, and `HEAD` resolves to
+ * the fork's default branch without first asking what that branch is called.
+ */
+export async function forkSha(
+  repo: string,
+  ref: string | null,
+): Promise<string> {
+  const xml = await fetchText(
+    `https://github.com/${repo}/commits/${ref ?? "HEAD"}.atom`,
+  );
+  return shaFromCommitsAtom(xml) ?? "";
+}
+
+/** The commit a MOVING ref was built from: the fork's own for a fork, and
+ *  upstream master's for everything else (a PR build's master half). */
+export async function movingSha(ref: string): Promise<string> {
+  const r = parseRef(ref);
+  return r.kind === "fork" ? await forkSha(r.repo, r.ref) : await masterSha();
 }
 
 export async function listAssets(
@@ -326,6 +348,17 @@ async function findBinary(
 
 // ── route 1: prebuilt release ──────────────────────────────────────────────
 
+/** The newest CUDA runtime every NVIDIA card's driver can run, or 0. */
+async function driverCudaMax(): Promise<number> {
+  try {
+    const { gpus } = await import("./hw.server.ts");
+    const v = (await gpus()).map((g) => g.cudaDriver ?? 0).filter((x) => x > 0);
+    return v.length ? Math.min(...v) : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export async function installRelease(
   opts: {
     ref: string;
@@ -341,9 +374,10 @@ export async function installRelease(
 
   p(0, null, [`Looking up ${opts.ref} on ${REPO}`]);
   const { tag, assets } = await listAssets(opts.ref);
+  const cudaMax = await driverCudaMax();
   const asset = opts.assetName
     ? assets.find((a) => a.name === opts.assetName) ?? null
-    : pickAsset(assets, PLATFORM, ARCH, opts.backend);
+    : pickAsset(assets, PLATFORM, ARCH, opts.backend, cudaMax);
   if (!asset) {
     // Never a filename dump: say why, and give the route that works. The
     // prerequisite state is read here so the advice is accurate — "you already
@@ -359,7 +393,12 @@ export async function installRelease(
           backend: opts.backend,
           platform: PLATFORM,
           arch: ARCH,
-          availableBackends: availableBackends(assets, PLATFORM, ARCH),
+          availableBackends: availableBackends(
+            assets,
+            PLATFORM,
+            ARCH,
+            cudaMax,
+          ),
           found,
         },
         assets.length,
@@ -388,6 +427,33 @@ export async function installRelease(
     dir,
     asset.name.endsWith(".zip") ? "zip" : "tar.gz",
   );
+
+  // The CUDA runtime, when the release ships it apart from the binaries.
+  // Extracted into the SAME directory: upstream's binaries carry
+  // `RUNPATH $ORIGIN`, so libraries beside `llama-server` are found without
+  // touching the environment — and without this the install "succeeds" and
+  // the first Start fails with "libcudart.so.13: cannot open shared object".
+  const rt = companionAsset(assets, asset);
+  if (rt) {
+    p(2, 0, [
+      rt.sizeB > 0
+        ? `Downloading the CUDA runtime ${rt.name} (${
+          (rt.sizeB / 1e6).toFixed(0)
+        } MB)`
+        : `Downloading the CUDA runtime ${rt.name}`,
+    ]);
+    const rtBytes = await download(
+      rt.url,
+      (received, total) => p(2, total ? received / total : null),
+      opts.signal,
+    );
+    const m = await extract(
+      rtBytes,
+      dir,
+      rt.name.endsWith(".zip") ? "zip" : "tar.gz",
+    );
+    p(2, 1, [`${m} CUDA runtime files added`]);
+  }
 
   p(3, null, [`${n} files extracted, checking binaries`]);
   const build = await finalize({
@@ -880,6 +946,14 @@ export async function buildFromSource(
     "-DLLAMA_BUILD_EXAMPLES=OFF",
     "-DLLAMA_BUILD_SERVER=ON",
     `-DGGML_NATIVE=${opts.native ? "ON" : "OFF"}`,
+    // The installed build must not need the tree it was compiled in. CMake
+    // writes ABSOLUTE build-tree RUNPATHs by default, so every source build
+    // resolved libllama/libggml out of `cache/sources/<ref>/build-*` — and a
+    // moving ref re-extracts that directory on the next build, which is how
+    // `source-master-cpu` and `-vulkan` came to fail with "libllama-server-
+    // impl.so: cannot open shared object file" while listed as installed.
+    // `$ORIGIN` for in-tree paths; the CUDA toolkit's own path stays absolute.
+    "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON",
     ...BACKEND_FLAGS[opts.backend],
     ...buildNumberFlags(opts.ref),
     ...cudaFlags,
@@ -942,10 +1016,17 @@ export async function buildFromSource(
   const binSrc = join(buildDir, "bin");
   let copied = 0;
   for await (const e of Deno.readDir(binSrc)) {
-    if (!e.isFile) continue;
     // The whole bin/ directory: the binaries need the ggml/llama shared
-    // objects that sit beside them.
-    await Deno.copyFile(join(binSrc, e.name), join(dest, "bin", e.name));
+    // objects that sit beside them — including the SONAME symlinks
+    // (`libllama.so.0` → `libllama.so.0.24.0`), which are what the loader
+    // actually asks for. Skipping them (`isFile` is false for a link) left
+    // every build resolving those names from the source cache instead.
+    const to = join(dest, "bin", e.name);
+    if (e.isSymlink) {
+      await Deno.symlink(await Deno.readLink(join(binSrc, e.name)), to);
+    } else if (e.isFile) {
+      await Deno.copyFile(join(binSrc, e.name), to);
+    } else continue;
     copied++;
   }
   p(3, 0.9, [`${copied} files installed`]);
@@ -959,12 +1040,31 @@ export async function buildFromSource(
     // A tag identifies itself; a moving ref does not, so record what it was.
     // For a pull request this is the master it was merged INTO, which is the
     // half of "master + PR #27754" that the name cannot carry.
-    sourceSha: refMoves(src) ? await masterSha().catch(() => "") : "",
+    // For a fork it is the FORK's commit: upstream master's sha would be a
+    // fact about a tree that was never compiled.
+    sourceSha: refMoves(src) ? await movingSha(opts.ref).catch(() => "") : "",
     // A build that behaves differently must say why.
     ...(opts.schedCap && opts.schedCap > 0 ? { schedCap: opts.schedCap } : {}),
   });
   p(3, 1, [`${BIN_SERVER} ready at ${build.serverBin}`]);
   return build;
+}
+
+/**
+ * Libraries `ldd` resolves from inside `forbidden` (the source cache), or
+ * cannot resolve at all. Pure over ldd's text, so it is testable.
+ */
+export function borrowedLibs(ldd: string, forbidden: string): string[] {
+  const out: string[] = [];
+  for (const line of ldd.split("\n")) {
+    const m = /^\s*(\S+)\s+=>\s+(not found|\S+)/.exec(line);
+    if (!m) continue;
+    const [, name, where] = m as unknown as [string, string, string];
+    if (where === "not found" || where.startsWith(forbidden + "/")) {
+      out.push(name);
+    }
+  }
+  return out;
 }
 
 /** Stream a child process, batching lines so the UI gets one dispatch per tick
@@ -1026,6 +1126,23 @@ async function finalize(
       }`,
     );
   }
+  // …and prove it runs ON ITS OWN. `--version` passes while the tree it was
+  // compiled in still exists, so a build that borrows its libraries from the
+  // source cache looked healthy until the next build of that ref replaced
+  // the cache. On Linux the loader can say where each library comes from.
+  if (PLATFORM === "linux") {
+    const leaks = borrowedLibs(
+      (await exec("ldd", [serverBin])).stdout,
+      paths().sources,
+    );
+    if (leaks.length > 0) {
+      throw new Error(
+        `installed ${BIN_SERVER} still loads ${
+          leaks.join(", ")
+        } from outside its own directory — it would break when that directory changes. This is a bug in the install step; please report it.`,
+      );
+    }
+  }
   return build;
 }
 
@@ -1048,6 +1165,14 @@ async function finalize(
  * extra on" (`caps.ts:supportsFlag`), which is the safe direction: the cost of
  * a failed probe is that the tuner is conservative, not that a server dies.
  */
+/** A build whose binary cannot load a library it links against. */
+export class BrokenBuild extends Error {
+  constructor(readonly lib: string) {
+    super(`cannot load ${lib}`);
+    this.name = "BrokenBuild";
+  }
+}
+
 export async function probeCaps(bin: string): Promise<string[]> {
   if (!bin) return [];
   const root = resolve(paths().builds);
@@ -1071,8 +1196,14 @@ export async function probeCaps(bin: string): Promise<string[]> {
     // nothing at all — which is the one answer that is worse than no answer,
     // because it looks like a measurement.
     const help = dec.decode(out.stdout) + "\n" + dec.decode(out.stderr);
+    // A binary that cannot load its own libraries is not "a build that
+    // knows no flags" — it is a build that cannot start, and the one place
+    // that learns it early is here. Named so the cell can say so.
+    const missing = /error while loading shared libraries: ([^:]+)/.exec(help);
+    if (missing) throw new BrokenBuild(missing[1] as string);
     return [...parseHelpFlags(help)].sort();
-  } catch {
+  } catch (e) {
+    if (e instanceof BrokenBuild) throw e;
     return [];
   } finally {
     clearTimeout(timer);

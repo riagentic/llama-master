@@ -10,6 +10,7 @@
 
 import type { Cpu, Gpu, Mem } from "../lib/types.ts";
 import { exec, PLATFORM } from "./host.server.ts";
+import { driverCudaVersion } from "../lib/cuda.ts";
 import type { Exec } from "./host.server.ts";
 
 // Re-exported so the cell can stamp them into state without importing the
@@ -222,10 +223,16 @@ async function nvidiaDisplays(): Promise<(boolean | undefined)[]> {
   if (nvDisplayCache && now - nvDisplayCache.at < DISPLAY_TTL_MS) {
     return nvDisplayCache.v;
   }
-  const r = await nvidiaSmi([
-    "--query-gpu=display_mode,display_active",
-    "--format=csv,noheader",
+  const [r, banner] = await Promise.all([
+    nvidiaSmi([
+      "--query-gpu=display_mode,display_active",
+      "--format=csv,noheader",
+    ]),
+    // The driver's CUDA ceiling rides the same 30 s cache: it changes when a
+    // driver is installed, which is rarer than a monitor being plugged in.
+    nvidiaSmi(["--version"]),
   ]);
+  nvCudaDriver = banner.code === 0 ? driverCudaVersion(banner.stdout) : 0;
   const v = r.code !== 0
     ? []
     : r.stdout.split("\n").filter((l) => l.trim() !== "").map((line) => {
@@ -239,6 +246,8 @@ async function nvidiaDisplays(): Promise<(boolean | undefined)[]> {
 }
 
 let nvDisplayCache: { at: number; v: (boolean | undefined)[] } | null = null;
+/** Read alongside the display state above; 0 = not read. */
+let nvCudaDriver = 0;
 const DISPLAY_TTL_MS = 30_000;
 
 /**
@@ -370,6 +379,9 @@ export async function gpus(): Promise<Gpu[]> {
       powerLimitW: Number(g.powerLimitW ?? 0),
       computeCap: Number(g.computeCap ?? 0),
       display,
+      ...(vendor === "nvidia" && nvCudaDriver > 0
+        ? { cudaDriver: nvCudaDriver }
+        : {}),
     };
   });
 }

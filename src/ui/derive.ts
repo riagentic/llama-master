@@ -64,6 +64,8 @@ import { num, str } from "../lib/params.ts";
 import { queueNote, submitKind } from "../lib/queue.ts";
 import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
+import { runtimeMismatch } from "../lib/runtime.ts";
+import type { Diagnosis } from "../lib/diagnose.ts";
 import type { UpdateCheck } from "../lib/update.ts";
 import type { FixPlan } from "../lib/fixplan.ts";
 import type {
@@ -108,8 +110,29 @@ export function activeCaps(): readonly string[] | null {
   return builds.caps[builds.activeId] ?? null;
 }
 
+/** Newest CUDA runtime every NVIDIA driver here can run; 0 = unknown. The
+ *  asset picker caps to it, so the "auto" it shows is the one the install
+ *  step will choose (`src/lib/assets.ts:scoreAsset`). */
+export function cudaMax(): number {
+  const v = hw.gpus.map((g) => g.cudaDriver ?? 0).filter((x) => x > 0);
+  return v.length ? Math.min(...v) : 0;
+}
+
 export function activeBuild(): Build | null {
   return builds.installed.find((b) => b.id === builds.activeId) ?? null;
+}
+
+/**
+ * Why the ACTIVE build cannot run the SELECTED model correctly, or null
+ * (`src/lib/runtime.ts`). The case it exists for is the silent one: a
+ * Hadamard-folded PrismML file loads on upstream llama.cpp and answers in
+ * garbage, so this has to be said before Start, not diagnosed after.
+ */
+export function modelRuntime(): Diagnosis | null {
+  const m = currentModel();
+  const b = activeBuild();
+  if (!m || !b) return null;
+  return runtimeMismatch(m.meta?.vendor, b.ref, builds.installed);
 }
 
 /**

@@ -154,6 +154,13 @@ export function benchRequest(
     n_predict: Math.max(16, Math.round(tokens)),
     temperature: 0,
     cache_prompt: false,
+    // A speed measurement asks for N tokens and must get N. Without this a
+    // model that closes its answer early measures nothing: Ternary-Bonsai-27B
+    // answered this very prompt with end-of-text at token 1 (with the
+    // reasoning budget below), and the Speed panel could only report "no
+    // timings" — about a build that had them. Generation cost per token does
+    // not depend on whether the text is still on topic.
+    ignore_eos: true,
     // A reasoning model asked for 128 tokens can spend all of them thinking
     // and emit nothing, which measures the right rate on the wrong work — and
     // on a build that supports it, this is the one place we WANT thinking off.

@@ -726,7 +726,7 @@ Deno.test("cfg: the pre-rename reserve field is dropped, not carried", () => {
       ) => Record<string, unknown>;
     };
   }).__aio;
-  assertEquals(def?.version, 4, "the shape changed, so the version must have");
+  assertEquals(def?.version, 6, "the shape changed, so the version must have");
   const migrate = def?.onMigrate;
   assert(migrate, "and a version bump with no hook only silences the warning");
   const old = {
@@ -813,4 +813,34 @@ Deno.test("cfg: v3 drops the two settings whose flags left the catalog", () => {
   // The old default (shift off, as `--no-context-shift` said) and the new
   // default (`contextShift: false`) run the same server, so nothing is carried.
   assertEquals("contextShift" in (next.settings as object), false);
+});
+
+Deno.test("cfg: v5 resets a default that moved and was never a choice", () => {
+  // v0.8.0 moved `-to` 600 → 3600 and turned `--jinja` back on, but a store
+  // saves VALUES: older installs kept launching `-to 600` (shorter than a long
+  // prefill) and `--no-jinja` (breaks tool-call and reasoning templates).
+  const migrate = (cfg as unknown as {
+    __aio: {
+      onMigrate: (
+        s: Record<string, unknown>,
+        from: number,
+      ) => Record<string, unknown>;
+    };
+  }).__aio.onMigrate;
+  const next = migrate({
+    // `touched` lists them — it lists every non-default value, tuner-written
+    // ones too, so it is no evidence of a choice.
+    settings: { timeout: 600, jinja: false, slots: false, ngl: 99 },
+    touched: ["ngl", "timeout", "slots"],
+  }, 4) as { settings: Record<string, unknown>; touched: string[] };
+  assert(!("timeout" in next.settings), "old default → today's default");
+  assert(!("jinja" in next.settings));
+  assertEquals(next.touched.sort(), ["ngl", "slots"]);
+  assertEquals(next.settings.slots, false, "hiding /slots is a fair choice");
+  assertEquals(next.settings.ngl, 99, "unrelated keys are untouched");
+  // A value that was never a default is a choice.
+  const kept = migrate({ settings: { timeout: 1200 }, touched: [] }, 4) as {
+    settings: Record<string, unknown>;
+  };
+  assertEquals(kept.settings.timeout, 1200);
 });

@@ -48,6 +48,7 @@ import {
   computeScratch,
   effectiveCtx,
   hybridScratch,
+  kvByLayer,
   kvLayers,
   kvPerToken,
   kvTotal,
@@ -265,12 +266,14 @@ import { findMtpSibling, isMtpName, pairKey } from "../src/lib/mtp.ts";
 import { parseHelpFlags, supportsFlag } from "../src/lib/caps.ts";
 import {
   formatRef,
+  parseForkInput,
   parsePrInput,
   parsePrList,
   parseRef,
   prStateNote,
   refDirName,
   refForPrs,
+  refLabel,
   refMoves,
   refNeedsGit,
   refNotFound,
@@ -860,28 +863,37 @@ Deno.test("tune: a model that fits goes entirely on the GPU, at full context", (
   assert(t.summary.includes("full"), `summary should say so: ${t.summary}`);
 });
 
-Deno.test("tune: leftover VRAM is spent on the micro-batch, and the plan pays for it", () => {
-  // Prefill is the wait at long context: 512 → 4096 measured 150 → 364 tok/s
-  // prompt ingestion on a MoE with experts on the host. A small model on a big
-  // card leaves tens of GB idle; the tuner turns some of it into `-ub`.
+Deno.test("tune: leftover VRAM becomes micro-batch only when weights stream from RAM", () => {
+  // The win is PCIe amortisation: 512 → 4096 measured 150 → 364 tok/s prefill
+  // on a MoE with experts on the host, whose weights cross the bus once per
+  // micro-batch. With the experts on the host here, the tuner grows `-ub`…
+  const moe = moeMeta();
+  const box = hw({ gpus: [gpu(12)] });
+  const h = tune(moe, box, defaults(), "hybrid");
+  assert(num(h.settings, "nCpuMoe") > 0, "experts are on the host");
+  assert(
+    num(h.settings, "ubatchSize") > 512,
+    `grown: ${h.settings.ubatchSize}`,
+  );
+  // The growth is billed, not assumed.
+  assert(plan(moe, box, h.settings).fits, "grown plan must still fit");
+  assert(h.reasons.some((r) => r.includes("Micro-batch")));
+
+  // …and leaves it alone when every weight is in VRAM: there is nothing to
+  // amortise, and on two cards a 4096 slice stops llama.cpp pipelining the
+  // batch through them — measured 1,622 → 1,055 tok/s (Qwen3.8-27B, upstream)
+  // and 1,966 → 1,212 (Ternary-Bonsai-27B, PrismML's fork), 512 → 4096.
   const m = meta({ nCtxTrain: 8192 });
   const roomy = hw({ gpus: [gpu(48)] });
   const t = tune(m, roomy, defaults(), "vram");
-  assertEquals(t.settings.ubatchSize, 4096);
-  assertEquals(t.settings.batchSize, 4096);
-  // The growth is billed, not assumed: the grown settings still fit with the
-  // safety margins intact.
-  assert(plan(m, roomy, t.settings).fits, "grown plan must still fit");
-  assert(
-    t.reasons.some((r) => r.includes("Micro-batch")),
-    `the spend is explained: ${t.reasons.join(" | ")}`,
-  );
+  assertEquals(t.settings.ubatchSize, 512);
+  assertEquals(t.reasons.some((r) => r.includes("Micro-batch")), false);
 });
 
-Deno.test("tune: a starved placement keeps its small micro-batch", () => {
-  // When the placement itself cut `-ub` to 256 to buy layers, growth would
-  // undo that trade — and on a card with no headroom there is nothing to
-  // spend anyway.
+Deno.test("tune: micro-batch growth never costs a layer", () => {
+  // Leftover VRAM goes to `-ub` only once the placement is settled: a card
+  // that can hold one more layer gets the layer, and only what no layer fits
+  // into becomes micro-batch (weights on the host make it worth having).
   const mb = 1024 ** 2;
   const m = meta({
     nLayer: 60,
@@ -890,13 +902,16 @@ Deno.test("tune: a starved placement keeps its small micro-batch", () => {
   });
   const tight = hw({ gpus: [gpu(8)] });
   const t = tune(m, tight, defaults(), "hybrid");
-  if (t.possible) {
-    assert(
-      num(t.settings, "ubatchSize") <= 512,
-      `no growth on a starved card: ${t.settings.ubatchSize}`,
-    );
-    assert(plan(m, tight, t.settings).fits);
-  }
+  assert(t.possible);
+  assert(plan(m, tight, t.settings).fits, "the grown plan still fits");
+  // One more layer at the SMALLEST micro-batch the tuner would ever use must
+  // not have fitted — otherwise growth bought prefill with a layer.
+  const more = {
+    ...t.settings,
+    ngl: num(t.settings, "ngl") + 1,
+    ubatchSize: Math.min(512, num(t.settings, "ubatchSize")),
+  };
+  assertEquals(plan(m, tight, more).fits, false);
 });
 
 Deno.test("plan: the compute buffer charges the FFN width for a large micro-batch", () => {
@@ -2382,7 +2397,7 @@ Deno.test("assets: an impossible combination is explained, with the route that w
     "vulkan",
     "hip",
   ]);
-  assertStringIncludes(cudaLinux.reason, "Windows only");
+  assertStringIncludes(cudaLinux.reason, "no prebuilt CUDA binary for Linux");
   assert(cudaLinux.steps.length >= 2);
   assertStringIncludes(cudaLinux.steps.join(" "), "Build from source");
   assertStringIncludes(cudaLinux.steps.join(" "), "Vulkan");
@@ -2437,7 +2452,7 @@ Deno.test("diagnose: the exact failure a user reported becomes advice", () => {
     },
     27,
   );
-  assertStringIncludes(d.reason, "Windows only");
+  assertStringIncludes(d.reason, "no prebuilt CUDA binary for Linux");
   assert(!d.reason.includes(".tar.gz"), "no filename dumps");
   // It knows nvcc is already installed, so it says "switch route", not "install".
   assertStringIncludes(d.steps[0]?.text ?? "", "already have");
@@ -2515,7 +2530,10 @@ Deno.test("readiness: green prerequisites do not mean the selection will work", 
     assetCount: 27,
   });
   assertEquals(r.ok, false, "must be refused BEFORE the button is pressed");
-  assertStringIncludes(r.diagnosis?.reason ?? "", "Windows only");
+  assertStringIncludes(
+    r.diagnosis?.reason ?? "",
+    "no prebuilt CUDA binary for Linux",
+  );
 
   // The same machine, same backend, other route: fine.
   assertEquals(
@@ -3290,21 +3308,24 @@ Deno.test("tune: the OS keeps its RAM, or the tuner says why it cannot", () => {
 
 Deno.test("stability: near-zero RAM headroom is a caution", () => {
   const GB = 1024 ** 3;
-  // Fits, but only just: the kernel cannot page these pages out.
+  // Fits, but only just: the kernel cannot page these pages out. The free
+  // figure is the plan's OWN need plus 0.05 GB, so the fixture stays "exactly
+  // fits" whatever the compute estimate learns next.
   const m = meta({ nLayer: 40, layers: layers(40, 300 * 1024 * 1024) });
-  const machine = hw({
-    gpus: [],
-    mem: {
-      totalB: 16 * GB,
-      // 12.95 GB of weights + KV against 13 GB free: it fits, with 0.05 GB
-      // spare — the "exactly fits" case that used to pass without a word.
-      availableB: 13 * GB,
-      usedB: 3 * GB,
-      swapTotalB: 0,
-      swapUsedB: 0,
-    },
-  });
+  const machineWith = (availableB: number) =>
+    hw({
+      gpus: [],
+      mem: {
+        totalB: availableB + 3 * GB,
+        availableB,
+        usedB: 3 * GB,
+        swapTotalB: 0,
+        swapUsedB: 0,
+      },
+    });
   const s = { ...defaults(), ngl: 0, ctxSize: 4096 };
+  const need = plan(m, machineWith(64 * GB), s).ram.usedB;
+  const machine = machineWith(need + 0.05 * GB);
   const p = plan(m, machine, s);
   assertEquals(p.ram.overB, 0, "the fixture must actually fit");
   assert(p.ram.freeB < GB, "and leave under a GB");
@@ -3431,10 +3452,31 @@ Deno.test("plan: a sliding-window model does not pay full context on every layer
   // And a model that declares no indexer is untouched: this is the sparse term.
   assertEquals(computeScratch(meta({ indexerTopK: 0 }), 512, 262144), 0);
 
-  // A window with no pattern means every layer is local (llama.cpp's default).
+  // A window with no pattern is NOT "every layer local": llama.cpp starts
+  // every layer dense (`std::fill(is_swa_impl, 0)`, llama-model.cpp) and only
+  // an architecture that asks gets windows. DeepSeek-V4 asks for all of them
+  // (`set_swa_pattern(0)`); Gemma-3 asks for five in six and its files carry
+  // no pattern key at all — read as "all local", gemma-3-12b at 131,072 was
+  // planned at 1.1 GiB of cache where llama.cpp allocated 8.5.
   assertEquals(
     swaSplit(meta({ ...full, swaWindow: 512, swaPattern: 1 })),
+    { full: 48, windowed: 0 },
+  );
+  assertEquals(
+    swaSplit(
+      meta({ ...full, arch: "deepseek4", swaWindow: 128, swaPattern: 1 }),
+    ),
     { full: 0, windowed: 48 },
+  );
+  assertEquals(
+    swaSplit(meta({
+      ...full,
+      arch: "gemma3",
+      swaWindow: 1024,
+      swaPattern: 1,
+      swaPatternStated: false,
+    })),
+    { full: 8, windowed: 40 },
   );
 });
 
@@ -4605,6 +4647,7 @@ Deno.test("plan: server slots multiply the scratch, and the plan knows it", () =
   // at one, same model, same placement, same context.
   const MB = 1024 ** 2;
   const m = meta({
+    arch: "deepseek4",
     nLayer: 43,
     nCtxTrain: 1_048_576,
     indexerTopK: 512,
@@ -4648,6 +4691,7 @@ Deno.test("plan: the sparse-attention scratch has a floor, not just a slope", ()
   const MB = 1024 ** 2;
   const GB = 1024 ** 3;
   const sparse = meta({
+    arch: "deepseek4",
     nLayer: 43,
     nCtxTrain: 1_048_576,
     indexerTopK: 512,
@@ -4694,6 +4738,7 @@ Deno.test("plan: a card is budgeted for the whole scratch, not its share", () =>
   // to give.
   const MB = 1024 ** 2;
   const m = meta({
+    arch: "deepseek4",
     nLayer: 43,
     nCtxTrain: 1_048_576,
     indexerTopK: 512,
@@ -6377,6 +6422,8 @@ Deno.test("bench: the request holds every variable still", () => {
   // A reasoning model asked for 128 tokens can spend all of them thinking,
   // which measures the right rate on the wrong work.
   assertEquals(body.reasoning_budget, 0);
+  // A model that ends its answer early would measure nothing at all.
+  assertEquals(body.ignore_eos, true);
   assertEquals(
     benchRequest("prose", 8).n_predict,
     16,
@@ -7193,7 +7240,7 @@ Deno.test("caps: an unprobed build supports nothing", () => {
   assertEquals(supportsFlag(["-bs"], "--fit"), false);
 });
 
-Deno.test("tune: GPU sampling is taken only when the build declares it", () => {
+Deno.test("tune: GPU sampling is left off — it was measured as a loss", () => {
   const m = meta({ name: "M", nCtxTrain: 4096 });
   const machine = hw({ gpus: [gpu(24, 0)] });
   const T = (o: Record<string, unknown>, placement = "vram") =>
@@ -7207,35 +7254,25 @@ Deno.test("tune: GPU sampling is taken only when the build declares it", () => {
       false,
       o,
     );
-
-  // Probed and present: taken. It costs no memory, it composes with drafting,
-  // and it removes a per-token stall.
+  // A build that knows `-bs` does not get it: 0.2-0.8 s per reply before
+  // the first token, for no measurable generation speed (tune.ts says where).
   const modern = T({ caps: ["-bs", "-ngl", "-c"] });
-  assertEquals(modern.settings.backendSampling, true);
-  assert(modern.reasons.some((r) => r.includes("Sampling runs on the GPU")));
-
-  // Probed and absent: NOT taken — this is the one setting an older binary
-  // refuses outright — and the build's age is named rather than left as an
-  // unexplained difference in speed.
-  const old = T({ caps: ["-ngl", "-c"] });
-  assertEquals(old.settings.backendSampling, false);
-  assert(
-    old.reasons.some((r) => r.includes("does not know `-bs`")),
-    "an absent flag must be explained, not silent",
-  );
-
-  // Never probed: not taken, and not complained about either — the app has no
-  // finding to report about a question it did not ask.
-  const unknown = T({});
-  assertEquals(unknown.settings.backendSampling, false);
-  assertEquals(
-    unknown.reasons.some((r) => r.includes("-bs")),
+  assertEquals(modern.settings.backendSampling, false);
+  assert(modern.reasons.some((r) => r.includes("no `-bs`")));
+  // A user's earlier `true` does not survive a re-tune either.
+  const was = tune(
+    m,
+    machine,
+    { ...defaults(), backendSampling: true },
+    "vram",
+    undefined,
+    undefined,
     false,
-    "silence about an unprobed build",
+    { caps: ["-bs"] },
   );
-
-  // CPU-only: there is no device to keep the logits on, so the flag would be a
-  // claim about nothing.
+  assertEquals(was.settings.backendSampling, false);
+  // Nothing to say about a build that cannot do it, or a CPU run.
+  assertEquals(T({}).reasons.some((r) => r.includes("-bs")), false);
   assertEquals(T({ caps: ["-bs"] }, "cpu").settings.backendSampling, false);
 });
 
@@ -7365,27 +7402,29 @@ Deno.test("plan: the attention mask is context x micro-batch", () => {
   // VRAM — so the tuner was growing the micro-batch against a budget that did
   // not know what a micro-batch costs.
   //
-  // Measured against the reported `CUDA_Host compute buffer` on two
-  // architectures that share nothing but llama.cpp: 2.00 bytes per pair on
-  // Ornith-1.5-35B-A3B over 14 points, 1.99 on Gemma-4-26B-A4B over 6.
+  // Measured against the reported `CUDA_Host compute buffer`: 2.00 bytes per
+  // pair on an older llama.cpp (Ornith, 14 points; Gemma-4, 6), and 8 on
+  // current llama.cpp (2026-09-18: five architectures, upstream master and
+  // PrismML's fork, host and each device — Ornith's host buffer went 136 →
+  // 520 MiB for 32k → 131k at -ub 512, exactly 8 × 98,304 × 512).
   const m = ornithMeta();
   const fa = { ...defaults(), flashAttn: "on" };
-  assertEquals(attnMaskB(m, fa, 262144, 512), 262144 * 512 * 2);
-  assertEquals(attnMaskB(m, fa, 262144, 4096), 262144 * 4096 * 2);
-  // 256 MiB at the default micro-batch; 2 GiB at the one the tuner reached for.
-  assertEquals(attnMaskB(m, fa, 262144, 512) / 1024 ** 2, 256);
-  assertEquals(attnMaskB(m, fa, 262144, 4096) / 1024 ** 3, 2);
+  assertEquals(attnMaskB(m, fa, 262144, 512), 262144 * 512 * 8);
+  assertEquals(attnMaskB(m, fa, 262144, 4096), 262144 * 4096 * 8);
+  // 1 GiB at the default micro-batch; 8 GiB at -ub 4096.
+  assertEquals(attnMaskB(m, fa, 262144, 512) / 1024 ** 3, 1);
+  assertEquals(attnMaskB(m, fa, 262144, 4096) / 1024 ** 3, 8);
 
   // Flash attention off is the f32 mask — and `auto` is llama.cpp's default,
   // which turns it ON wherever the kernel exists, so only an explicit "off"
   // doubles this.
   assertEquals(
     attnMaskB(m, { ...defaults(), flashAttn: "off" }, 65536, 1024),
-    65536 * 1024 * 4,
+    65536 * 1024 * 16,
   );
   assertEquals(
     attnMaskB(m, { ...defaults(), flashAttn: "auto" }, 65536, 1024),
-    65536 * 1024 * 2,
+    65536 * 1024 * 8,
   );
 
   // A sparse-attention model is measured end to end by `computeScratch`; adding
@@ -7721,4 +7760,170 @@ Deno.test("command: a VALUE this build does not take is left out too", () => {
   });
   assertEquals(ok[ok.indexOf("--lazy-mode") + 1], "on");
   assertEquals(ok[ok.indexOf("-ts") + 1], "18.5,23.5");
+});
+
+// ── forks: a vendor's llama.cpp for a model upstream cannot load ──────────
+
+Deno.test("srcref: a fork is read from every shape a user pastes", () => {
+  const prism = {
+    kind: "fork" as const,
+    repo: "PrismML-Eng/llama.cpp",
+    ref: null,
+  };
+  assertEquals(
+    parseForkInput("https://github.com/PrismML-Eng/llama.cpp"),
+    prism,
+  );
+  assertEquals(parseForkInput("github.com/PrismML-Eng/llama.cpp/"), prism);
+  assertEquals(
+    parseForkInput("https://github.com/PrismML-Eng/llama.cpp.git"),
+    prism,
+  );
+  assertEquals(parseForkInput("PrismML-Eng/llama.cpp"), prism);
+  assertEquals(
+    parseForkInput(
+      "https://github.com/PrismML-Eng/llama.cpp/tree/feat/tq1_0-cuda",
+    ),
+    { kind: "fork", repo: "PrismML-Eng/llama.cpp", ref: "feat/tq1_0-cuda" },
+  );
+  assertEquals(
+    parseForkInput("PrismML-Eng/llama.cpp@prism-b10685-7dffb15"),
+    {
+      kind: "fork",
+      repo: "PrismML-Eng/llama.cpp",
+      ref: "prism-b10685-7dffb15",
+    },
+  );
+  // Not forks: a PR (it has its own reader), upstream itself (its refs have
+  // spellings already), junk, and anything that could climb out of a path.
+  assertEquals(
+    parseForkInput("https://github.com/ggml-org/llama.cpp/pull/27754"),
+    null,
+  );
+  assertEquals(parseForkInput("ggml-org/llama.cpp"), null);
+  assertEquals(parseForkInput("27754"), null);
+  assertEquals(parseForkInput("a/b@../../etc"), null);
+  assertEquals(parseForkInput("../x"), null);
+  // And the PR reader does not take a fork URL either — one box, no overlap.
+  assertEquals(parsePrList("https://github.com/PrismML-Eng/llama.cpp"), []);
+});
+
+Deno.test("srcref: a fork round-trips, downloads from itself, and moves", () => {
+  const r = parseForkInput("PrismML-Eng/llama.cpp")!;
+  assertEquals(formatRef(r), "fork:PrismML-Eng/llama.cpp");
+  assertEquals(parseRef(formatRef(r)), r);
+  const b = parseForkInput("PrismML-Eng/llama.cpp@feat/x")!;
+  assertEquals(parseRef(formatRef(b)), b);
+  assertEquals(
+    tarballUrl(r),
+    "https://codeload.github.com/PrismML-Eng/llama.cpp/tar.gz/HEAD",
+  );
+  assertEquals(
+    tarballUrl(b),
+    "https://codeload.github.com/PrismML-Eng/llama.cpp/tar.gz/feat/x",
+  );
+  assertEquals(refMoves(r), true, "a branch is re-fetched, never reused");
+  assertEquals(refNeedsGit(r), false, "a tarball, like a single PR");
+  assertEquals(refPrs(r), []);
+  // One path segment, always: the ref becomes a source dir and a build id.
+  assertEquals(refDirName(r), "fork-PrismML-Eng_llama.cpp");
+  assertEquals(refDirName(b), "fork-PrismML-Eng_llama.cpp-feat_x");
+  assertStringIncludes(refLabel(r), "PrismML-Eng/llama.cpp");
+  // A stored fork spelling that no longer parses must not become a TAG —
+  // that would hand codeload `refs/tags/fork:…`. Master is always buildable.
+  assertEquals(parseRef("fork:not a repo"), { kind: "master" });
+  assertStringIncludes(refNotFound(b).reason, "feat/x");
+});
+
+Deno.test("update: a fork build follows the fork, never an upstream tag", () => {
+  const ref = "fork:PrismML-Eng/llama.cpp";
+  const up = { ...CHECKED, forkShas: { [ref]: "c".repeat(40) } };
+  const same = updateFor(
+    build({ ref, origin: "source", sourceSha: "c".repeat(40) }),
+    up,
+  );
+  assertEquals(same.available, false);
+  const moved = updateFor(
+    build({ ref, origin: "source", sourceSha: "d".repeat(40) }),
+    up,
+  );
+  assertEquals(moved.available, true);
+  assertStringIncludes(moved.to, "ccccccc");
+  // Upstream master moving says nothing about the fork.
+  assertEquals(
+    updateFor(
+      build({ ref, origin: "source", sourceSha: "d".repeat(40) }),
+      CHECKED,
+    )
+      .available,
+    false,
+  );
+  // And the update target is the fork again — an upstream tag would swap in
+  // a runtime that rejects the very model the fork was built for.
+  assertEquals(updateTarget(build({ ref }), up), ref);
+});
+
+Deno.test("readiness: a fork is refused on the release route, before the button", () => {
+  const r = targetReadiness("release", "cuda", {
+    ...LINUX,
+    found: new Set(["cmake", "compiler", "cuda"]),
+    availableBackends: ["cpu", "cuda"],
+    assetCount: 20,
+    fork: "PrismML-Eng/llama.cpp",
+  });
+  assertEquals(r.ok, false);
+  assertStringIncludes(r.diagnosis?.reason ?? "", "PrismML-Eng/llama.cpp");
+  assertEquals(r.diagnosis?.steps[0]?.action, {
+    kind: "switch-origin",
+    to: "source",
+  });
+});
+
+Deno.test("plan: each layer's cache is sized by llama.cpp's own per-layer rules", () => {
+  // Gemma-4-26B-A4B, from its real header: windowed layers hold 8 KV heads of
+  // 256, the global ones 2 heads of 512, and the pattern is a per-layer
+  // array. llama.cpp at 131,072, -ub 512: `size = 2560 MiB (131072 cells,
+  // 5 layers)` + `size = 300 MiB (1536 cells, 25 layers)`.
+  const MB = 1024 ** 2;
+  const pattern = Array.from({ length: 30 }, (_, i) => (i % 6 === 5 ? 0 : 1));
+  const g4 = meta({
+    arch: "gemma4",
+    nLayer: 30,
+    nHead: 16,
+    nHeadKv: 8,
+    keyLength: 512,
+    valueLength: 512,
+    keyLengthSwa: 256,
+    valueLengthSwa: 256,
+    swaWindow: 1024,
+    swaLayers: pattern,
+    headKvLayers: pattern.map((w) => (w ? 8 : 2)),
+  });
+  const s = { ...defaults(), ctxSize: 131072, ubatchSize: 512 };
+  assertEquals(kvTotal(g4, s, 131072), (2560 + 300) * MB);
+  // gemma-3-12b: no pattern key, llama.cpp's built-in 6. Measured 8192 + 480.
+  const g3 = meta({
+    arch: "gemma3",
+    nLayer: 48,
+    nHead: 16,
+    nHeadKv: 8,
+    keyLength: 256,
+    valueLength: 256,
+    swaWindow: 1024,
+    swaPattern: 1,
+    swaPatternStated: false,
+  });
+  assertEquals(kvTotal(g3, s, 131072), (8192 + 480) * MB);
+  // Hybrid: the cache sits on the KV-bearing layers, so a card holding the
+  // last few layers holds whole caches, not an even slice.
+  const hy = meta({
+    nLayer: 8,
+    fullAttnInterval: 4,
+    nHeadKv: 4,
+    keyLength: 256,
+    valueLength: 256,
+  });
+  const per = kvByLayer(hy, s, 4096);
+  assertEquals(per.filter((b) => b > MB).length, 2, "layers 3 and 7");
+  assert(per[3]! > 0 && per[3] === per[7]);
 });

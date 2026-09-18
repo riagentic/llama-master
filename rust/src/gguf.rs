@@ -57,6 +57,13 @@ fn type_info(t: u32) -> Option<(u64, u64)> {
         34 => (256, 54),  // TQ1_0
         35 => (256, 66),  // TQ2_0
         39 => (32, 17),   // MXFP4
+        40 => (64, 36),   // NVFP4: 4 E4M3 sub-scales + 32 bytes of E2M1
+        41 => (128, 18),  // Q1_0: f16 scale + 1 bit/weight (PrismML, merged)
+        42 => (64, 18),   // Q2_0: f16 scale + 2 bits/weight (PrismML, merged)
+        // PrismML's fork only (PrismML-Eng/llama.cpp, ggml-common.h), parked
+        // at 142/143 so they cannot collide with upstream's next ids.
+        142 => (128, 34), // PQ2_0: Q2_0's codec at group 128
+        143 => (128, 28), // PTQ1_0: 5 trits/byte + 4 spare + f16 = 1.75 bpw
         _ => return None,
     })
 }
@@ -95,6 +102,11 @@ fn type_name(t: u32) -> &'static str {
         34 => "TQ1_0",
         35 => "TQ2_0",
         39 => "MXFP4",
+        40 => "NVFP4",
+        41 => "Q1_0",
+        42 => "Q2_0",
+        142 => "PQ2_0",
+        143 => "PTQ1_0",
         _ => "UNKNOWN",
     }
 }
@@ -135,6 +147,13 @@ fn ftype_name(f: u32) -> Option<&'static str> {
         36 => "TQ1_0",
         37 => "TQ2_0",
         38 => "MXFP4_MOE",
+        39 => "NVFP4",
+        40 => "Q1_0",
+        41 => "Q2_0",
+        // PrismML's fork (llama.h): 142 is the pre-rename spelling of 141,
+        // and published PQ2_0 files carry either.
+        141 | 142 => "PQ2_0",
+        143 => "PTQ1_0",
         _ => return None,
     })
 }
@@ -198,8 +217,16 @@ impl<'a> Cur<'a> {
 pub enum Val {
     Num(f64),
     Str(String),
+    /// A short numeric (or bool) array — per-layer hyperparameters such as
+    /// Gemma-4's `sliding_window_pattern` and `head_count_kv`. Longer arrays
+    /// (token tables) stay `Skipped`: nothing here needs them.
+    Arr(Vec<f64>),
     Skipped,
 }
+
+/// Per-layer arrays are one entry per layer; nothing real is past this, and
+/// a tokenizer table (hundreds of thousands) must not be copied.
+const MAX_ARR: usize = 4096;
 
 fn fixed_size(t: u32) -> Option<usize> {
     Some(match t {
@@ -231,7 +258,16 @@ fn read_value(c: &mut Cur, t: u32) -> R<Val> {
         9 => {
             let it = c.u32()?;
             let n = c.len()? as usize;
-            if let Some(sz) = fixed_size(it) {
+            if fixed_size(it).is_some() && n <= MAX_ARR {
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    match read_value(c, it)? {
+                        Val::Num(x) => v.push(x),
+                        _ => return Err(usize::MAX),
+                    }
+                }
+                return Ok(Val::Arr(v));
+            } else if let Some(sz) = fixed_size(it) {
                 c.skip(n.saturating_mul(sz))?;
             } else if it == 8 {
                 for _ in 0..n {
@@ -364,11 +400,43 @@ pub struct Gguf {
     /// Tensors across ALL parts (`split.tensors.count`). The check that a merge
     /// actually saw everything: reading part 1 of four gives 38 of 1328.
     pub split_tensors: u64,
+    /// The one runtime that can load this file correctly, when it is not
+    /// upstream llama.cpp. `"prism"` = PrismML's fork: a tensor of a
+    /// Prism-private type (PQ2_0/PTQ1_0, which upstream REJECTS), or any
+    /// `prism.*` key — the Hadamard-folded weights, which upstream LOADS and
+    /// then answers in garbage because it never un-rotates them. The second is
+    /// the dangerous one: nothing fails. "" = any llama.cpp.
+    pub vendor: &'static str,
+    /// Per-layer: is this layer sliding-window? From an ARRAY
+    /// `attention.sliding_window_pattern` (Gemma-4, Granite-SWA, Step-3.5…).
+    /// Empty when the file states no per-layer pattern — then the scalar
+    /// pattern, or llama.cpp's per-architecture default, applies (`plan.ts`).
+    pub swa_layers: Vec<u8>,
+    /// Per-layer KV head count when `attention.head_count_kv` is an array
+    /// (Gemma-4: 8 on windowed layers, 2 on global ones). Empty = uniform.
+    pub head_kv_layers: Vec<u64>,
+    /// Head sizes of the WINDOWED layers when they differ from the global
+    /// ones (`attention.key_length_swa`). 0 = same as `key_length`.
+    pub key_length_swa: u64,
+    pub value_length_swa: u64,
+    /// Trailing layers that reuse an earlier layer's cache and hold none of
+    /// their own (`attention.shared_kv_layers`, Gemma-3n/-4 E models).
+    pub shared_kv_layers: u64,
+    /// Whether `attention.sliding_window_pattern` was present as a SCALAR —
+    /// so "1" from the file and "absent" can be told apart.
+    pub swa_pattern_stated: bool,
 }
 
 fn kv_num(kv: &[(String, Val)], key: &str) -> Option<f64> {
     kv.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
         Val::Num(n) => Some(*n),
+        _ => None,
+    })
+}
+
+fn kv_arr(kv: &[(String, Val)], key: &str) -> Option<Vec<f64>> {
+    kv.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        Val::Arr(a) => Some(a.clone()),
         _ => None,
     })
 }
@@ -419,8 +487,12 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     }
 
     let mut kv: Vec<(String, Val)> = Vec::new();
+    let mut prism_keys = false;
     for _ in 0..n_kv {
         let key = c.str()?;
+        // Checked before the array skip below: most `prism.hadamard.*` keys
+        // are arrays and would otherwise leave no trace.
+        prism_keys |= key.starts_with("prism.");
         let t = c.u32()?;
         let v = read_value(&mut c, t)?;
         // Keep only scalars/strings — arrays are already skipped by value.
@@ -435,7 +507,15 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     let n_layer = a("block_count").unwrap_or(0.0) as usize;
     let n_embd = a("embedding_length").unwrap_or(0.0) as u64;
     let n_head = a("attention.head_count").unwrap_or(0.0) as u64;
-    let n_head_kv = a("attention.head_count_kv").unwrap_or(n_head as f64) as u64;
+    // An ARRAY (one per layer, Gemma-4) is not "absent": falling back to the
+    // query head count billed 16 KV heads where the layers hold 8 and 2. The
+    // scalar is the widest layer; the per-layer truth is `head_kv_layers`.
+    let n_head_kv = a("attention.head_count_kv")
+        .or_else(|| {
+            kv_arr(&kv, &format!("{}.attention.head_count_kv", arch))
+                .and_then(|v| v.into_iter().reduce(f64::max))
+        })
+        .unwrap_or(n_head as f64) as u64;
     let head_dim = if n_head > 0 { n_embd / n_head } else { 0 };
     let key_length = a("attention.key_length").unwrap_or(head_dim as f64) as u64;
     let value_length = a("attention.value_length").unwrap_or(head_dim as f64) as u64;
@@ -546,13 +626,31 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
 
     let indexer_top_k = a("attention.indexer.top_k").unwrap_or(0.0) as u64;
     let n_ctx_orig = a("rope.scaling.original_context_length").unwrap_or(0.0) as u64;
+    let arr = |suffix: &str| kv_arr(&kv, &format!("{}.{}", arch, suffix));
+    let swa_layers: Vec<u8> = arr("attention.sliding_window_pattern")
+        .map(|v| v.iter().map(|x| (*x != 0.0) as u8).collect())
+        .unwrap_or_default();
+    let head_kv_layers: Vec<u64> = arr("attention.head_count_kv")
+        .map(|v| v.iter().map(|x| x.max(0.0) as u64).collect())
+        .unwrap_or_default();
+    let swa_pattern_stated = a("attention.sliding_window_pattern").is_some();
+    let key_length_swa = a("attention.key_length_swa").unwrap_or(0.0) as u64;
+    let value_length_swa = a("attention.value_length_swa").unwrap_or(0.0) as u64;
+    let shared_kv_layers = a("attention.shared_kv_layers").unwrap_or(0.0) as u64;
+    let n_ctx_train = a("context_length").unwrap_or(0.0) as u64;
+    let nextn_layers = a("nextn_predict_layers").unwrap_or(0.0) as u64;
+    let n_expert = a("expert_count").unwrap_or(0.0) as u64;
+    let n_expert_used = a("expert_used_count").unwrap_or(0.0) as u64;
+    let n_ff = a("feed_forward_length").unwrap_or(0.0) as u64;
+    let n_ff_exp = a("expert_feed_forward_length").unwrap_or(0.0) as u64;
+    let rope_freq_base = a("rope.freq_base").unwrap_or(0.0);
 
     Ok(Gguf {
         version,
         name: kv_str(&kv, "general.name").unwrap_or_default(),
         quant,
         n_layer,
-        n_ctx_train: a("context_length").unwrap_or(0.0) as u64,
+        n_ctx_train,
         n_embd,
         n_head,
         n_head_kv,
@@ -566,12 +664,12 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         ssm_d_inner,
         ssm_d_state,
         ssm_n_group,
-        nextn_layers: a("nextn_predict_layers").unwrap_or(0.0) as u64,
-        n_expert: a("expert_count").unwrap_or(0.0) as u64,
-        n_expert_used: a("expert_used_count").unwrap_or(0.0) as u64,
-        n_ff: a("feed_forward_length").unwrap_or(0.0) as u64,
-        n_ff_exp: a("expert_feed_forward_length").unwrap_or(0.0) as u64,
-        rope_freq_base: a("rope.freq_base").unwrap_or(0.0),
+        nextn_layers,
+        n_expert,
+        n_expert_used,
+        n_ff,
+        n_ff_exp,
+        rope_freq_base,
         n_tensors,
         tensor_bytes,
         params,
@@ -586,6 +684,17 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         split_no: kv_num(&kv, "split.no").unwrap_or(0.0) as u64,
         split_count: kv_num(&kv, "split.count").unwrap_or(0.0) as u64,
         split_tensors: kv_num(&kv, "split.tensors.count").unwrap_or(0.0) as u64,
+        swa_layers,
+        head_kv_layers,
+        key_length_swa,
+        value_length_swa,
+        shared_kv_layers,
+        swa_pattern_stated,
+        vendor: if prism_keys || type_hist.iter().any(|(t, _)| *t == 142 || *t == 143) {
+            "prism"
+        } else {
+            ""
+        },
     })
 }
 
@@ -606,7 +715,8 @@ pub fn to_json(g: &Gguf) -> String {
             "\"ssmDConv\":{},\"ssmDInner\":{},\"ssmDState\":{},\"ssmNGroup\":{},\"nextnLayers\":{},",
             "\"nExpert\":{},\"nExpertUsed\":{},\"nFf\":{},\"nFfExp\":{},",
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"params\":{},\"embdBytes\":{},\"outputBytes\":{},",
-            "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},",
+            "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},\"vendor\":{},",
+            "\"swaLayers\":[{}],\"headKvLayers\":[{}],\"keyLengthSwa\":{},\"valueLengthSwa\":{},\"sharedKvLayers\":{},\"swaPatternStated\":{},",
             "\"layers\":[{}]}}"
         ),
         g.version,
@@ -645,6 +755,13 @@ pub fn to_json(g: &Gguf) -> String {
         g.split_no,
         g.split_count,
         g.split_tensors,
+        quote(g.vendor),
+        g.swa_layers.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","),
+        g.head_kv_layers.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","),
+        g.key_length_swa,
+        g.value_length_swa,
+        g.shared_kv_layers,
+        g.swa_pattern_stated,
         layers
     )
 }
@@ -683,6 +800,24 @@ mod tests {
             self.u32(4);
             self.u32(v);
         }
+        fn kv_u32_array(&mut self, k: &str, items: &[u32]) {
+            self.s(k);
+            self.u32(9);
+            self.u32(4);
+            self.u64(items.len() as u64);
+            for i in items {
+                self.u32(*i);
+            }
+        }
+        fn kv_bool_array(&mut self, k: &str, items: &[bool]) {
+            self.s(k);
+            self.u32(9);
+            self.u32(7);
+            self.u64(items.len() as u64);
+            for i in items {
+                self.0.push(*i as u8);
+            }
+        }
         fn kv_str_array(&mut self, k: &str, items: &[&str]) {
             self.s(k);
             self.u32(9);
@@ -720,6 +855,72 @@ mod tests {
         b.tensor("token_embd.weight", &[4096, 32000], 12);
         b.tensor("output_norm.weight", &[4096], 0); // F32 → 16384 bytes
         b.0
+    }
+
+    #[test]
+    fn per_layer_attention_arrays_are_read_not_skipped() {
+        // Gemma-4 states its window pattern and KV heads PER LAYER. Skipped,
+        // the planner saw every layer windowed with 16 KV heads.
+        let mut b = Buf::new();
+        b.u64(0);
+        b.u64(6);
+        b.kv_str("general.architecture", "gemma4");
+        b.kv_u32("gemma4.block_count", 3);
+        b.kv_u32("gemma4.attention.head_count", 16);
+        b.kv_u32_array("gemma4.attention.head_count_kv", &[8, 8, 2]);
+        b.kv_bool_array("gemma4.attention.sliding_window_pattern", &[true, true, false]);
+        b.kv_u32("gemma4.attention.key_length_swa", 256);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.swa_layers, vec![1, 1, 0]);
+        assert_eq!(g.head_kv_layers, vec![8, 8, 2]);
+        assert_eq!(g.n_head_kv, 8, "the widest layer, never the query heads");
+        assert_eq!(g.key_length_swa, 256);
+        assert!(!g.swa_pattern_stated, "an array is not the scalar pattern");
+        let j = to_json(&g);
+        assert!(j.contains("\"swaLayers\":[1,1,0]"), "{}", j);
+        assert!(j.contains("\"headKvLayers\":[8,8,2]"));
+    }
+
+    #[test]
+    fn prism_files_name_their_runtime() {
+        assert_eq!(parse(&fixture()).unwrap().vendor, "", "upstream file");
+        // A Hadamard-folded file of an UPSTREAM type (Q2_0): upstream loads it
+        // and prints garbage, so the key alone must be enough.
+        let mut b = Buf::new();
+        b.u64(1);
+        b.u64(2);
+        b.kv_str("general.architecture", "qwen35");
+        b.kv_str_array("prism.hadamard.weight_names", &["blk.0.ffn_up.weight"]);
+        b.tensor("blk.0.ffn_up.weight", &[128, 128], 42);
+        assert_eq!(parse(&b.0).unwrap().vendor, "prism");
+        // A Prism-private type with no keys at all.
+        let mut b = Buf::new();
+        b.u64(1);
+        b.u64(1);
+        b.kv_str("general.architecture", "qwen35");
+        b.tensor("blk.0.ffn_up.weight", &[128, 128], 143);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.vendor, "prism");
+        assert!(to_json(&g).contains("\"vendor\":\"prism\""));
+    }
+
+    #[test]
+    fn prism_types_have_their_real_bits_per_weight() {
+        // Sizes from PrismML-Eng/llama.cpp ggml-common.h static_asserts. The
+        // bpw is the published figure for each file (PTQ1_0 1.75, PQ2_0 2.125):
+        // a type we could not size would bill the whole model at 0 bytes.
+        let bpw = |t| {
+            let (block, per) = type_info(t).unwrap();
+            per as f64 * 8.0 / block as f64
+        };
+        assert_eq!(bpw(143), 1.75); // PTQ1_0
+        assert_eq!(bpw(142), 2.125); // PQ2_0
+        assert_eq!(bpw(41), 1.125); // Q1_0
+        assert_eq!(bpw(42), 2.25); // Q2_0
+        assert_eq!(bpw(40), 4.5); // NVFP4
+        assert_eq!(ftype_name(141), Some("PQ2_0"));
+        assert_eq!(ftype_name(142), Some("PQ2_0"));
+        assert_eq!(ftype_name(143), Some("PTQ1_0"));
     }
 
     #[test]

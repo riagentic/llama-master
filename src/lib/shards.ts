@@ -122,6 +122,8 @@ export function mergeShards(parts: ModelMeta[]): ModelMeta {
     embdBytes: sum((m) => m.embdBytes),
     outputBytes: sum((m) => m.outputBytes),
     unknownTypes: sum((m) => m.unknownTypes),
+    // Any part carrying a vendor's tensors makes the whole model need it.
+    vendor: parts.find((m) => m.vendor)?.vendor ?? "",
     layers,
   };
 }

@@ -108,6 +108,7 @@ function meta(over: Partial<ModelMeta>): ModelMeta {
     splitNo: 0,
     splitCount: 0,
     splitTensors: 0,
+    vendor: "",
     layers: [],
     ...over,
   };

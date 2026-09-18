@@ -85,6 +85,8 @@ export function scoreAsset(
   platform: string,
   arch: string,
   backend: Backend,
+  /** Newest CUDA runtime the driver can run (`Gpu.cudaDriver`); 0 = unknown. */
+  cudaMax = 0,
 ): number | null {
   const n = name.toLowerCase();
   if (!isBinaryAsset(n)) return null;
@@ -117,10 +119,62 @@ export function scoreAsset(
 
   let score = 100;
   if (archHit) score += 20;
+  // Several CUDA builds of one release (`cuda-12.8`, `cuda-13.3`) differ only
+  // in the toolkit, and they are the same LENGTH — so the shortest-name rule
+  // below picked whichever the list happened to put first, which was 12.8. A
+  // newer toolkit carries native kernels for newer cards (sm_120 is native
+  // from 12.8, and upstream's own newest kernels target 13.x), so take the
+  // newest the DRIVER can load; one it cannot load is not a candidate.
+  const cv = cudaVersionOf(n);
+  if (cv > 0) {
+    if (cudaMax > 0 && cv > cudaMax) return null;
+    score += Math.round(cv * 10);
+  }
   // Prefer the shortest name among equals: extra tokens mean extra specificity
   // (a CUDA version, a distro release) that we did not ask for.
   score -= Math.min(30, Math.floor(n.length / 4));
   return score;
+}
+
+/** `…-cuda-13.3-…` → 13.3; 0 when the name carries no CUDA version. */
+export function cudaVersionOf(name: string): number {
+  const m = /cuda-(\d+)\.(\d+)/i.exec(name);
+  return m ? Number(m[1]) + Number(m[2]) / 10 ** m[2]!.length : 0;
+}
+
+/**
+ * The CUDA runtime a binary asset needs beside it, when the release ships it
+ * separately — `cudart-<same name>`.
+ *
+ * Upstream's Linux CUDA builds (b11039 on) link `libcudart.so.13` and
+ * `libcublas.so.13` and do not contain them; they come in a second archive of
+ * the same name with a `cudart-` prefix. Installing the first alone is a
+ * binary that fails with "cannot open shared object file" — which is exactly
+ * what PrismML's Linux release does, with no companion published at all.
+ */
+export function companionAsset(
+  assets: readonly Asset[],
+  picked: Asset,
+): Asset | null {
+  if (!/cuda/i.test(picked.name) || picked.name.startsWith("cudart")) {
+    return null;
+  }
+  const exact = assets.find((a) => a.name === `cudart-${picked.name}`);
+  if (exact) return exact;
+  // Windows spells it without the build number
+  // (`cudart-llama-bin-win-cuda-12.4-x64.zip` beside
+  // `llama-b11039-bin-win-cuda-12.4-x64.zip`), so match on what matters:
+  // same CUDA version, same OS token, same architecture token.
+  const n = picked.name.toLowerCase();
+  const cv = /cuda-\d+\.\d+/.exec(n)?.[0];
+  const os = ["win", "ubuntu", "linux", "macos"].find((t) => n.includes(t));
+  const arch = ["x64", "arm64"].find((t) => n.includes(t));
+  if (!cv || !os || !arch) return null;
+  return assets.find((a) => {
+    const c = a.name.toLowerCase();
+    return c.startsWith("cudart") && c.includes(cv) && c.includes(os) &&
+      c.includes(arch);
+  }) ?? null;
 }
 
 /** The asset to download by default, or null when nothing here fits. */
@@ -129,10 +183,11 @@ export function pickAsset(
   platform: string,
   arch: string,
   backend: Backend,
+  cudaMax = 0,
 ): Asset | null {
   let best: { a: Asset; s: number } | null = null;
   for (const a of assets) {
-    const s = scoreAsset(a.name, platform, arch, backend);
+    const s = scoreAsset(a.name, platform, arch, backend, cudaMax);
     if (s === null) continue;
     if (!best || s > best.s) best = { a, s };
   }
@@ -179,9 +234,10 @@ export function noAssetExplanation(
   if (backend === "cuda" && platform === "linux") {
     return {
       reason:
-        "llama.cpp publishes prebuilt CUDA binaries for Windows only — there is no Linux CUDA release to download, upstream.",
+        'This llama.cpp release has no prebuilt CUDA binary for Linux that this machine\'s driver can run. Upstream published Windows-only CUDA builds until b11039 (September 2026); from then on, pick "master" to get one.',
       steps: [
-        'Switch the route to "Build from source" and pick CUDA — that works on Linux and llama.master will handle the CUDA architecture for your GPU.',
+        'Pick "master" as the version — the newest release carries a Linux CUDA build.',
+        'Or switch the route to "Build from source" and pick CUDA — llama.master will handle the CUDA architecture for your GPU, and the result is compiled natively for it.',
         "Or use the prebuilt Vulkan release, which runs on NVIDIA cards too and needs no toolchain.",
       ],
     };
@@ -215,6 +271,9 @@ export function availableBackends(
   assets: readonly Asset[],
   platform: string,
   arch: string,
+  cudaMax = 0,
 ): Backend[] {
-  return BACKENDS.filter((b) => pickAsset(assets, platform, arch, b) !== null);
+  return BACKENDS.filter((b) =>
+    pickAsset(assets, platform, arch, b, cudaMax) !== null
+  );
 }
