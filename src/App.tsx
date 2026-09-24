@@ -22,14 +22,15 @@ import { ServerPanel, StatusPill } from "./ui/ServerPanel.tsx";
 import { ChatPanel } from "./ui/ChatPanel.tsx";
 import { OnePage } from "./ui/OnePage.tsx";
 import { About } from "./ui/About.tsx";
+import { RunSync } from "./ui/RunSync.tsx";
 import { updateNow } from "./ui/actions.ts";
 import {
   activeBuild,
   buildBusy,
   buildsSizeB,
-  currentModel,
   mappedModelB,
   modelsSizeB,
+  shownModel,
   updateInfo,
   vramTotalB,
   vramUsedB,
@@ -87,7 +88,9 @@ function BrandMark() {
 
 function Header() {
   const build = activeBuild();
-  const model = currentModel();
+  // The RUNNING model while one is up: the header answers "what is this app
+  // doing", and a selection made since (another tab, `am`) is not that.
+  const model = shownModel();
   const cpu = hw.cpu;
   const gpu = hw.gpus[0];
   const mem = hw.mem;
@@ -241,6 +244,11 @@ export default function App() {
       data-theme={ui.theme}
       style={{ "--fs": `${ui.fontPx}px` }}
     >
+      {
+        /* Headless, and mounted HERE rather than by a page: the auto-tune and
+           the run recorders must happen whichever tab is open. */
+      }
+      <RunSync />
       <Header />
       <div class="main">
         <Rail />

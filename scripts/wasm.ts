@@ -1,4 +1,4 @@
-// rust/build.ts — compile llama-sys to WASM and stage it into src/.
+// scripts/wasm.ts — compile llama-sys to WASM and stage it into src/.
 // Run via `deno task wasm`. The artifact (src/llama-sys.wasm) is committed so
 // a fresh clone runs without a Rust toolchain; re-run this after any .rs edit.
 
@@ -22,8 +22,8 @@ async function run(cmd: string[], cwd: string): Promise<void> {
 }
 
 if (import.meta.main) {
-  const rustDir = dirname(fromFileUrl(import.meta.url));
-  const root = join(rustDir, "..");
+  const root = join(dirname(fromFileUrl(import.meta.url)), "..");
+  const rustDir = join(root, "rust");
   const target = "wasm32-unknown-unknown";
 
   console.log(`→ cargo test (host)`);

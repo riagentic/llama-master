@@ -32,6 +32,15 @@ import { draftRows, queueLabel, submitKind } from "../lib/queue.ts";
 import { submitChat } from "./actions.ts";
 import { chatQueue, chatQueueNote, submitLabel } from "./derive.ts";
 
+/** A queued message's key: its text, plus how many identical texts come
+ *  before it — stable when earlier, different messages leave the queue. */
+function chipKey(queue: readonly string[], i: number): string {
+  const text = queue[i] ?? "";
+  let n = 0;
+  for (let k = 0; k < i; k++) if (queue[k] === text) n++;
+  return `${n}\u0000${text}`;
+}
+
 /** The draft, per window. Module-level rather than `useLocal` so it survives a
  *  switch between the two surfaces that mount this — both are the same
  *  conversation, so the half-typed thought must follow. */
@@ -77,7 +86,11 @@ export function ChatComposer(props: { url: string; ready: boolean }) {
             </div>
             <div class="chat-queue-items">
               {queue.map((text, i) => (
-                <span class="chat-chip" key={String(i)} title={text}>
+                // Keyed by CONTENT, not position: the drain shifts the head
+                // off while the user looks at the rest, and a positional key
+                // re-used the first chip's DOM for what had been the second.
+                // `chipKey` disambiguates identical texts.
+                <span class="chat-chip" key={chipKey(queue, i)} title={text}>
                   <span class="chat-chip-n">{i + 1}</span>
                   <span class="chat-chip-text">{queueLabel(text)}</span>
                   <button
@@ -86,7 +99,10 @@ export function ChatComposer(props: { url: string; ready: boolean }) {
                     aria-label={`Remove queued message ${i + 1}`}
                     title="Remove this message"
                     onClick={() =>
-                      chat.unqueue(i)}
+                      // The text travels with the index: the queue may have
+                      // moved under this chip by the time the click lands
+                      // (`chat.unqueue`).
+                      chat.unqueue(i, text)}
                   >
                     ✕
                   </button>

@@ -95,6 +95,7 @@ export const prereq = cell("prereq", {
             s.install = { label: note, received, total };
           },
         );
+        // aio-ok — appended after the lines the installer streamed in.
         s.fixLog = appendLog(s.fixLog.slice(), [result.message], 200);
         if (!result.ok) s.lastError = `${id}: ${result.message}`;
         // Re-detect either way: a partial install still changes the answer.

@@ -373,3 +373,86 @@ testUI(
     }
   },
 );
+
+/** The system prompt, host and port boxes sit over REPLICATED fields. Bound
+ *  per keystroke, anything that re-rendered them mid-edit — the 1 s poll, a
+ *  streamed reply's flush — wrote the cell's last acknowledged copy back over
+ *  keys still in flight. They are drafts now, committed on change. */
+testUI(
+  App,
+  "typing survives a cell write, and lands on change",
+  async (ui_) => {
+    await ui_.settle();
+    await chat.setSystem("");
+    ui_.App.system.setValue("You are terse");
+    // A chat-cell write while the user is mid-edit: the header re-renders.
+    await chat.clearError();
+    await chat.setSystem("");
+    await ui_.settle();
+    assertEquals(ui_.App.system.value, "You are terse", "the keys survived");
+    assertEquals(chat.system, "", "and nothing was dispatched per keystroke");
+    await ui_.App.system.blur();
+    await ui_.expectCell(chat, (s) => s.system === "You are terse");
+    await chat.setSystem("");
+  },
+);
+
+/** An emptied port box is not a port. It once wrote 0, and the next Connect
+ *  went to :80. */
+testUI(App, "clearing the port box keeps the port in force", async (ui_) => {
+  await ui_.settle();
+  await conn.setPort(8080);
+  await ui_.settle();
+  ui_.App.port.setValue("");
+  await ui_.App.port.blur();
+  await ui_.settle();
+  assertEquals(conn.port, 8080);
+  assertEquals(ui_.App.port.value, "8080", "the box shows what is in force");
+});
+
+/** Enter fires BEFORE the change that commits the draft, so Enter-to-connect
+ *  must commit first — or it connects to the previous address. */
+testUI(
+  App,
+  "Enter in the address box connects to what was typed",
+  async (ui_) => {
+    const stub = stubServer();
+    try {
+      await ui_.settle();
+      await conn.forget();
+      await conn.setHost("192.0.2.1"); // a previous, different address
+      await ui_.settle();
+      ui_.App.host.setValue(stub.url);
+      await ui_.App.host.press("Enter");
+      await ui_.expectCell(conn, (s) => s.status === "connected");
+      assertEquals(conn.url, stub.url);
+    } finally {
+      await conn.forget();
+      await stub.close();
+    }
+  },
+);
+
+/** One note shows either cell's error; ✕ cleared only conn's, so a chat error
+ *  stayed on screen with a button that did nothing. */
+testUI(
+  App,
+  "dismissing the error note clears it, whichever cell said it",
+  async (ui_) => {
+    const stub = stubServer();
+    const gone = stub.url;
+    await stub.close();
+    await ui_.settle();
+    await conn.clearError();
+    await chat.clear();
+    await chat.send(gone, "anyone?");
+    await ui_.settle();
+    assert(chat.lastError.length > 0);
+    assertExists(ui_.App["error-dismiss"]);
+    ui_.App["error-dismiss"].click();
+    await ui_.expectCell(chat, (s) => s.lastError === "");
+    await ui_.settle();
+    assert(!ui_.html().includes('t="error"'), "and the note is gone");
+    await chat.clear();
+  },
+);

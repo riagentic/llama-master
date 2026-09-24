@@ -22,6 +22,12 @@ export type StubOptions = {
    *  the only state the message queue is about — never exists. */
   delayMs?: number;
   model?: string;
+  /** Cut the reply's connection after this many SSE events — the far end
+   *  going away mid-answer, which is not the same as a clean end. */
+  dropAfter?: number;
+  /** Hold these paths' answers back (ms), so a test can move the client on
+   *  while an old request is still in the air. */
+  lag?: Record<string, number>;
 };
 
 export type Stub = {
@@ -55,6 +61,8 @@ export function stubServer(opts: StubOptions = {}): Stub {
     async (req) => {
       const path = new URL(req.url).pathname;
       hits.push(path);
+      const lag = opts.lag?.[path];
+      if (lag) await new Promise((r) => setTimeout(r, lag));
       if (path === "/props") {
         return Response.json({
           model_path: model,
@@ -94,6 +102,20 @@ export function stubServer(opts: StubOptions = {}): Stub {
           }\n\n`,
         );
         events.push("data: [DONE]\n\n");
+        if (opts.dropAfter !== undefined) {
+          const enc = new TextEncoder();
+          const sent = events.slice(0, opts.dropAfter);
+          return new Response(
+            new ReadableStream({
+              async start(c) {
+                for (const e of sent) c.enqueue(enc.encode(e));
+                await new Promise((r) => setTimeout(r, 30));
+                c.error(new Error("connection dropped"));
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         if (!opts.delayMs) {
           return new Response(events.join(""), {
             headers: { "content-type": "text/event-stream" },

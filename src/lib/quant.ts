@@ -173,8 +173,10 @@ export type QuantOption = {
   tps: number;
   /** `tps` against the current file's `tps`. 1 = the same. */
   speedup: number;
-  /** Layers the tuner had to leave in system RAM — the thing that actually
-   *  decides the speed when a model is near the edge of the cards. */
+  /** Layers any of whose weights the tuner had to leave in system RAM — whole
+   *  layers off the GPU, and layers whose routed experts `--n-cpu-moe` holds
+   *  back. Either is read from RAM on every token, which is the thing that
+   *  actually decides the speed when a model is near the edge of the cards. */
   layersInRam: number;
 };
 
@@ -264,7 +266,16 @@ export function quantOptions(
       ctx: t.ctx,
       tps: estimateTps({ ...b, gpuBps: cal.gpuBps, ramBps: cal.ramBps }),
       speedup: 1,
-      layersInRam: Math.max(0, m.nLayer - p.layersOnGpu),
+      // Both are prefixes of the model — `-ngl` leaves the FIRST layers on the
+      // host and `--n-cpu-moe` holds the FIRST layers' experts — so the layers
+      // touching RAM are the longer of the two. Counting only the first made
+      // a MoE with most of its experts in RAM read as "fits in VRAM", and a
+      // smaller quant that really did get there was never credited for it.
+      layersInRam: Math.max(
+        0,
+        m.nLayer - p.layersOnGpu,
+        m.nExpert > 0 ? p.moeOnCpu : 0,
+      ),
     };
   };
 

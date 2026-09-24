@@ -25,9 +25,8 @@ import { cfg } from "../cell/cfg.ts";
 import { hw } from "../cell/hw.ts";
 import { isLanExposed, lanHost, lanUrl, pickLanIp } from "../lib/lan.ts";
 import { num, str } from "../lib/params.ts";
-import { runLocked } from "./actions.ts";
+import { LOCK_REASON, runLocked } from "./actions.ts";
 import { serverRunning } from "./derive.ts";
-import { LOCK_REASON } from "./actions.ts";
 import { Segmented, Toggle } from "./kit.tsx";
 
 export function LanSwitch(props: { t?: string }) {
@@ -51,6 +50,7 @@ export function LanSwitch(props: { t?: string }) {
         checked={on}
         label="Available on LAN"
         t={`${id}-toggle`}
+        disabled={locked}
         tip={locked
           ? LOCK_REASON
           : "Bind llama-server to 0.0.0.0 so other machines on your network can reach it. Off (127.0.0.1) it answers only on this machine — which is why a client elsewhere finds nothing."}

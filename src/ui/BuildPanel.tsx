@@ -11,6 +11,7 @@ import {
   parseForkInput,
   parsePrList,
   parseRef,
+  prInputProblem,
   refLabel,
   refPrs,
 } from "../lib/srcref.ts";
@@ -37,7 +38,7 @@ import {
   foundPrereqs,
   prereqById,
 } from "./derive.ts";
-import { optimalForThisPc } from "./actions.ts";
+import { LOCK_REASON, optimalForThisPc, runLocked } from "./actions.ts";
 import { Guidance } from "./Guidance.tsx";
 
 const BACKENDS: readonly { id: Backend; label: string; tip: string }[] = [
@@ -297,8 +298,29 @@ function Chooser() {
   );
 }
 
+/**
+ * Why this build's Delete is refused right now, or "".
+ *
+ * Two refusals, both about something in flight. The running server is
+ * executing the active build's binary and libraries — deleting them under it
+ * is a crash later that names nothing. And a build job writes into the builds
+ * directory and may be about to make any of these rows active or replace it,
+ * so no row is removed while one runs.
+ */
+function deleteBlocker(id: string): string {
+  if (buildBusy()) return "Wait for the build in progress to finish.";
+  if (runLocked() && id === builds.activeId) {
+    return "The running server is using this build — stop it first.";
+  }
+  return "";
+}
+
 function Installed() {
   const list = builds.installed;
+  // The active build is the one the server runs: switching it under a live
+  // run would make the command on screen describe a binary that is not the
+  // one executing (`runLocked`, same rule as the all-in-one page's picker).
+  const locked = runLocked();
   return (
     <Panel
       title="Installed builds"
@@ -349,14 +371,17 @@ function Installed() {
                     ? "row-active row-pick"
                     : "row-pick"}
                   t={`build-row-${b.id}`}
-                  title={`Use ${b.ref} · ${b.backend}`}
-                  onClick={() => builds.setActive(b.id)}
+                  title={locked ? LOCK_REASON : `Use ${b.ref} · ${b.backend}`}
+                  onClick={() => {
+                    if (!locked) builds.setActive(b.id);
+                  }}
                 >
                   <td class="c-icon">
                     <input
                       type="radio"
                       aria-label={`Use ${b.id}`}
                       checked={b.id === builds.activeId}
+                      disabled={locked}
                       onChange={() => builds.setActive(b.id)}
                     />
                   </td>
@@ -381,7 +406,9 @@ function Installed() {
                     <button
                       type="button"
                       class="btn tiny danger"
-                      title={`Delete ${b.dir}`}
+                      t={`build-delete-${b.id}`}
+                      disabled={deleteBlocker(b.id) !== ""}
+                      title={deleteBlocker(b.id) || `Delete ${b.dir}`}
                       onClick={(e) => {
                         // Without this the click also selects the row it is in.
                         e.stopPropagation();
@@ -432,7 +459,14 @@ function PrPicker() {
   // vendor's llama.cpp (PrismML's ternary types) arrives with a repository
   // link, and a second box for it would be a second place to look.
   const fork = typed.length === 0 ? parseForkInput(text) : null;
+  // A pull request against ANOTHER repository cannot be merged into
+  // upstream's master, and the parser drops it — so a box holding one would
+  // build master (or master + the rest of the list) while the user believes
+  // their PR is in it. Refused out loud, and the whole input with it: building
+  // what is left of a list with one entry silently missing is the same lie.
+  const problem = prInputProblem(text);
   const apply = () => {
+    if (problem) return;
     if (fork) builds.setRef(formatRef(fork));
     else if (typed.length === 1) builds.setPr(typed[0]!, "merge");
     else if (typed.length > 1) builds.setPrs(typed);
@@ -462,8 +496,10 @@ function PrPicker() {
             type="button"
             class="btn small primary"
             t="pr-use"
-            disabled={typed.length === 0 && !fork}
-            title={fork
+            disabled={problem !== null || (typed.length === 0 && !fork)}
+            title={problem
+              ? problem
+              : fork
               ? `Build ${refLabel(fork)} instead of upstream llama.cpp`
               : typed.length === 0
               ? "Type a pull request number, paste its URL, or paste a fork's URL"
@@ -496,6 +532,9 @@ function PrPicker() {
             )
             : null}
         </div>
+        {problem
+          ? <span class="warn-note pr-refused" t="pr-refused">{problem}</span>
+          : null}
         {on
           ? (
             <div class="pr-note" t="pr-note">

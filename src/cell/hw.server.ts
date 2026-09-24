@@ -205,7 +205,9 @@ let nvidiaAbsentUntil = 0;
 /** Every `nvidia-smi` call goes through here: absence is cached, and the call
  *  has a ceiling — a wedged one (after suspend, typically) used to block the
  *  1 s refresh forever. */
-async function nvidiaSmi(args: string[]): Promise<Exec> {
+/** The one door to `nvidia-smi`: a 5 s ceiling (it wedges after a suspend)
+ *  and a remembered absence. Every caller in the app goes through here. */
+export async function nvidiaSmi(args: string[]): Promise<Exec> {
   if (Date.now() < nvidiaAbsentUntil) {
     return { code: 127, stdout: "", stderr: "nvidia-smi: not found" };
   }

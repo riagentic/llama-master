@@ -186,21 +186,35 @@ export function countsFromSplit(
 /**
  * The `-ts` value that produces exactly these cuts.
  *
- * Half a slot is shaved off the first share and added to the last so every
- * boundary lands STRICTLY between two slot fractions. Emitting the counts
- * themselves puts the boundary exactly on `k / n_offloaded`, where llama.cpp's
- * `upper_bound` is deciding on an equality between two floats it computed
- * separately — correct today, and one refactor upstream from being off by one
- * card. Midpoints cannot be off by one.
+ * Half a slot is shaved off the first card that holds anything and added to
+ * the last one that does, so every boundary lands STRICTLY between two slot
+ * fractions. Emitting the counts themselves puts the boundary exactly on
+ * `k / n_offloaded`, where llama.cpp's `upper_bound` is deciding on an equality
+ * between two floats it computed separately — correct today, and one refactor
+ * upstream from being off by one card. Midpoints cannot be off by one. Never
+ * from a ZERO share: `-0.5` is not a split llama.cpp (or `countsFromSplit`)
+ * accepts, and a card that holds nothing must say 0 to hold nothing.
  *
- * Empty when there is nothing to say: one card, or one card doing all the work.
+ * Emitted whenever there are two cards, including when one of them does all
+ * the work. "" there used to mean "no split needed", and it is the opposite:
+ * with no `-ts` llama.cpp divides the layers by each card's FREE memory at load
+ * time, so a plan that kept card 0 empty — because the user's display reserve
+ * spends it — put half the model on it anyway. `41,0` is the only spelling of
+ * "all of it on card 0". Empty only for a single card, where there is nothing
+ * to divide.
  */
 export function tensorSplitValue(counts: readonly number[]): string {
-  const used = counts.filter((c) => c > 0).length;
-  if (counts.length < 2 || used < 2) return "";
-  const last = counts.length - 1;
+  if (counts.length < 2) return "";
+  const used = counts
+    .map((c, i) => (c > 0 ? i : -1))
+    .filter((i) => i >= 0);
+  if (used.length === 0) return "";
+  const first = used[0]!;
+  const last = used[used.length - 1]!;
   return counts
-    .map((c, i) => (i === 0 ? c - 0.5 : i === last ? c + 0.5 : c))
+    .map((c, i) =>
+      first === last ? c : i === first ? c - 0.5 : i === last ? c + 0.5 : c
+    )
     .map((v) => (Number.isInteger(v) ? String(v) : v.toFixed(1)))
     .join(",");
 }

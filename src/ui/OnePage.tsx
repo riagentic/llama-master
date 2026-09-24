@@ -9,7 +9,6 @@
 // Composed entirely from the same components the deep tabs use, so there is one
 // implementation of every number and it cannot disagree with itself.
 
-import { afterRender, useRef } from "aio/air";
 import { chat } from "../cell/chat.ts";
 import { cfg } from "../cell/cfg.ts";
 import { hw } from "../cell/hw.ts";
@@ -73,7 +72,6 @@ import {
   currentModel,
   currentStatePlan,
   driftNow,
-  headroomNow,
   loadingNow,
   mappedModelB,
   memoryIsLive,
@@ -84,7 +82,6 @@ import {
   serverRunning,
   shownModel,
   shownSettings,
-  speedCalFromLastReply,
   vramTotalB,
   vramUsedB,
 } from "./derive.ts";
@@ -258,114 +255,10 @@ function Vitals() {
  */
 function RunStrip() {
   const m = currentModel();
-  // Keep the settings describing what Start would actually run.
-  //
-  // Keyed on everything the tuning depends on rather than hooked to one
-  // dropdown: a model can be selected from the Models tab, from `am`, or
-  // restored from the last session, and settings tuned for a different model
-  // are wrong however they got there. `afterRender` runs post-commit, so this
-  // is a reaction to state rather than a side effect during render, and it
-  // settles in one pass because re-tuning does not change the key.
-  const tunedFor = useRef("");
-  // Whether the machine has been measured is part of the key, because tuning
-  // before it has is not a tuning. `models.scan()` and `hw.refresh()` race at
-  // boot — measured at 45 ms against 48 ms on the author's machine, i.e. a coin
-  // flip — and when models won, the tuner saw no RAM and no GPUs, fell back to
-  // CPU placement, and `cfg.setPlacement` PERSISTED it. The card then sat idle
-  // for the rest of the session, and forever after, with nothing on screen to
-  // explain why. Booleans and a count only: `availableB` moves on every poll and
-  // would re-tune once a second.
-  //
-  // `headroomNow()` is what makes this adaptive: a game taking 20 GB of VRAM, a
-  // compile taking 8 GB of RAM, or either of those FINISHING, all change the
-  // right answer — in both directions. It is deliberately coarse (eighths of each
-  // pool, `src/lib/adapt.ts`) because these machines are workstations where the
-  // raw numbers never hold still: keying on `availableB` itself would rewrite the
-  // user's settings on every 1 s poll and fight their typing.
-  const hwReady = hw.lastRefresh > 0 && hw.mem !== null;
-  // The reserve is in the key for the same reason the headroom bucket is: it
-  // changes how much memory a plan may spend, so a settings map tuned before it
-  // moved describes a run the user no longer wants. Exact bytes, not a bucket —
-  // this one only changes when someone types into the box.
-  const key =
-    `${models.selected}|${builds.activeId}|${cfg.placement}|${ctxOverride()}|${hwReady}|${hw.gpus.length}|${headroomNow()}|${cfg.reservePerGpuVramB}:${cfg.reserveConnectedVramB}:${cfg.reserveRamB}`;
-  afterRender(() => {
-    if (tunedFor.current === key) return;
-    if (!hwReady) return; // nothing measured yet — a tune now would be a guess
-    if (!cfg.autoOptimal || serverRunning() || !currentModel()?.meta) return;
-    tunedFor.current = key;
-    applyOptimal();
-  });
-  // Write down a context that ACTUALLY generated. `proven`, not `healthy`:
-  // /health only proves the weights loaded, and a DeepSeek-V4 run passed it at
-  // 17,408 tokens then OOM'd on its first prompt — recording at /health wrote
-  // that lie down as a fact, and rememberFit only ever grows, so it would have
-  // opened every later run at a size measured to crash. For a model whose
-  // buffers the planner cannot derive from its header this is the only measured
-  // fact the app will ever have (`src/lib/fitladder.ts`). Keyed so it fires
-  // once per successful start, not once per frame.
-  const notedFit = useRef("");
-  afterRender(() => {
-    if (!srv.proven || !srv.runModel) return;
-    const ctx = Number(srv.runSettings?.ctxSize ?? 0);
-    const k = `${srv.runModel}|${ctx}|${srv.startedAt}`;
-    if (notedFit.current === k || ctx <= 0) return;
-    notedFit.current = k;
-    // A run that walked the ladder is a measurement that the RECORD was too
-    // high — the opening bid is capped at the record, and the ladder only
-    // engages after that bid actually died. Replace it; growing-only would
-    // re-run the crash at the top of every session.
-    cfg.rememberFit({ model: srv.runModel, ctx, exact: srv.fitTries > 0 });
-  });
-  // Write down what the build could not do. Unlike the context above this is
-  // recorded the moment the ladder learns it rather than on `proven`: the abort
-  // IS the proof, it names the feature in llama.cpp's own words, and it holds
-  // whether or not the run that follows goes on to succeed for some other
-  // reason. Keyed on the build AND the model, so a newer llama.cpp is never
-  // held back by what an older one could not do.
-  const notedUnsupported = useRef("");
-  afterRender(() => {
-    if (srv.unsupported.length === 0 || !srv.runModel) return;
-    const build = builds.activeId;
-    const k = `${build}|${srv.runModel}|${srv.unsupported.join(",")}`;
-    if (notedUnsupported.current === k || !build) return;
-    notedUnsupported.current = k;
-    cfg.rememberUnsupported({
-      build,
-      model: srv.runModel,
-      settings: srv.unsupported.slice(),
-    });
-  });
-  // Learn this machine's real bandwidth from the reply it just produced. The
-  // speed estimate is bandwidth ÷ bytes-per-token, and bandwidth is the one term
-  // that cannot be read off the machine — so the app ships a labelled default and
-  // replaces it the first time a real generation gives it a rate to work back
-  // from. Keyed on the rate so it runs once per reply, not once per frame.
-  //
-  // Keyed on BOTH observations: a chat reply and a bench are two rates about
-  // the same machine, the bench wins when it applies (`speedCalFromLastReply`),
-  // and keying on the chat rate alone meant pressing Measure changed nothing
-  // until the user happened to say something afterwards.
-  //
-  // Read in the RENDER BODY, not inside the callback. A component subscribes
-  // only to what its render touches, and this one touches `srv` (the buttons)
-  // but nothing of `chat` — so reading `chat.lastTps` inside `afterRender`
-  // subscribed to nothing, the component never re-rendered when a reply
-  // finished, and the callback ran once and never again. Half of that was
-  // already known and mis-diagnosed: adding the bench to the key fixed
-  // "pressing Measure changed nothing" without fixing why. aio 1.0.0-beta says
-  // it outright (`docs/ui/reactivity-tracking.md`), which is what found the
-  // other half. `lastTps` is written once per FINISHED reply, not per streamed
-  // flush, so subscribing here costs one re-render per answer.
-  const calFor = useRef("");
-  const calKey = `${chat.lastTps}|${srv.lastBench.at}`;
-  afterRender(() => {
-    if (calFor.current === calKey) return;
-    calFor.current = calKey;
-    const cal = speedCalFromLastReply();
-    if (cal.gpuBps || cal.ramBps) cfg.setSpeedCal(cal);
-  });
-
+  // The auto-tune and the run recorders that used to live here are in
+  // `RunSync`, mounted by the shell: this strip exists only while the
+  // all-in-one tab is open, and a run started from anywhere else went
+  // unrecorded (`src/ui/RunSync.tsx`).
   const blocker = startBlocker();
   const running = serverRunning();
   const locked = runLocked();
@@ -755,7 +648,9 @@ function PlacementAdvice(
         title={`Switch to ${label} and re-tune`}
         onClick={() => {
           cfg.setPlacement(better);
-          applyOptimal();
+          // Named, not read back: the replica still holds the old placement
+          // until the dispatch above lands (`actions.ts:RunTarget`).
+          applyOptimal({ placement: better });
         }}
       >
         Use {label}

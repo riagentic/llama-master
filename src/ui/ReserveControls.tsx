@@ -29,7 +29,7 @@ import {
   vramReserveShares,
 } from "../lib/reserve.ts";
 import { bytes } from "../lib/format.ts";
-import { planningHw, reserveCost, vramTotalB } from "./derive.ts";
+import { hwSnapshot, planningHw, reserveCost } from "./derive.ts";
 
 function Field(props: {
   pool: "gpu" | "connected" | "ram";
@@ -99,15 +99,21 @@ function Field(props: {
  */
 export function ReserveControls(props: { t?: string }) {
   const id = props.t ?? "reserve";
-  const gpus = hw.gpus;
-  const vramCapB = vramTotalB();
-  const ramCapB = hw.mem?.totalB ?? 0;
   // The EFFECTIVE reserve — clamped to the machine, exactly as every plan on
   // this page sees it, so the summary cannot claim more is held back than is.
   const phw = planningHw();
   const held = reserveOf(phw);
   const shares = vramReserveShares(phw.gpus, held);
   const heldVramB = shares.reduce((a, b) => a + b, 0);
+  // Every capacity and display reading below is over the cards the PLANNER
+  // sees — the ones the active build can address and the user left enabled —
+  // not raw `hw.gpus`. The shares above already were, so reading the raw list
+  // here let the summary disagree with itself: an iGPU a CUDA build never
+  // touches could be named as the display card, and a card switched off with
+  // `-dev` still set the "more than this card has" ceiling.
+  const gpus = phw.gpus;
+  const vramCapB = gpus.reduce((a, g) => a + Math.max(0, g.vramTotalB), 0);
+  const ramCapB = hw.mem?.totalB ?? 0;
   const displays = displayGpus(gpus);
   const guessed = displayUnknown(gpus);
   const smallestCardB = gpus.length > 0
@@ -117,8 +123,17 @@ export function ReserveControls(props: { t?: string }) {
     (a, g, i) => displays[i] ? Math.max(a, Math.max(0, g.vramTotalB)) : a,
     0,
   );
+  // Named by the MACHINE's index, which is what the GPU page and nvidia-smi
+  // call a card — a position among the planner's cards shifts the moment one
+  // is filtered out. The planner's list maps back through `hwSnapshot` (same
+  // order, same objects; `planningHw` only adjusts the usage figures).
+  const snap = hwSnapshot().gpus;
   const displayNames = gpus
-    .map((_g, i) => displays[i] ? `GPU ${i}` : "")
+    .map((_g, i) => {
+      if (!displays[i]) return "";
+      const n = snap[i] ? hw.gpus.indexOf(snap[i]) : -1;
+      return `GPU ${n >= 0 ? n : i}`;
+    })
     .filter(Boolean);
   const summary = heldVramB > 0 || held.ramB > 0
     ? [

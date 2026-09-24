@@ -20,6 +20,10 @@ import { quote } from "./command.ts";
 /** One `NAME=value` assignment, parsed. */
 export type EnvVar = { name: string; value: string };
 
+/** One token: its value with the quotes taken out, and as it was typed — which
+ *  is what a refusal has to show, because that is what the user can find. */
+type Token = { value: string; raw: string; broken: boolean };
+
 /**
  * Tokenize the way a shell would: whitespace separates, except inside quotes.
  *
@@ -29,24 +33,40 @@ export type EnvVar = { name: string; value: string };
  * screen in exactly the way this app refuses everywhere else. Quotes are
  * stripped by the scan (they are shell syntax, not value bytes), so the spawn
  * gets exactly what a shell would have passed.
+ *
+ * Two things a shell would do that this does not, so they are REFUSED rather
+ * than approximated (`bad` carries the token as typed): an unclosed quote —
+ * a shell waits for the rest of the line, and "the rest" silently becoming the
+ * value is a variable nobody typed — and a backslash outside single quotes,
+ * which a shell reads as an escape and this would pass through as a byte. In
+ * single quotes a backslash is a byte to a shell too, so it is kept there.
  */
-function tokenize(text: string): string[] {
-  const tokens: string[] = [];
+function tokenize(text: string): Token[] {
+  const tokens: Token[] = [];
   let cur = "";
+  let raw = "";
   let quote: '"' | "'" | null = null;
   let started = false;
+  let broken = false;
   const end = () => {
-    if (started) tokens.push(cur);
+    if (started) tokens.push({ value: cur, raw, broken });
     cur = "";
+    raw = "";
     started = false;
+    broken = false;
   };
   for (const ch of text) {
     if (quote) {
+      raw += ch;
       if (ch === quote) quote = null;
-      else cur += ch;
+      else {
+        if (ch === "\\" && quote === '"') broken = true;
+        cur += ch;
+      }
       continue;
     }
     if (ch === '"' || ch === "'") {
+      raw += ch;
       quote = ch;
       started = true; // `a"b c"` is one token, not `ab` + `c`
       continue;
@@ -55,9 +75,12 @@ function tokenize(text: string): string[] {
       end();
       continue;
     }
+    if (ch === "\\") broken = true;
+    raw += ch;
     cur += ch;
     started = true;
   }
+  if (quote) broken = true;
   end();
   return tokens;
 }
@@ -84,7 +107,12 @@ export function parseEnvVars(text: string): {
 } {
   const vars: EnvVar[] = [];
   const bad: string[] = [];
-  for (const token of tokenize(text)) {
+  for (const t of tokenize(text)) {
+    if (t.broken) {
+      bad.push(t.raw);
+      continue;
+    }
+    const token = t.value;
     const eq = token.indexOf("=");
     if (eq <= 0) {
       bad.push(token);
@@ -107,13 +135,6 @@ export function parseEnvVars(text: string): {
   return { vars, bad };
 }
 
-/**
- * The same input as a `Record` for `Deno.Command`'s `env`.
- *
- * Last one wins, exactly as a shell would: the two entries are one input
- * line, and a duplicate is the user editing in place far more often than two
- * variables competing.
- */
 /**
  * The environment a server is spawned with: the app's own, minus any
  * `LLAMA_ARG_*` the user did not put in the Command panel, plus theirs.
@@ -138,6 +159,13 @@ export function spawnEnv(
   return { env: { ...env, ...envRecord(vars) }, dropped: dropped.sort() };
 }
 
+/**
+ * The same input as a `Record` for `Deno.Command`'s `env`.
+ *
+ * Last one wins, exactly as a shell would: the two entries are one input
+ * line, and a duplicate is the user editing in place far more often than two
+ * variables competing.
+ */
 export function envRecord(vars: readonly EnvVar[]): Record<string, string> {
   const out: Record<string, string> = {};
   for (const v of vars) out[v.name] = v.value;

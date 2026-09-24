@@ -70,9 +70,27 @@ const CTX_STEP = 256;
 export type FitFault = "weights" | "context";
 
 /** The load-time shapes. A buffer that failed while TENSORS were being placed is
- *  the model, whatever else the same log also says. */
+ *  the model. */
 const WEIGHTS_SIGNS =
-  /alloc_tensor_range|unable to allocate \w+ buffer|error loading model|failed to load model|create_memory: failed/i;
+  /alloc_tensor_range|unable to allocate \w+ buffer|error loading model|failed to load model/i;
+
+/**
+ * The shapes that say the MODEL loaded and its context did not — read first,
+ * because they share a line with the weights shapes.
+ *
+ * The KV cache is allocated through the same `alloc_tensor_range` the weights
+ * are, so its failure prints the same
+ * `alloc_tensor_range: failed to allocate CUDA0 buffer of size …` — and only
+ * the line after it (`failed to initialize the context: failed to allocate
+ * buffer for kv cache`, `llama-kv-cache.cpp`) says whose buffer it was. Read as
+ * weights, a cache that did not fit moved experts to the host, rung after rung,
+ * which frees VRAM the cache could then take but never shortens the thing that
+ * is too long. The recurrent state (`rs cache`) and the DSV4 compressor state
+ * are context-sized in the same way. None of these lines can appear once
+ * loading the weights has failed: llama.cpp never reaches the context.
+ */
+const CONTEXT_SIGNS =
+  /failed to allocate buffer for (?:kv|rs) cache|failed to allocate buffer for DSV4|failed to initiali[sz]e the context|failed to create.?context|failed to initiali[sz]e memory|compute buffers|graph_reserve/i;
 
 /**
  * What llama.cpp asked for and did not get, in bytes.
@@ -97,9 +115,19 @@ export function requestedB(lines: readonly string[]): number {
   return 0;
 }
 
-/** Which device the failed allocation was for, or -1 when the log does not say. */
+/**
+ * Which device the failed allocation was for, or -1 when the log does not say.
+ *
+ * Two spellings. CUDA's allocator names the device by number (`allocating …
+ * MiB on device 1`); every backend's buffer type names it in the BUFFER
+ * (`failed to allocate CUDA1 buffer`, `Vulkan0`, `ROCm0`), which is the only
+ * one a non-CUDA backend prints. A host buffer (`CPU`, `CUDA_Host`) carries no
+ * index and is correctly not a device.
+ */
 export function faultDevice(lines: readonly string[]): number {
-  const m = lines.join("\n").match(/allocating [\d.]+ MiB on device (\d+)/i);
+  const text = lines.join("\n");
+  const m = text.match(/allocating [\d.]+ MiB on device (\d+)/i) ??
+    text.match(/(?:failed|unable) to allocate [A-Za-z]+?(\d+) buffer/i);
   const n = m ? Number(m[1]) : NaN;
   return Number.isInteger(n) ? n : -1;
 }
@@ -107,7 +135,30 @@ export function faultDevice(lines: readonly string[]): number {
 /** The two faults, told apart. `null` when nothing ran out of memory at all. */
 export function fitFault(lines: readonly string[]): FitFault | null {
   if (!isFitFailure(lines)) return null;
-  return WEIGHTS_SIGNS.test(lines.join("\n")) ? "weights" : "context";
+  const text = lines.join("\n");
+  if (CONTEXT_SIGNS.test(text)) return "context";
+  return WEIGHTS_SIGNS.test(text) ? "weights" : "context";
+}
+
+/**
+ * What the failing card had to give, for sizing the shortfall.
+ *
+ * The named card's own figure when the log names one we have. Otherwise the
+ * SMALLEST figure any card reported: reading an unknown card as holding
+ * nothing turned the whole request into the shortfall — a 34 GB ask on a card
+ * with 22 GB spare moved 34 GB of experts to the host instead of 12. The
+ * smallest known headroom is still the cautious side (the step it sizes is the
+ * largest one the evidence supports), without inventing a zero. `null` when
+ * nothing is known at all, and the caller then has only the request itself.
+ */
+function faultFreeB(
+  dev: number,
+  freeB: readonly number[] | undefined,
+): number | null {
+  const known = (freeB ?? []).filter((b) => Number.isFinite(b) && b > 0);
+  const own = dev >= 0 ? freeB?.[dev] : undefined;
+  if (own !== undefined && Number.isFinite(own) && own > 0) return own;
+  return known.length > 0 ? Math.min(...known) : null;
 }
 
 /**
@@ -456,7 +507,7 @@ export function fitDecision(args: {
     const nLayer = args.nLayer ?? 0;
     const now = Math.max(0, args.nCpuMoe ?? 0);
     const dev = faultDevice(args.lines);
-    const free = args.deviceFreeB?.[dev] ?? 0;
+    const free = faultFreeB(dev, args.deviceFreeB) ?? 0;
     // The shortfall, not the request: asking for 34.7 GB of a card holding
     // 22 GB of headroom is 12.7 GB short, and moving 34.7 GB of experts to the
     // host would give away most of the GPU for no reason.

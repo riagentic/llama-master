@@ -35,6 +35,8 @@ import { About } from "../src/ui/About.tsx";
 import { ServerPanel } from "../src/ui/ServerPanel.tsx";
 import { SpeedPanel } from "../src/ui/SpeedPanel.tsx";
 import { ChatPanel } from "../src/ui/ChatPanel.tsx";
+import { ModelsPanel } from "../src/ui/ModelsPanel.tsx";
+import { Guidance } from "../src/ui/Guidance.tsx";
 import {
   CTX_BANDS,
   CTX_PRESETS,
@@ -72,6 +74,8 @@ import {
   betterPlacement,
   placements,
   reserveCost,
+  runModel,
+  selectModel,
   startBlocker,
   startServer,
   stopServer,
@@ -3550,3 +3554,384 @@ Deno.test({
     }
   },
 });
+
+// ── the run is one thing, whichever page it is driven from ─────────────────
+
+/** Back to "nothing is running" — every field the tests below seed. The srv
+ *  cell is a singleton across the file, and a seeded "ready" left behind locks
+ *  every later test's controls. */
+const STOPPED = {
+  status: "stopped",
+  pid: 0,
+  startedAt: 0,
+  runSettings: null,
+  runModel: "",
+  proven: false,
+  healthy: false,
+  fitTries: 0,
+  unsupported: [],
+};
+
+testUI(
+  App,
+  "a proven context and a refused flag are written down on any tab",
+  async (ui_) => {
+    // The recorders lived in the all-in-one page's run strip, and the shell
+    // mounts one tab at a time: a model started from the Models table lands
+    // on Server, where nothing recorded the context it proved or the flag the
+    // build refused. They are the shell's now (`RunSync`), so this drives
+    // them from a tab that is NOT the all-in-one page.
+    await ui_.settle();
+    await ui.go("server");
+    await ui_.waitFor(
+      () => ui.tab === "server" && ui_.html().includes("llama-server"),
+      "on the Server tab",
+    );
+    const before = builds.activeId;
+    const path = "/nowhere/run-sync-fixture.gguf";
+    try {
+      ui_.seed({ builds: { activeId: "sync-build" } });
+      ui_.seed({
+        srv: {
+          proven: true,
+          runModel: path,
+          runSettings: { ...cfg.settings, ctxSize: 12288 },
+          startedAt: 77,
+          fitTries: 0,
+          unsupported: ["specType"],
+        },
+      });
+      await ui_.expectCell(
+        cfg,
+        (s) => s.fitCtx[path] === 12288,
+        "the context that generated is recorded",
+      );
+      await ui_.expectCell(
+        cfg,
+        (s) =>
+          (s.unsupported[`sync-build\n${path}`] ?? []).includes("specType"),
+        "and what the build refused, against build AND model",
+      );
+      assertEquals(ui.tab, "server", "all of it without visiting all-in-one");
+    } finally {
+      ui_.seed({ srv: STOPPED, builds: { activeId: before } });
+      await cfg.forgetFit(path);
+      await ui_.settle();
+    }
+  },
+);
+
+testUI(
+  ModelsPanel as never,
+  "Run starts the model it names, without the last model's drafter, and then locks the table",
+  { seed: { hw: roomyMachine() }, latency: 15 },
+  async (ui_) => {
+    // Run is select + tune + start in one gesture, and it read the selection
+    // back from the replica straight after dispatching it — with any latency
+    // at all that is the PREVIOUS model, and Run started it. The latency here
+    // is the round trip that made the bug; every value must be carried, not
+    // re-read. And `-md` names a drafter paired to one model's vocabulary, so
+    // it must not follow the selection to another.
+    await ui_.settle();
+    const dir = await Deno.makeTempDir({ prefix: "llama-master-run-" });
+    const a = join(dir, "first-8x2B-Q4_K_M.gguf");
+    const b = join(dir, "second-8x2B-Q4_K_M.gguf");
+    await Deno.writeFile(a, moeGguf());
+    await Deno.writeFile(b, moeGguf());
+    try {
+      await withStubBuild(async (bin) => {
+        await srv.stop();
+        await srv.poll();
+        await models.addDir(dir);
+        await models.scan();
+        await ui_.waitFor(
+          () => [a, b].every((p) => models.items.some((m) => m.path === p)),
+          "both fixtures are in the library",
+        );
+        await models.select(a);
+        await cfg.set("draftModel", "/nowhere/first-drafter.gguf");
+        await cfg.set("port", String(freePort()));
+        await ui_.settle();
+
+        await runModel(b);
+        assertEquals(srv.runModel, b, "the model Run named is what started");
+        assertEquals(srv.argv[0], bin);
+        assert(srv.argv.includes(b), `argv names it: ${srv.argv.join(" ")}`);
+        assert(
+          !srv.argv.includes("-md"),
+          `the previous model's drafter is not carried: ${srv.argv.join(" ")}`,
+        );
+        await ui_.expectCell(cfg, (s) => s.settings.draftModel === "");
+        await ui_.expectCell(models, (s) => s.selected === b);
+
+        // While it runs, this table is not a way around the run lock.
+        await ui_.settle();
+        const panel = ui_.find("ModelsPanel");
+        assert(
+          panel["run-first-8x2B-Q4_K_M.gguf"].attr("disabled") !== null,
+          "Run is disabled while a server is up",
+        );
+
+        await stopServer();
+        await srv.poll();
+      });
+    } finally {
+      await srv.stop();
+      await models.removeDir(dir);
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+);
+
+testUI(
+  ModelsPanel as never,
+  "selecting the same model keeps its drafter; another drops it",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // Over the RETURNED settings too — the half `runModel` spawns from.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m);
+      await models.select(m.path);
+      await cfg.set("draftModel", "/nowhere/drafter.gguf");
+      await ui_.settle();
+      assertEquals(
+        str(selectModel(m.path), "draftModel"),
+        "/nowhere/drafter.gguf",
+        "re-selecting the same model is not a switch",
+      );
+      await models.select("/nowhere/other.gguf");
+      await ui_.settle();
+      assertEquals(str(selectModel(m.path), "draftModel"), "");
+      await ui_.expectCell(cfg, (s) => s.settings.draftModel === "");
+      await models.removeDir(dir);
+    });
+  },
+);
+
+testUI(
+  OnePage as never,
+  "the context box keeps what is being typed while the value under it moves",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // A controlled box over a value re-derived every second: the pin moving
+    // under it (another window, a tick re-tuning the placement) wrote the
+    // derived number back over digits still being typed.
+    await ui_.settle();
+    await withModel(async (dir) => {
+      await models.addDir(dir);
+      await models.scan();
+      const m = models.items.find((x) => x.meta);
+      assertExists(m);
+      await models.select(m.path);
+      await cfg.setCtxOverride(0);
+      await ui_.settle();
+
+      const box = ui_.find("OnePage")["one-ctx-value"];
+      await box.setValue("4608");
+      ui_.seed({ cfg: { ctxOverride: 8192, ctxOverrideFor: m.path } });
+      await ui_.settle();
+      assertEquals(box.value, "4608", "the draft survives the re-render");
+      assertEquals(cfg.ctxOverride, 8192, "and nothing was written mid-edit");
+
+      await box.blur();
+      await ui_.expectCell(cfg, (s) => s.ctxOverride === 4608, "one commit");
+      await cfg.setCtxOverride(0);
+      await models.removeDir(dir);
+    });
+  },
+);
+
+testUI(
+  TunePanel as never,
+  "Tune: a running server locks every flag, and shows the context it runs at",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    await ui_.settle();
+    await cfg.set("ctxSize", "4096");
+    await ui_.settle();
+    try {
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: "/nowhere/running.gguf",
+          runSettings: { ...cfg.settings, ctxSize: 16384 },
+        },
+      });
+      await ui_.settle();
+      const panel = ui_.find("TunePanel");
+      for (const handle of ["optimal", "reset-all", "tune-lan-toggle"]) {
+        assert(
+          panel[handle].attr("disabled") !== null,
+          `${handle} is disabled while a server runs`,
+        );
+      }
+      // The catalog's own switches carry the lock AND a name: a checkbox
+      // with an empty label is announced as "checkbox".
+      const html = ui_.html();
+      assert(
+        /<input[^>]*aria-label="Jinja templates"[^>]*disabled/.test(html) ||
+          /<input[^>]*disabled[^>]*aria-label="Jinja templates"/.test(html),
+        "a boolean flag is named and locked",
+      );
+      // The placement choice says which one is chosen, to a screen reader too.
+      assertStringIncludes(html, 'aria-pressed="true"');
+      assertEquals(
+        panel["tune-ctx-value"].value,
+        "16384",
+        "the context the server RUNS at, not the 4096 in the panel",
+      );
+    } finally {
+      ui_.seed({ srv: STOPPED });
+      await ui_.settle();
+    }
+  },
+);
+
+testUI(
+  OnePage as never,
+  "Available on LAN cannot be flipped while a server runs",
+  { seed: { hw: roomyMachine() } },
+  async (ui_) => {
+    // The handler already refused, so the STATE never changed — but the box
+    // flipped in the DOM anyway, showing a bind the server does not have.
+    await ui_.settle();
+    try {
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: "/nowhere/running.gguf",
+          runSettings: { ...cfg.settings },
+        },
+      });
+      await ui_.settle();
+      assert(
+        ui_.find("OnePage")["one-lan-toggle"].attr("disabled") !== null,
+        "the switch is disabled, not merely ignored",
+      );
+    } finally {
+      ui_.seed({ srv: STOPPED });
+      await ui_.settle();
+    }
+  },
+);
+
+/** A diagnosis with one Fix and one re-check — the two steps whose target and
+ *  busy guard are under test. Called, not JSX: this file is `.ts`. */
+function GuidanceFixture() {
+  return Guidance({
+    diagnosis: {
+      reason: "cmake is missing.",
+      steps: [
+        { text: "Install cmake.", action: { kind: "fix-prereq", id: "cmake" } },
+        {
+          text: "Re-check the prerequisites.",
+          action: { kind: "recheck-prereqs" },
+        },
+      ],
+    },
+  });
+}
+
+testUI(
+  GuidanceFixture as never,
+  "guidance fixes are refused while an install runs, and lead to Prerequisites",
+  async (ui_) => {
+    // "Fix it" navigated to Machine, a page that summarises prerequisites in
+    // one line and does not show the fix's log; and it stayed clickable while
+    // another install was running, where `prereq.fix` refuses silently.
+    await ui_.settle();
+    try {
+      ui_.seed({ prereq: { fixing: "nvcc" } });
+      await ui_.settle();
+      const g = ui_.find("GuidanceFixture");
+      assert(g["guide-fix-prereq"].attr("disabled") !== null, "Fix waits");
+      assert(
+        g["guide-recheck-prereqs"].attr("disabled") !== null,
+        "and so does re-check",
+      );
+    } finally {
+      ui_.seed({ prereq: { fixing: "" } });
+      await ui_.settle();
+    }
+    // The re-check goes where the list is, and runs the check it names.
+    await ui_.find("GuidanceFixture")["guide-recheck-prereqs"].click();
+    await ui_.expectCell(ui, (s) => s.tab === "prereq", "to Prerequisites");
+    await ui_.waitFor(() => !prereq.scanning, "the re-check ran");
+  },
+);
+
+testUI(
+  BuildPanel as never,
+  "a pull request against another repository is refused out loud, not dropped",
+  async (ui_) => {
+    // The parser keeps only upstream's pull requests. Without a sentence, a
+    // pasted fork PR built plain master — or master plus the REST of the list
+    // — while the user believed their change was in it.
+    await ui_.settle();
+    const before = builds.ref;
+    ui_["pr-number"].setValue(
+      "27773, https://github.com/someone/llama.cpp/pull/12",
+    );
+    await ui_.settle();
+    assertEquals(ui_["pr-use"].disabled, true, "nothing builds without it");
+    assertStringIncludes(ui_.html(), "someone/llama.cpp");
+    assertExists(ui_["pr-refused"], "the reason is under the box");
+    ui_["pr-number"].press("Enter");
+    await ui_.settle();
+    assertEquals(
+      builds.ref,
+      before,
+      "Enter does not take the rest of the list",
+    );
+  },
+);
+
+testUI(
+  BuildPanel as never,
+  "a running server locks the build it runs on",
+  async (ui_) => {
+    // Deleting or switching the active build under a live server is the run
+    // lock bypassed from another page — the binary the process is executing
+    // disappears, or the command on screen stops describing it.
+    await ui_.settle();
+    const bin = await installStubBuild("locked-build");
+    const before = builds.activeId;
+    try {
+      await builds.scan();
+      await builds.setActive("locked-build");
+      ui_.seed({
+        srv: {
+          status: "ready",
+          pid: 4242,
+          startedAt: 1,
+          runModel: "/nowhere/running.gguf",
+          runSettings: { ...cfg.settings },
+          argv: [bin],
+        },
+      });
+      await ui_.settle();
+      assertEquals(
+        ui_["build-delete-locked-build"].disabled,
+        true,
+        "the running build cannot be deleted",
+      );
+      assertStringIncludes(
+        ui_.html(),
+        "The running server is using this build",
+      );
+    } finally {
+      ui_.seed({ srv: { ...STOPPED, argv: [] } });
+      await ui_.settle();
+      if (before) await builds.setActive(before).catch(() => {});
+      await removeStubBuild("locked-build");
+    }
+  },
+);

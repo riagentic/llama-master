@@ -11,6 +11,7 @@ import { devices, isEnabled, toggleDevice } from "../lib/gpu.ts";
 import { bytes } from "../lib/format.ts";
 import type { Param } from "../lib/types.ts";
 import { activeBuild } from "./derive.ts";
+import { LOCK_REASON, runLocked } from "./actions.ts";
 
 /**
  * One checkbox per GPU the active build can address.
@@ -41,13 +42,19 @@ export function DevicePicker(props: { value: string; p: Param }) {
   }
   const all = list.map((d) => d.id);
   const on = list.filter((d) => isEnabled(props.value, d.id)).length;
+  // `-dev` decides where a running model's layers ARE; it is locked with the
+  // rest of the run (`runLocked`) on every page that shows it — this one
+  // component is on two.
+  const locked = runLocked();
   return (
     <div class="device-picker" t="device-picker">
       {list.map((d) => (
         <label
           key={d.id}
           class={isEnabled(props.value, d.id) ? "device on" : "device"}
-          title={`${d.label} — passed to llama.cpp as ${d.id}`}
+          title={locked
+            ? LOCK_REASON
+            : `${d.label} — passed to llama.cpp as ${d.id}`}
         >
           <input
             type="checkbox"
@@ -58,7 +65,7 @@ export function DevicePicker(props: { value: string; p: Param }) {
             t={d.id}
             // Never let the last one go: llama.cpp with no device fails at load,
             // and "use nothing" is what -ngl 0 already says, honestly.
-            disabled={on === 1 && isEnabled(props.value, d.id)}
+            disabled={locked || (on === 1 && isEnabled(props.value, d.id))}
             onChange={(e) =>
               cfg.set(
                 props.p.key,

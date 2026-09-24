@@ -64,9 +64,9 @@ export type BuildsState = {
    *  real speed lever, and a build that has never heard of it refuses to start
    *  at all. Guessing from the version string is not available either — a PR
    *  stack has no version that means anything — so the binary is asked, once,
-   *  and the answer is kept (`src/lib/caps.ts`). Persisted with the cell: a
-   *  build's flags do not change while it sits on disk, and re-probing every
-   *  boot would spawn a process per build for an answer already known. */
+   *  and the answer is kept (`src/lib/caps.ts`) for the life of the process —
+   *  a build's flags do not change while it sits on disk. Replaced whenever
+   *  a build with that id is rebuilt or removed. */
   caps: Record<string, string[]>;
   broken: Record<string, string>;
   scanning: boolean;
@@ -419,13 +419,13 @@ export const builds = cell("builds", {
       if (s.checkingUpdate) return;
       s.checkingUpdate = true;
       try {
-        const io = await import("./builds.server.ts");
         // A fork build is compared against the FORK, so its ref is resolved
-        // before the await — the active build may change while it is out.
+        // before the first await — the active build may change while it is out.
         const active = s.installed.find((b) => b.id === s.activeId);
         const fork = active && parseRef(active.ref).kind === "fork"
           ? active.ref
           : "";
+        const io = await import("./builds.server.ts");
         const [latestTag, masterSha, forkSha] = await Promise.all([
           io.latestTag().catch(() => ""),
           io.masterSha().catch(() => ""),
@@ -541,6 +541,9 @@ export const builds = cell("builds", {
         // gone, or a failed delete leaves the UI describing a directory that is
         // still there.
         s.installed = s.installed.filter((b) => b.id !== id);
+        // A rebuilt id must never be answered from its predecessor's flags.
+        delete s.caps[id];
+        delete s.broken[id];
         // aiol-ok — and the selection follows the list it was just filtered
         // out of; both reads are of the line above, not of a stale snapshot.
         if (s.activeId === id) s.activeId = s.installed[0]?.id ?? "";
@@ -595,42 +598,41 @@ export const builds = cell("builds", {
         if (p.lines?.length) s.log = appendLog(s.log.slice(), p.lines);
       };
 
+      // The run's parameters, gathered BEFORE the first await: these are the
+      // values the user pressed the button on, and nothing that lands while
+      // the build module loads may change what this job builds.
+      const ref = s.ref;
+      const backend = s.backend;
+      const signal = s.$signal;
+      // Auto = every logical CPU but two. A compile that claims the whole
+      // machine makes the desktop unusable for several minutes, and the last
+      // two cores buy back almost no wall-clock.
+      const jobs = s.jobs || autoJobs();
+      const native = s.native;
+      const schedCap = s.bypassSchedCap ? SCHED_SPLIT_CAP : 0;
+      const assetName = s.assetName || undefined;
       try {
         const io = await import("./builds.server.ts");
-        // aiol-ok — the run's parameters, read at the moment the run starts.
-        // `start` is the method the whole cell is arranged around: nothing else
-        // may write `ref`/`backend` while a job is running (every setter is
-        // disabled in the UI and `start` refuses re-entry), so these are the
-        // values the user pressed the button on.
-        const signal = s.$signal;
         const built = source
           ? await io.buildFromSource(
-            {
-              ref: s.ref,
-              backend: s.backend,
-              // Auto = every logical CPU but two. A compile that claims the
-              // whole machine makes the desktop unusable for several minutes,
-              // and the last two cores buy back almost no wall-clock.
-              jobs: s.jobs || autoJobs(),
-              native: s.native,
-              schedCap: s.bypassSchedCap ? SCHED_SPLIT_CAP : 0,
-              signal,
-            },
+            { ref, backend, jobs, native, schedCap, signal },
             onProgress,
           )
           : await io.installRelease(
-            {
-              ref: s.ref,
-              backend: s.backend,
-              assetName: s.assetName || undefined,
-              signal,
-            },
+            { ref, backend, assetName, signal },
             onProgress,
           );
 
+        // aio-ok — merged into the list as it is NOW: a scan may have landed
+        // during a build that took minutes, and its answer must survive.
         const rest = s.installed.filter((b) => b.id !== built.id);
         s.installed = [built, ...rest];
         s.activeId = built.id;
+        // Same id, NEW binary: the old flag list and any "broken" verdict were
+        // about the build this one replaced, so ask the new one.
+        delete s.caps[built.id];
+        delete s.broken[built.id];
+        await probeInto(s, built.id, true);
         job.status = "done";
         job.progress = 1;
         job.endedAt = Date.now();
@@ -653,10 +655,13 @@ export const builds = cell("builds", {
         const diagnosis = e instanceof io.BuildFailure
           ? e.diagnosis
           : diagnoseFailure(
+            // aio-ok — the log this run streamed, read back to be diagnosed.
             [message, ...s.log.slice(-40)].join("\n"),
             {
-              origin: s.origin,
-              backend: s.backend,
+              // The run's own route and backend — the setters may have moved
+              // since, and a diagnosis of a different build is no diagnosis.
+              origin: source ? "source" : "release",
+              backend,
               platform: navigator.platform.includes("Win")
                 ? "windows"
                 : "linux",

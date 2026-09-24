@@ -11,6 +11,7 @@ import { builds } from "../cell/builds.ts";
 import { prereq } from "../cell/prereq.ts";
 import { ui } from "../cell/ui.ts";
 import type { Diagnosis, FixAction, Step } from "../lib/diagnose.ts";
+import { LOCK_REASON, runLocked } from "./actions.ts";
 
 /** Perform a step's action. Kept here so every place that shows guidance
  *  behaves identically. */
@@ -23,11 +24,20 @@ function run(action: FixAction): void {
       builds.setBackend(action.to);
       break;
     case "fix-prereq":
-      ui.go("dashboard");
+      // The Prerequisites page, not Machine: that is where the fix's own log
+      // streams, and a privileged install whose output is a tab away is the
+      // "nothing runs unexplained" promise broken by navigation.
+      ui.go("prereq");
       prereq.fix(action.id);
       break;
     case "open-tab":
       ui.go(action.tab);
+      break;
+    case "recheck-prereqs":
+      // Where the list is, not Machine (which summarises it in one line), and
+      // the check the step names actually runs.
+      ui.go("prereq");
+      prereq.scan();
       break;
     case "open-url":
       globalThis.open?.(action.url, "_blank");
@@ -58,6 +68,8 @@ function label(action: FixAction): string {
         : action.tab === "settings"
         ? "Open Tune"
         : "Open Build";
+    case "recheck-prereqs":
+      return "Re-check";
     case "open-url":
       return "Open docs ↗";
     case "use-ref":
@@ -67,8 +79,34 @@ function label(action: FixAction): string {
   }
 }
 
+/**
+ * Why this action cannot run right now, or "".
+ *
+ * A Fix while another fix or an app-managed install is under way would queue
+ * nothing — `prereq.fix` refuses silently when busy — and read as a button that
+ * does nothing; a re-check mid-install reports a half-installed tool. Switching
+ * the active build under a running server is what the run lock forbids
+ * everywhere else.
+ */
+function actionBlocker(action: FixAction): string {
+  const prereqBusy = prereq.fixing !== "" || prereq.install !== null;
+  switch (action.kind) {
+    case "fix-prereq":
+      return prereqBusy ? "Another install is in progress." : "";
+    case "recheck-prereqs":
+      return prereqBusy
+        ? "An install is in progress — re-check when it finishes."
+        : "";
+    case "use-build":
+      return runLocked() ? LOCK_REASON : "";
+    default:
+      return "";
+  }
+}
+
 function StepRow(props: { step: Step }) {
   const a = props.step.action;
+  const blocked = a ? actionBlocker(a) : "";
   return (
     <li class="guide-step">
       <span>{props.step.text}</span>
@@ -77,8 +115,10 @@ function StepRow(props: { step: Step }) {
           <button
             type="button"
             class="btn tiny primary"
+            t={`guide-${a.kind}`}
+            disabled={blocked !== ""}
             onClick={() => run(a)}
-            title={props.step.text}
+            title={blocked || props.step.text}
           >
             {label(a)}
           </button>

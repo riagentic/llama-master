@@ -749,6 +749,13 @@ input[type="checkbox"] {
   background: var(--accent);
 }
 
+/* A switch that cannot be flipped looks it — the same dimming a disabled
+   button gets, so "locked while the server runs" reads before it is clicked. */
+.toggle.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .segmented {
   display: inline-flex;
   border: 1px solid var(--line);
@@ -771,8 +778,13 @@ input[type="checkbox"] {
   border-right: 0;
 }
 
-.seg:hover {
+.seg:hover:not(:disabled) {
   color: var(--text);
+}
+
+.seg:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .seg.on {

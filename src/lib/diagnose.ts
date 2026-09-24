@@ -18,6 +18,9 @@ export type FixAction =
   | { kind: "switch-backend"; to: Backend }
   | { kind: "fix-prereq"; id: string }
   | { kind: "open-tab"; tab: "dashboard" | "build" | "settings" }
+  /** Open the Prerequisites page and run the check there. Its own kind: a
+   *  step that means "look at the machine" must not read as a re-check. */
+  | { kind: "recheck-prereqs" }
   | { kind: "open-url"; url: string }
   /** Point the Build tab at a source ref (a vendor's fork) and open it. */
   | { kind: "use-ref"; ref: string }
@@ -156,15 +159,21 @@ const BUILD_SIGNATURES: {
   {
     match: /Unsupported gpu architecture|compute_\d+a?'/i,
     reason:
-      "Your CUDA toolkit is older than your GPU, so nvcc does not recognise the architecture cmake asked it to build for.",
+      "Your CUDA toolkit does not know the architecture cmake asked it to build for — usually because it is older than your GPU (or, on a Maxwell/Pascal/Volta card, because CUDA 13 dropped it).",
     steps: () => [
       {
         text:
           "llama.master normally caps this automatically (it builds PTX the driver can JIT). Seeing it means the cap did not apply — re-run the build so the architecture is re-detected.",
       },
       {
-        text: "Installing a newer CUDA toolkit removes the need for the cap.",
-        action: { kind: "fix-prereq", id: "cuda" },
+        // `cuda-arch`, never `cuda`: that one installs the DISTRIBUTION's
+        // toolkit — Ubuntu's `nvidia-cuda-toolkit` is CUDA 12.0, the very nvcc
+        // that produced this error. `cuda-arch` fetches NVIDIA's own release
+        // for this card into the app's directory, and only when the driver can
+        // run it (`cuda.ts:cudaOffer`).
+        text:
+          "Install a CUDA toolkit new enough for this card — into the app's own directory, no system change — and the cap is no longer needed.",
+        action: { kind: "fix-prereq", id: "cuda-arch" },
       },
       {
         text: "Or use Vulkan, which has no toolkit version to match.",
@@ -319,7 +328,7 @@ export function diagnoseFailure(
         }]),
       {
         text: "Re-check the prerequisites — one of them may have changed.",
-        action: { kind: "open-tab", tab: "dashboard" },
+        action: { kind: "recheck-prereqs" },
       },
     ],
   };

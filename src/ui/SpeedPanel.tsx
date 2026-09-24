@@ -28,7 +28,6 @@
 // percent, so the gap that opens on code is the drafter's, in tok/s, here.
 
 import { srv } from "../cell/srv.ts";
-import { cfg } from "../cell/cfg.ts";
 import { prefillNote } from "../lib/bench.ts";
 import type { BenchResult } from "../lib/bench.ts";
 import { num } from "../lib/params.ts";
@@ -38,6 +37,7 @@ import {
   benchCodeNow,
   benchNow,
   serverRunning,
+  shownSettings,
   specVerdictNow,
 } from "./derive.ts";
 import { ErrorNote, Panel, Pill } from "./kit.tsx";
@@ -143,7 +143,11 @@ export function SpeedPanel() {
   const v = specVerdictNow();
   const band = bandwidthNow();
   const running = serverRunning();
-  const prefill = b ? prefillNote(b, num(cfg.settings, "ubatchSize")) : "";
+  // The micro-batch the MEASURED run was started with, not the panel's value
+  // now: the note explains a measurement, and a `-ub` typed since was not in
+  // force when it was taken (`shownSettings`, the same rule `specVerdictNow`
+  // follows).
+  const prefill = b ? prefillNote(b, num(shownSettings(), "ubatchSize")) : "";
   return (
     <Panel
       title="Speed"

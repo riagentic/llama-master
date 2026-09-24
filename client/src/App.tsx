@@ -25,6 +25,7 @@ import { transcript } from "./shared/richtext.ts";
 import { useStickyBottom } from "./ui/sticky.ts";
 import {
   CopyButton,
+  DraftInput,
   Empty,
   ErrorNote,
   KV,
@@ -58,28 +59,32 @@ function ConnectBar() {
         <span class="dim">client</span>
       </div>
 
-      <input
+      {
+        /* Drafts, committed on change: the bar re-renders on every 1 s poll,
+           and a box bound straight to the cell lost keys to it. */
+      }
+      <DraftInput
+        type="text"
         class="host"
         t="host"
-        aria-label="Server address"
+        ariaLabel="Server address"
         placeholder="192.168.1.20 — or a hostname"
         value={conn.host}
-        onInput={(e) =>
-          conn.setHost((e.currentTarget as HTMLInputElement).value)}
-        onKeyDown={(e) => {
-          if ((e as KeyboardEvent).key === "Enter") void conn.connect();
-        }}
+        onCommit={(v) => conn.setHost(v)}
+        onEnter={() => void conn.connect()}
       />
-      <input
+      <DraftInput
         type="number"
         class="port"
         t="port"
-        aria-label="Port"
+        ariaLabel="Port"
         min="1"
         max="65535"
         value={String(conn.port)}
-        onInput={(e) =>
-          conn.setPort(Number((e.currentTarget as HTMLInputElement).value))}
+        // An emptied box is not a port: nothing is written, and the box shows
+        // the port still in force (`setPort` refuses anything else invalid).
+        onCommit={(v) => v.trim() ? conn.setPort(Number(v)) : undefined}
+        onEnter={() => void conn.connect()}
       />
       <button
         type="button"
@@ -270,14 +275,19 @@ function Chat() {
     <section class="chat" t="chat">
       <div class="chat-head">
         <b>Chat</b>
-        <input
+        {
+          /* A draft, committed on change: every streamed-token flush
+             re-renders this header, and a box bound straight to the cell
+             wiped keys typed while a reply was arriving. */
+        }
+        <DraftInput
+          type="text"
           class="system"
           t="system"
           placeholder="System prompt (optional)"
-          aria-label="System prompt"
+          ariaLabel="System prompt"
           value={chat.system}
-          onInput={(e) =>
-            chat.setSystem((e.currentTarget as HTMLInputElement).value)}
+          onCommit={(v) => chat.setSystem(v)}
         />
         <span class="spacer" />
         {chat.lastTps > 0
@@ -384,7 +394,12 @@ export default function App() {
       <Found />
       <ErrorNote
         message={conn.lastError || chat.lastError}
-        onDismiss={() => conn.clearError()}
+        // One note shows either cell's error, so ✕ clears both — clearing only
+        // conn's left a chat error on screen that the button could not remove.
+        onDismiss={() => {
+          void conn.clearError();
+          void chat.clearError();
+        }}
       />
       <StatusStrip />
       <Chat />

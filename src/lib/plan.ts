@@ -969,10 +969,10 @@ export function plan(
       (counts ? loadPerDevice(slotCostsB, counts) : []),
     budgetsB,
     // The split that produces this placement — which, when the user pinned
-    // one, is theirs. Re-deriving it from the counts would answer "" for a
-    // pinned `1,0` (one card doing all the work needs no split of OURS), and
-    // "" does not produce that placement: llama.cpp would fall back to
-    // splitting by free VRAM and put half the model on the other card.
+    // one, is theirs, spelled as they spelled it. Ours is re-derived from the
+    // counts, and is never "" on two cards: "" does not produce any particular
+    // placement — llama.cpp falls back to splitting by free VRAM
+    // (`devsplit.ts:tensorSplitValue`).
     tensorSplit: pinnedCounts
       ? asked_ts
       : counts
@@ -1065,7 +1065,12 @@ export function plan(
     );
   }
   if (kvOnCpu) notes.push("KV cache is pinned to system RAM (-nkvo).");
-  if (bool(s, "mlock") && ram.usedB + ram.otherB > ramCapacity * 0.9) {
+  // `loadMode`, not the `mlock` boolean `cfg` version 4 folded into it: read
+  // under the old key this note could never fire.
+  if (
+    str(s, "loadMode").includes("mlock") &&
+    ram.usedB + ram.otherB > ramCapacity * 0.9
+  ) {
     notes.push("--mlock with this little free RAM risks the OOM killer.");
   }
 

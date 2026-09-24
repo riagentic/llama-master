@@ -57,7 +57,13 @@ export function ErrorNote(props: { message: string; onDismiss?: () => void }) {
       <span class="error-text">{props.message}</span>
       {props.onDismiss
         ? (
-          <button type="button" class="x" onClick={props.onDismiss}>
+          <button
+            type="button"
+            class="x"
+            t="error-dismiss"
+            aria-label="Dismiss"
+            onClick={props.onDismiss}
+          >
             ✕
           </button>
         )
@@ -131,5 +137,71 @@ export function Waiting() {
       <i class="dot" />
       <span>waiting for the first token…</span>
     </div>
+  );
+}
+
+/**
+ * A text or number box over a REPLICATED cell field, without the round trip
+ * per keystroke.
+ *
+ * Bound directly (`value={cell.x}` + a dispatch on every `input`), each key is
+ * a dispatch, and anything that re-renders the box meanwhile — a 1 s poll, a
+ * streamed reply's flush — writes back the value the cell last acknowledged,
+ * wiping keys still in flight. So the text is local while it is being edited
+ * and the cell sees ONE write on `change` (blur, or Enter), the same rule as
+ * llama.master's own `DraftInput` (`src/ui/kit.tsx` there; copied, not
+ * imported, because the two apps share only `src/lib`).
+ *
+ * `onEnter` commits first and acts once that write has LANDED, because
+ * `keydown` fires BEFORE the `change` that would have committed — an
+ * Enter-to-connect that read the cell would connect to the previous address.
+ * So `onCommit` returns its dispatch, and `onEnter` waits on it.
+ */
+export function DraftInput(props: {
+  type: "text" | "number";
+  value: string;
+  onCommit: (value: string) => unknown;
+  onEnter?: () => void;
+  ariaLabel: string;
+  class?: string;
+  placeholder?: string;
+  min?: number | string;
+  max?: number | string;
+  t?: string;
+}) {
+  // null = not editing: show the cell's value. A string = the user's, verbatim.
+  const [draft, setDraft] = useLocal<string | null>(null);
+  // What this box last handed the cell, so the `change` that follows an
+  // Enter-commit is not a second, identical write.
+  const sent = useRef<string | null>(null);
+  const commit = (v: string): unknown => {
+    setDraft(null);
+    if (v === props.value || v === sent.current) return undefined;
+    sent.current = v;
+    return props.onCommit(v);
+  };
+  return (
+    <input
+      type={props.type}
+      class={props.class}
+      aria-label={props.ariaLabel}
+      placeholder={props.placeholder}
+      min={props.min}
+      max={props.max}
+      t={props.t}
+      value={draft ?? props.value}
+      onInput={(e) => {
+        sent.current = null;
+        setDraft((e.currentTarget as HTMLInputElement).value);
+      }}
+      onChange={(e) => commit((e.currentTarget as HTMLInputElement).value)}
+      onKeyDown={(e) => {
+        if ((e as KeyboardEvent).key !== "Enter" || !props.onEnter) return;
+        const onEnter = props.onEnter;
+        void Promise.resolve(
+          commit((e.currentTarget as HTMLInputElement).value),
+        ).then(() => onEnter());
+      }}
+    />
   );
 }

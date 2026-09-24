@@ -10,7 +10,7 @@ import { QuantAdvice } from "./QuantAdvice.tsx";
 import { cfg } from "../cell/cfg.ts";
 import { plan as computePlan } from "../lib/plan.ts";
 import { bytes, shortPath, stamp } from "../lib/format.ts";
-import { runModel, selectModel } from "./actions.ts";
+import { LOCK_REASON, runLocked, runModel, selectModel } from "./actions.ts";
 import { Bar, Empty, ErrorNote, KV, Panel, Pill } from "./kit.tsx";
 import { MemoryPlan } from "./Memory.tsx";
 import {
@@ -134,6 +134,10 @@ function Details() {
 export function ModelsPanel() {
   const list = visibleModels();
   const p = models.progress;
+  // One model runs at a time: while it does, neither selecting another nor
+  // Run may happen from here — the all-in-one picker is locked for the same
+  // reason, and this table was the way around it.
+  const locked = runLocked();
   return (
     <div class="tab-body">
       <ErrorNote message={models.lastError} />
@@ -211,13 +215,17 @@ export function ModelsPanel() {
                     <tr
                       key={m.path}
                       class={m.path === models.selected ? "row-active" : ""}
-                      onClick={() => selectModel(m.path)}
+                      title={locked ? LOCK_REASON : undefined}
+                      onClick={() => {
+                        if (!locked) selectModel(m.path);
+                      }}
                     >
                       <td class="c-icon">
                         <input
                           type="radio"
                           aria-label={`Select ${m.file}`}
                           checked={m.path === models.selected}
+                          disabled={locked}
                           onChange={() => selectModel(m.path)}
                         />
                       </td>
@@ -246,10 +254,14 @@ export function ModelsPanel() {
                         <button
                           type="button"
                           class="btn tiny primary"
-                          title="Select, tune for this machine, and start the server"
+                          t={`run-${m.file}`}
+                          disabled={locked}
+                          title={locked
+                            ? LOCK_REASON
+                            : "Select, tune for this machine, and start the server"}
                           onClick={(e) => {
                             e.stopPropagation();
-                            runModel(m.path);
+                            void runModel(m.path);
                           }}
                         >
                           Run

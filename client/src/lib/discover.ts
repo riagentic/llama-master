@@ -130,3 +130,80 @@ export function candidates(
   }
   return out;
 }
+
+/**
+ * Which SERVER a sweep answer is, as opposed to which address it came from.
+ *
+ * `candidates` probes 127.0.0.1 and then every address this machine owns —
+ * the LAN address, and on a workstation every docker/libvirt bridge too — so a
+ * llama-server bound to 0.0.0.0 on this box answers once per address. Counted
+ * as that many servers, the list read "3 servers" for one, the single-answer
+ * auto-connect never fired, and the sweep's early stop was spent on echoes.
+ * So every address of THIS machine collapses to one host, "self", and the
+ * port plus the server's own identity (its `/props` model path) finish the
+ * key. The identity is what keeps two genuinely different servers apart when
+ * both happen to be local.
+ */
+export function hitKey(
+  url: string,
+  own: readonly string[],
+  identity = "",
+): string {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return url;
+  }
+  const host = u.hostname;
+  const self = host === "localhost" || host.startsWith("127.") ||
+    own.includes(host);
+  return `${self ? "self" : host}:${u.port}|${identity}`;
+}
+
+/** Hits with this machine's echoes removed, first answer kept — and the input
+ *  is in `candidates` order, which puts 127.0.0.1 ahead of every other address
+ *  of the same box. */
+export function dedupeHits<T extends { url: string }>(
+  hits: readonly T[],
+  own: readonly string[],
+  identity: (h: T) => string = () => "",
+): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const h of hits) {
+    const k = hitKey(h.url, own, identity(h));
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(h);
+  }
+  return out;
+}
+
+/**
+ * What a finished sweep does to the connection.
+ *
+ * - `leave`: something else — a connect made by hand, a forget — replaced
+ *   "discovering" while the sweep ran; that is the truth now.
+ * - `connect`: exactly one server answered and the user was connected to
+ *   NOTHING, before or since. One answer is not a menu.
+ * - `restore`: put back the status the sweep interrupted. A sweep changes
+ *   which servers are KNOWN, not which one is in use — leaving "discovering"
+ *   behind disabled the chat against a server that was still connected, and
+ *   auto-connecting from a working connection moved the user's conversation to
+ *   whatever answered.
+ */
+export function afterSweep(o: {
+  /** Was a server in use when the sweep started? */
+  wasConnected: boolean;
+  /** The connection's URL now, after the sweep's awaits. */
+  urlNow: string;
+  /** Is the status still the sweep's own "discovering"? */
+  stillDiscovering: boolean;
+  found: readonly { url: string }[];
+}): "leave" | "restore" | { connect: string } {
+  if (!o.stillDiscovering) return "leave";
+  const only = o.found.length === 1 ? o.found[0] : undefined;
+  if (only && !o.wasConnected && !o.urlNow) return { connect: only.url };
+  return "restore";
+}

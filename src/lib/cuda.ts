@@ -36,6 +36,42 @@ const MAX_ARCH: [number, number][] = [
   [13.0, 121],
 ];
 
+/** OLDEST compute capability each CUDA release can still emit code for.
+ *
+ *  The floor moves too, and a card under it is not a PTX case: nvcc cannot
+ *  emit `compute_XX` for it any more than `sm_XX`, so there is nothing for the
+ *  driver to JIT. CUDA 11.0 removed Kepler's sm_30, 12.0 the rest of Kepler
+ *  (sm_35/37), and 13.0 Maxwell, Pascal and Volta (sm_50..sm_72) — "offline
+ *  compilation and library support removed" in its release notes. Verified
+ *  against `nvcc --list-gpu-arch`: 12.0 starts at compute_50, 13.3 at
+ *  compute_75. */
+const MIN_ARCH: [number, number][] = [
+  // [CUDA version, min compute capability × 10]
+  [11.0, 35],
+  [12.0, 50],
+  [13.0, 75],
+];
+
+/** The oldest architecture this CUDA release can target, or 0 if unknown. */
+export function minArchFor(cudaVersion: number): number {
+  if (!(cudaVersion > 0)) return 0;
+  let floor = 0;
+  for (const [ver, arch] of MIN_ARCH) {
+    if (cudaVersion >= ver) floor = arch;
+  }
+  return floor;
+}
+
+/** The first CUDA release that can NO LONGER target `cap`, or null when every
+ *  release in the table still can. */
+export function cudaDroppedCap(cap: number): number | null {
+  const arch = Math.round(cap * 10);
+  for (const [ver, min] of MIN_ARCH) {
+    if (arch < min) return ver;
+  }
+  return null;
+}
+
 /** Compute capability an architecture number refers to: 90 → 9.0. */
 const archToCap = (arch: number): number => arch / 10;
 
@@ -115,6 +151,30 @@ export function cudaPlan(
     };
   }
 
+  // Too OLD for this toolkit, before anything else: no architecture flag
+  // rescues it, and letting cmake find out costs minutes and ends in
+  // `nvcc fatal: Unsupported gpu architecture 'compute_61'`.
+  const min = minArchFor(cuda);
+  const tooOld = caps.filter((c) => Math.round(c * 10) < min);
+  if (tooOld.length > 0) {
+    const oldest = Math.min(...tooOld);
+    const dropped = cudaDroppedCap(oldest);
+    return {
+      mode: "impossible",
+      architectures: "",
+      reason: `CUDA ${cuda} cannot build for sm_${
+        Math.round(oldest * 10)
+      } — its oldest target is sm_${min}. NVIDIA removed support for this GPU${
+        dropped ? ` in CUDA ${dropped.toFixed(1)}` : ""
+      }, and a PTX build does not help: there is no PTX for it either.`,
+      remedy: dropped
+        ? `Build with a CUDA release older than ${
+          dropped.toFixed(1)
+        }, or use the Vulkan backend.`
+        : "Use the Vulkan backend.",
+    };
+  }
+
   const maxCap = archToCap(max);
   const tooNew = caps.filter((c) => c > maxCap);
 
@@ -179,7 +239,12 @@ export function cudaUpgradeFor(
   const newestCap = Math.max(...caps);
   if (newestCap <= archToCap(max)) return null;
   const need = cudaVersionForCap(newestCap);
-  return need === null ? null : { need, have, newestCap };
+  if (need === null) return null;
+  // Never offer a toolkit that would lose an OLDER card on the same machine:
+  // a Blackwell beside a Pascal needs a release that still builds for both.
+  const oldest = Math.round(Math.min(...caps) * 10);
+  if (oldest < minArchFor(need)) return null;
+  return { need, have, newestCap };
 }
 
 /**

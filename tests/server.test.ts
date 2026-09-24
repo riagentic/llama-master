@@ -181,6 +181,59 @@ Deno.test({
 
 Deno.test({
   name:
+    "builds: a rebuild that fails its checks keeps the build it would have replaced",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const b = await import("../src/cell/builds.server.ts");
+    const dest = join(paths().builds, "release-b1-cpu");
+    const stage = async (script: string) => {
+      const dir = `${dest}.partial`;
+      await Deno.mkdir(join(dir, "bin"), { recursive: true });
+      const bin = join(dir, "bin", "llama-server");
+      await Deno.writeTextFile(bin, `#!/bin/sh\n${script}\n`);
+      await Deno.chmod(bin, 0o755);
+      return dir;
+    };
+    const base = (dir: string) => ({
+      id: "release-b1-cpu",
+      ref: "b1",
+      origin: "release" as const,
+      backend: "cpu" as const,
+      dir,
+    });
+
+    const good = await stage("echo version: 1");
+    const first = await b.commitBuild(base(good), dest);
+    assertEquals(first.dir, dest);
+    assertEquals(first.serverBin, join(dest, "bin", "llama-server"));
+
+    // The replacement cannot execute: it must be refused, cleaned up, and the
+    // installed build must still be listed exactly as it was.
+    const bad = await stage("exit 127");
+    await assertRejects(
+      () => b.commitBuild(base(bad), dest),
+      Error,
+      "will not execute",
+    );
+    const listed = (await b.listBuilds()).find((x) => x.id === first.id);
+    assertEquals(listed?.createdAt, first.createdAt);
+    assertEquals(listed?.serverBin, first.serverBin);
+    await assertRejects(() => Deno.stat(bad), Deno.errors.NotFound);
+
+    // A Cancel that lands after the checks keeps the installed build too.
+    const late = await stage("echo version: 2");
+    const ac = new AbortController();
+    ac.abort();
+    await assertRejects(() => b.commitBuild(base(late), dest, ac.signal));
+    const still = (await b.listBuilds()).find((x) => x.id === first.id);
+    assertEquals(still?.createdAt, first.createdAt);
+    await b.removeBuild(first.id);
+  },
+});
+
+Deno.test({
+  name:
     "builds: removeBuild takes a direct child of the builds root and nothing else",
   sanitizeOps: false,
   sanitizeResources: false,

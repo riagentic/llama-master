@@ -111,6 +111,12 @@ export const chat = cell("chat", {
       s.streaming = false;
     },
 
+    /** The ✕ on the error note — which shows this cell's error as well as
+     *  `conn`'s, so dismissing it must clear both. */
+    clearError(s) {
+      s.lastError = "";
+    },
+
     /**
      * The composer's one gesture: hold this message, or send it.
      *
@@ -324,16 +330,20 @@ async function turn(
       // The signal is the authority either way.
       outcome = s.$signal?.aborted ? "cancelled" : "done";
     } catch (e) {
+      // What arrived is kept however the stream was cut — Stop, shutdown, or
+      // the far end going away. On a LAN the last is the common one, and
+      // throwing away half an answer because the network dropped under it
+      // makes the user ask again for text they had already been shown.
+      if (acc || think) {
+        s.messages.push({
+          role: "assistant",
+          content: acc,
+          ...(think ? { thinking: think } : {}),
+          ...(tps ? { tps } : {}),
+        });
+      }
       if (s.$signal?.aborted) {
         outcome = "cancelled";
-        if (acc || think) {
-          s.messages.push({
-            role: "assistant",
-            content: acc,
-            ...(think ? { thinking: think } : {}),
-            ...(tps ? { tps } : {}),
-          });
-        }
       } else {
         // Never a raw error: what the user can do about it is part of it.
         const msg = String(e);

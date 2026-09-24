@@ -22,7 +22,7 @@
     "aio/am": "../dep/aio/src/am.ts",
     "@std/assert": "jsr:@std/assert@^1",
     "@std/path": "jsr:@std/path@^1",
-    "electron": "npm:electron@^41",
+    "electron": "npm:electron@44.4.1",
     "esbuild": "npm:esbuild@^0.24",
     "happy-dom": "npm:happy-dom@^17",
     "immer": "npm:immer@^10"

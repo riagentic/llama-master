@@ -6,7 +6,7 @@
 // decision it makes lives in `src/lib/`.
 
 import type { Iface } from "../lib/discover.ts";
-import { candidates } from "../lib/discover.ts";
+import { candidates, dedupeHits } from "../lib/discover.ts";
 
 /** This machine's IPv4 addresses. `Deno.networkInterfaces` is the whole of it —
  *  no shelling out, no parsing `ip addr`. */
@@ -107,35 +107,51 @@ export async function json(
  *  staying inside every default ulimit. */
 const IN_FLIGHT = 64;
 
+type Hit = { url: string; props: Record<string, unknown> };
+
+/** A server's own identity, for telling this machine's echoes of ONE server
+ *  from two servers (`dedupeHits`). */
+const identity = (h: Hit): string => String(h.props.model_path ?? "");
+
 /**
- * Sweep for servers, newest answer first, reporting progress as it goes.
+ * Sweep for servers, in candidate order, reporting progress as it goes.
  *
- * Stops early once `stopAfter` servers have answered: the common case is one
- * llama.master on the subnet, and continuing to knock on 900 more doors after
- * finding it is time the user spends watching a spinner.
+ * Stops early once `stopAfter` DISTINCT servers have answered: the common case
+ * is one llama.master on the subnet, and continuing to knock on 900 more doors
+ * after finding it is time the user spends watching a spinner. Distinct,
+ * because this machine answers once per address it owns (`dedupeHits`) — and
+ * the answers are ordered by candidate before de-duplicating, so 127.0.0.1 is
+ * the one kept however the probes happened to finish.
  */
 export async function sweep(
   ifaces: readonly Iface[],
   onProgress: (done: number, total: number, found: number) => void,
   stopAfter = 4,
   timeoutMs = 700,
-): Promise<{ url: string; props: Record<string, unknown> }[]> {
+): Promise<Hit[]> {
   const urls = candidates(ifaces);
-  const found: { url: string; props: Record<string, unknown> }[] = [];
+  const own = ifaces.map((i) => i.address);
+  const found: (Hit & { at: number })[] = [];
+  let distinct: Hit[] = [];
   let done = 0;
   let next = 0;
   const worker = async () => {
-    while (next < urls.length && found.length < stopAfter) {
-      const url = urls[next++];
+    while (next < urls.length && distinct.length < stopAfter) {
+      const at = next++;
+      const url = urls[at];
       if (!url) break;
       const props = await probe(url, timeoutMs);
       done++;
-      if (props) found.push({ url, props });
-      onProgress(done, urls.length, found.length);
+      if (props) {
+        found.push({ url, props, at });
+        found.sort((a, b) => a.at - b.at);
+        distinct = dedupeHits(found, own, identity);
+      }
+      onProgress(done, urls.length, distinct.length);
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(IN_FLIGHT, urls.length) }, worker),
   );
-  return found;
+  return distinct.map(({ url, props }) => ({ url, props }));
 }

@@ -206,6 +206,89 @@ Deno.test("chat: a server that vanishes mid-conversation explains itself", async
   assertEquals(chat.messages[0]?.content, "are you there");
 });
 
+/** The far end dropping mid-answer is an ERROR, not a Stop — and on a LAN the
+ *  commonest one. What had already arrived was on screen; throwing it away
+ *  with the connection makes the user ask again for text they had seen. */
+Deno.test("chat: a reply cut by the network keeps what arrived, and says so", async () => {
+  const stub = stubServer({ reply: ["half ", "an ", "answer"], dropAfter: 2 });
+  using _boot = await bootCells([chat]);
+  try {
+    await chat.clear();
+    await chat.send(stub.url, "go");
+    assertEquals(chat.streaming, false);
+    assertEquals(
+      chat.messages.length,
+      2,
+      "the question and the partial answer",
+    );
+    assertEquals(chat.messages[1]?.content, "half an ");
+    assert(chat.lastError.length > 0, "and the cut is reported, not hidden");
+    await chat.clearError();
+    assertEquals(chat.lastError, "", "the ✕ on the note can clear it");
+  } finally {
+    await stub.close();
+  }
+});
+
+/** A connect that is still waiting on a slow address must not land its answer
+ *  after the user has moved on to another one. */
+Deno.test("conn: a superseded connect writes nothing under the new address", async () => {
+  const slow = stubServer({ model: "/m/slow.gguf", lag: { "/props": 400 } });
+  const fast = stubServer({ model: "/m/fast.gguf" });
+  using _boot = await bootCells([conn]);
+  try {
+    await conn.forget();
+    const first = conn.connect(slow.url);
+    await new Promise((r) => setTimeout(r, 50)); // the slow probe is in the air
+    await conn.connect(fast.url);
+    await first;
+    assertEquals(conn.url, fast.url);
+    assertEquals(conn.info?.model, "fast.gguf");
+    assertEquals(conn.port, fast.port, "the fields describe the new server");
+    assertEquals(conn.status, "connected");
+  } finally {
+    await slow.close();
+    await fast.close();
+  }
+});
+
+/** The same for the 1 s poll: a sample of the OLD server that finishes after
+ *  a switch must not overwrite the new one's reading. */
+Deno.test("conn: a poll of the previous server writes nothing after a switch", async () => {
+  const old = stubServer({ model: "/m/old.gguf" });
+  const next = stubServer({ model: "/m/next.gguf", health: "loading model" });
+  using _boot = await bootCells([conn]);
+  try {
+    await conn.forget();
+    await conn.connect(old.url);
+    // Slow only from here on, so the connect above was quick.
+    const slowOld = stubServer({
+      model: "/m/old.gguf",
+      lag: { "/health": 400 },
+    });
+    try {
+      await conn.connect(slowOld.url);
+      const stale = conn.poll();
+      await new Promise((r) => setTimeout(r, 50)); // its /health is in the air
+      await conn.connect(next.url);
+      await stale;
+      assertEquals(conn.url, next.url);
+      assertEquals(conn.info?.model, "next.gguf");
+      assertEquals(
+        conn.ready,
+        false,
+        "the old server's healthy reading did not land on the new one",
+      );
+      assertEquals(conn.healthDetail, "", "nor its health detail");
+    } finally {
+      await slowOld.close();
+    }
+  } finally {
+    await old.close();
+    await next.close();
+  }
+});
+
 Deno.test("chat: clear wipes the conversation and the numbers with it", async () => {
   const stub = stubServer();
   using _boot = await bootCells([chat]);
@@ -239,7 +322,13 @@ testCell(
     t.expect.state((s) => s.host === "");
     // deno-lint-ignore no-explicit-any
     t.send.setPort("not a port" as any);
-    t.expect.state((s) => s.port === 0);
+    // Refused, not zeroed: 0 is not a port, and a cleared box writing it once
+    // turned the next Connect into a request to :80.
+    t.expect.state((s) => s.port === 18080, "the previous port stands");
+    t.send.setPort(0);
+    t.send.setPort(70000);
+    t.send.setPort(80.5);
+    t.expect.state((s) => s.port === 18080, "nor any other non-port");
     t.send.setHost("192.168.1.9");
     t.send.setPort(8080);
     t.expect.state((s) => s.host === "192.168.1.9" && s.port === 8080);
@@ -351,4 +440,23 @@ testCell(chat, "an idle submit is the request itself", async (t) => {
   t.expect.state((s) => s.queue.length === 0);
   t.expect.state((s) => s.messages[0]?.content === "go");
   await stub.close();
+});
+
+/** aio counts a method's declared parameters against what a dispatch passed,
+ *  and TypeScript's `?` is erased — so `connect(s, url?: string)` called bare
+ *  (the Connect button) was a "short call" warned about on every boot. An
+ *  optional parameter takes a default in the signature. */
+Deno.test("cells: no method parameter is optional by `?` alone", async () => {
+  const dir = new URL("../src/cell/", import.meta.url);
+  const offenders: string[] = [];
+  for await (const e of Deno.readDir(dir)) {
+    if (!e.name.endsWith(".ts") || e.name.endsWith(".server.ts")) continue;
+    const src = await Deno.readTextFile(new URL(e.name, dir));
+    src.split("\n").forEach((line, i) => {
+      if (/^\s*(async\s+)?\w+\(\s*s\b[^)]*\w\?:/.test(line)) {
+        offenders.push(`${e.name}:${i + 1}: ${line.trim()}`);
+      }
+    });
+  }
+  assertEquals(offenders, []);
 });

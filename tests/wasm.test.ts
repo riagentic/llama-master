@@ -232,6 +232,24 @@ Deno.test("models: a split model missing a part is an error, not a smaller model
   }
 });
 
+Deno.test("models: an unreadable folder beside a model does not hide the model", async () => {
+  // A models disk carries a root-owned `lost+found`. `Deno.readDir` throws
+  // lazily — from the first `next()`, not the call — so a guard around the call
+  // alone let that one directory abort the whole scan and list nothing.
+  const dir = await Deno.makeTempDir({ prefix: "llama-master-test-" });
+  const locked = join(dir, "lost+found");
+  try {
+    await Deno.writeFile(join(dir, "tiny-moe.gguf"), moeGguf());
+    await Deno.mkdir(locked, { mode: 0o000 });
+    await Deno.chmod(locked, 0o000);
+    const list = await scan([dir], () => {});
+    assertEquals(list.map((m) => m.file), ["tiny-moe.gguf"]);
+  } finally {
+    await Deno.chmod(locked, 0o700);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test("hw: this machine reports a coherent snapshot", async () => {
   const s = await snapshot();
   // Every field is best-effort, but the shape and the invariants are not.

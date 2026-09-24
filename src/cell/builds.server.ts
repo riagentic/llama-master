@@ -13,7 +13,7 @@
 // prerequisite list, downloads ~20x less, and a specific tag is exactly what a
 // user asking for "b6234" means.
 
-import { basename, dirname, join, resolve } from "@std/path";
+import { basename, dirname, join, relative, resolve } from "@std/path";
 import type { Asset } from "../lib/assets.ts";
 import { availableBackends, companionAsset, pickAsset } from "../lib/assets.ts";
 import { progressOf } from "../lib/buildlog.ts";
@@ -418,9 +418,10 @@ export async function installRelease(
   );
 
   const id = buildId("release", tag, opts.backend);
-  const dir = join(paths().builds, id);
-  await Deno.remove(dir, { recursive: true }).catch(() => {});
-  await ensureDir(dir);
+  const dest = join(paths().builds, id);
+  // Staged beside its final name: the installed build of this id keeps
+  // working until the new one has PROVED it runs (`promote`).
+  const dir = await freshStaging(dest);
   p(2, null, [`Extracting into ${dir}`]);
   const n = await extract(
     bytes,
@@ -456,13 +457,17 @@ export async function installRelease(
   }
 
   p(3, null, [`${n} files extracted, checking binaries`]);
-  const build = await finalize({
-    id,
-    ref: tag,
-    origin: "release",
-    backend: opts.backend,
-    dir,
-  });
+  const build = await commitBuild(
+    {
+      id,
+      ref: tag,
+      origin: "release",
+      backend: opts.backend,
+      dir,
+    },
+    dest,
+    opts.signal,
+  );
   p(3, 1, [`${BIN_SERVER} ready at ${build.serverBin}`]);
   return build;
 }
@@ -760,10 +765,11 @@ export async function detectCudaPlan(): Promise<
   // build for these cards, and leaving cmake to find it first would make the
   // prerequisite's Fix button do nothing visible.
   const { managedCuda } = await import("./prereq.server.ts");
+  const { nvidiaSmi } = await import("./hw.server.ts");
   const own = await managedCuda();
   const [nvcc, smi] = await Promise.all([
-    exec(own?.nvcc ?? "nvcc", ["--version"]),
-    exec("nvidia-smi", ["--query-gpu=compute_cap", "--format=csv,noheader"]),
+    exec(own?.nvcc ?? "nvcc", ["--version"], { timeoutMs: 10_000 }),
+    nvidiaSmi(["--query-gpu=compute_cap", "--format=csv,noheader"]),
   ]);
   const caps = smi.code === 0
     ? smi.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => n > 0)
@@ -930,7 +936,9 @@ export async function buildFromSource(
     ]);
   }
 
-  // 2 — configure.
+  // 2 — configure. Nothing before this point kills a process, so a Cancel
+  // pressed during extraction or toolchain detection is honoured here.
+  opts.signal?.throwIfAborted();
   const buildDir = join(srcDir, `build-${opts.backend}`);
   await ensureDir(buildDir);
   const configureArgs = [
@@ -1007,11 +1015,15 @@ export async function buildFromSource(
   );
   if (code !== 0) throw new Error(`build failed (exit ${code})`);
 
-  // 4 — install into the durable builds directory.
+  // 4 — install into the durable builds directory. A Cancel that lands after
+  // the compile must not replace the installed build it was meant to keep.
+  opts.signal?.throwIfAborted();
   const id = buildId("source", opts.ref, opts.backend);
   const dest = join(paths().builds, id);
-  await Deno.remove(dest, { recursive: true }).catch(() => {});
-  await ensureDir(join(dest, "bin"));
+  // Staged, like a release: a build that fails its checks below must not
+  // have cost the user the working build of the same id.
+  const staging = await freshStaging(dest);
+  await ensureDir(join(staging, "bin"));
   p(3, null, [`Installing to ${dest}`]);
   const binSrc = join(buildDir, "bin");
   let copied = 0;
@@ -1021,7 +1033,7 @@ export async function buildFromSource(
     // (`libllama.so.0` → `libllama.so.0.24.0`), which are what the loader
     // actually asks for. Skipping them (`isFile` is false for a link) left
     // every build resolving those names from the source cache instead.
-    const to = join(dest, "bin", e.name);
+    const to = join(staging, "bin", e.name);
     if (e.isSymlink) {
       await Deno.symlink(await Deno.readLink(join(binSrc, e.name)), to);
     } else if (e.isFile) {
@@ -1031,21 +1043,27 @@ export async function buildFromSource(
   }
   p(3, 0.9, [`${copied} files installed`]);
 
-  const build = await finalize({
-    id,
-    ref: opts.ref,
-    origin: "source",
-    backend: opts.backend,
-    dir: dest,
-    // A tag identifies itself; a moving ref does not, so record what it was.
-    // For a pull request this is the master it was merged INTO, which is the
-    // half of "master + PR #27754" that the name cannot carry.
-    // For a fork it is the FORK's commit: upstream master's sha would be a
-    // fact about a tree that was never compiled.
-    sourceSha: refMoves(src) ? await movingSha(opts.ref).catch(() => "") : "",
-    // A build that behaves differently must say why.
-    ...(opts.schedCap && opts.schedCap > 0 ? { schedCap: opts.schedCap } : {}),
-  });
+  const build = await commitBuild(
+    {
+      id,
+      ref: opts.ref,
+      origin: "source",
+      backend: opts.backend,
+      dir: staging,
+      // A tag identifies itself; a moving ref does not, so record what it was.
+      // For a pull request this is the master it was merged INTO, which is the
+      // half of "master + PR #27754" that the name cannot carry.
+      // For a fork it is the FORK's commit: upstream master's sha would be a
+      // fact about a tree that was never compiled.
+      sourceSha: refMoves(src) ? await movingSha(opts.ref).catch(() => "") : "",
+      // A build that behaves differently must say why.
+      ...(opts.schedCap && opts.schedCap > 0
+        ? { schedCap: opts.schedCap }
+        : {}),
+    },
+    dest,
+    opts.signal,
+  );
   p(3, 1, [`${BIN_SERVER} ready at ${build.serverBin}`]);
   return build;
 }
@@ -1095,7 +1113,70 @@ async function runStreaming(
 }
 
 /** Locate the binaries, make them executable, write the metadata file. */
+/** An empty staging directory for `dest`, cleared of any earlier attempt. It
+ *  carries no metadata until `promote`, so `listBuilds` never lists it. */
+async function freshStaging(dest: string): Promise<string> {
+  const staging = `${dest}.partial`;
+  await Deno.remove(staging, { recursive: true }).catch(() => {});
+  await ensureDir(staging);
+  return staging;
+}
+
+/**
+ * Swap a staged build that passed `finalize` in over the installed one.
+ *
+ * The metadata is written LAST, at the final path: a directory without it is
+ * a half-finished install that `listBuilds` skips, so a crash at any point
+ * leaves either the old build or the new one — never a refused binary listed
+ * as installed. `$ORIGIN` RUNPATHs are relative, so the rename moves nothing
+ * the loader depends on.
+ */
+async function promote(staged: Build, dest: string): Promise<Build> {
+  await Deno.remove(dest, { recursive: true }).catch(() => {});
+  await Deno.rename(staged.dir, dest);
+  const moved = (p: string) => p && join(dest, relative(staged.dir, p));
+  const build: Build = {
+    ...staged,
+    dir: dest,
+    serverBin: moved(staged.serverBin),
+    cliBin: moved(staged.cliBin),
+  };
+  await writeMeta(dest, build);
+  return build;
+}
+
+/** Check the install staged at `base.dir` and, only if it runs, put it at
+ *  `dest` in place of whatever build of that id was there. A Cancel that
+ *  lands before the swap keeps the installed build. */
+export async function commitBuild(
+  base: Omit<Build, "serverBin" | "cliBin" | "createdAt" | "sizeB">,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<Build> {
+  const staged = await finalize(base);
+  if (signal?.aborted) {
+    await Deno.remove(base.dir, { recursive: true }).catch(() => {});
+    signal.throwIfAborted();
+  }
+  return await promote(staged, dest);
+}
+
+/** Check a staged install actually runs, and describe it. Throws on a build
+ *  that cannot start, removing it; writes no metadata. */
 async function finalize(
+  base: Omit<Build, "serverBin" | "cliBin" | "createdAt" | "sizeB">,
+): Promise<Build> {
+  try {
+    return await checkStaged(base);
+  } catch (e) {
+    // A refused build is not kept: the installed one is still in place, and
+    // hundreds of MB of binaries that cannot run are nobody's backup.
+    await Deno.remove(base.dir, { recursive: true }).catch(() => {});
+    throw e;
+  }
+}
+
+async function checkStaged(
   base: Omit<Build, "serverBin" | "cliBin" | "createdAt" | "sizeB">,
 ): Promise<Build> {
   const serverBin = await findBinary(base.dir, BIN_SERVER);
@@ -1114,7 +1195,6 @@ async function finalize(
     createdAt: Date.now(),
     sizeB: await dirSize(base.dir),
   };
-  await writeMeta(base.dir, build);
 
   // Prove it runs. A binary that cannot start (missing CUDA runtime, wrong
   // glibc) must fail here, not two clicks later when the user hits Start.

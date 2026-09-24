@@ -79,18 +79,31 @@ function isProjector(file: string): boolean {
   return /^mmproj[-.]/i.test(file);
 }
 
+/**
+ * A directory's entries, or as many as could be read. Unreadable or missing is
+ * not an error, just nothing here — a root-owned `lost+found` on a models disk,
+ * another user's ollama store.
+ *
+ * The iteration is inside the `try`, not only the call: `Deno.readDir` returns
+ * lazily and throws `PermissionDenied` from the first `next()`, so a guard
+ * around the call alone let one such directory abort the whole scan.
+ */
+async function listDir(dir: string): Promise<Deno.DirEntry[]> {
+  const out: Deno.DirEntry[] = [];
+  try {
+    for await (const e of Deno.readDir(dir)) out.push(e);
+  } catch {
+    // Keep what was read before the failure.
+  }
+  return out;
+}
+
 async function* walk(
   dir: string,
   depth: number,
 ): AsyncGenerator<{ path: string; size: number; mtime: number }> {
   if (depth < 0) return;
-  let entries: AsyncIterable<Deno.DirEntry>;
-  try {
-    entries = Deno.readDir(dir);
-  } catch {
-    return; // unreadable or missing — not an error, just nothing here
-  }
-  for await (const e of entries) {
+  for (const e of await listDir(dir)) {
     if (e.name.startsWith(".")) continue;
     const p = join(dir, e.name);
     if (e.isDirectory) {
@@ -128,13 +141,7 @@ async function walkOllama(
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth < 0) return;
-    let entries: AsyncIterable<Deno.DirEntry>;
-    try {
-      entries = Deno.readDir(dir);
-    } catch {
-      return; // unreadable (another user's store) — not an error
-    }
-    for await (const e of entries) {
+    for (const e of await listDir(dir)) {
       const p = join(dir, e.name);
       if (e.isDirectory) {
         await walk(p, depth - 1);
@@ -219,7 +226,14 @@ export async function readMeta(
       return { meta: null, error: `cannot read: ${e}` };
     }
 
-    const r = await gguf(head);
+    let r: Awaited<ReturnType<typeof gguf>>;
+    try {
+      r = await gguf(head);
+    } catch (e) {
+      // A header hostile enough to trap the parser is THIS file's problem:
+      // one bad download must not take every other model off the list.
+      return { meta: null, error: `unreadable header: ${e}` };
+    }
     if (r.ok) return { meta: r.json as unknown as ModelMeta, error: null };
     if (r.truncated === null) return { meta: null, error: r.error };
     // The parser wanted more than the file HAS: it is the file that ends

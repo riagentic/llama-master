@@ -344,9 +344,16 @@ export function Dashboard() {
           value={hw.paused ? "paused" : "1 s"}
           tone={hw.paused ? "warn" : "ok"}
         />
+        {
+          /* Measured from when this window loaded (`performance.timeOrigin`),
+             and labelled as that. It read `cpuHistory.length × 1 s`, which is
+             a rolling 60-sample window — every session was "1m" old forever
+             after its first minute. The page re-renders on every sample, so
+             the figure moves with the clock. */
+        }
         <Stat
-          label="Uptime of app"
-          value={duration(hw.cpuHistory.length * 1000)}
+          label="Window open"
+          value={duration(Math.max(0, Date.now() - performance.timeOrigin))}
         />
         <div class="dash-actions">
           <button

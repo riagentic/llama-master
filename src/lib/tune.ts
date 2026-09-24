@@ -23,7 +23,8 @@
 // costs before choosing.
 
 import { plan } from "./plan.ts";
-import type { MtpSibling } from "./mtp.ts";
+import { isMtpName, type MtpSibling } from "./mtp.ts";
+import { offloadRange } from "./devsplit.ts";
 import { supportsFlag } from "./caps.ts";
 import { reserveLabel, reserveOf } from "./reserve.ts";
 import { defaults, num, str } from "./params.ts";
@@ -470,14 +471,25 @@ function place(
       : minCpuMoe(meta, hw, { ...s, ngl: n, ubatchSize: ubatch }, n) ?? moeMax,
   };
   if (!fitsRam(meta, hw, split)) return null;
-  const movedExperts = Number(split.nCpuMoe) || 0;
+  // Counted the way llama.cpp counts, not read off `-ngl`: that counts the
+  // OUTPUT head as a slot, so `-ngl 30` on a 32-layer model is 29 layers plus
+  // the head — and `--n-cpu-moe` counts from layer 0, so the first of its
+  // layers are ones that never reached the GPU at all. "The routed experts of
+  // 32 of them" about 29 layers on the card was two numbers that could not both
+  // be true (`devsplit.ts:offloadRange`).
+  const off = offloadRange(meta.nLayer, split);
+  const onGpu = Math.max(0, meta.nLayer - off.start);
+  const movedExperts = Math.max(
+    0,
+    Math.min(num(split, "nCpuMoe"), meta.nLayer) - off.start,
+  );
   return {
     settings: split,
     // Name the experts when they moved: on a MoE model that is the decision
     // doing the work, and "30 of 32 layers" alone hides it.
     note: movedExperts > 0
-      ? `${n} of ${meta.nLayer} layers on the GPU, and the routed experts of ${movedExperts} of them in RAM`
-      : `${n} of ${meta.nLayer} layers on the GPU, the rest in RAM`,
+      ? `${onGpu} of ${meta.nLayer} layers on the GPU, and the routed experts of ${movedExperts} of them in RAM`
+      : `${onGpu} of ${meta.nLayer} layers on the GPU, the rest in RAM`,
   };
 }
 
@@ -698,7 +710,19 @@ export function tune(
   const sibUsable = sib !== null && sib.sizeB > 0 &&
     sib.sizeB <= MTP_SIBLING_MAX_B;
   s.specType = meta.nextnLayers > 0 || sibUsable ? "draft-mtp" : "";
-  if (sibUsable && sib) s.draftModel = sib.path;
+  // Written on every run, never only when a drafter is found. The settings
+  // this starts from are the LAST model's, so "set it when there is one" left
+  // the previous model's drafter attached to the next: a Gemma head drafting
+  // for a Qwen, whose vocabularies differ, so every draft is rejected — a
+  // silent slowdown — on VRAM the plan does not bill. A draft model the USER
+  // chose is not the tuner's to take away, and it can tell the two apart: the
+  // only ones it ever attaches are MTP-named siblings (`mtp.ts:isMtpName`).
+  const prevDraft = str(s, "draftModel");
+  s.draftModel = sibUsable && sib
+    ? sib.path
+    : isMtpName(prevDraft.split(/[\\/]/).pop() ?? "")
+    ? ""
+    : prevDraft;
   if (meta.nextnLayers > 0) {
     reasons.push(
       `Speculative decoding on — this model ships ${meta.nextnLayers} multi-token-prediction block${
@@ -1089,10 +1113,19 @@ function finish(
   // so it is also the one the memory bars are drawing.
   if (p.devices.tensorSplit) {
     s.tensorSplit = p.devices.tensorSplit;
+    const holding = p.devices.bytesB.filter((b) => b > 0).length;
     reasons.push(
-      `Layers split ${
-        p.devices.bytesB.map((b) => gb(b)).join(" / ")
-      } across the cards (-ts ${p.devices.tensorSplit}) — llama.cpp divides them by count, and with the experts held back the last layers are far heavier, so left to itself it would overfill one card.`,
+      holding <= 1
+        // One card doing all of it is still a split to PIN: with no `-ts`
+        // llama.cpp divides by each card's free memory at load time and puts
+        // layers on the other card too — the one whose memory the plan kept
+        // back, for the safety margin or for the user's own reserve.
+        ? `Every offloaded layer on GPU ${
+          Math.max(0, p.devices.bytesB.findIndex((b) => b > 0))
+        } (-ts ${p.devices.tensorSplit}) — pinned, because left to itself llama.cpp would divide the layers by free memory and spend the other card's too, including anything reserved there.`
+        : `Layers split ${
+          p.devices.bytesB.map((b) => gb(b)).join(" / ")
+        } across the cards (-ts ${p.devices.tensorSplit}) — llama.cpp divides them by count, and with the experts held back the last layers are far heavier, so left to itself it would overfill one card.`,
     );
   }
 

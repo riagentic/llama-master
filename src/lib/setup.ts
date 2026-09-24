@@ -205,19 +205,17 @@ export function setupRows(
     tip: "-b / -ub: how many tokens are processed per step during prompt work.",
   });
 
-  // How the weights get into memory — three spellings, one setting.
-  const mlock = bool(s, "mlock");
-  const noMmap = bool(s, "noMmap");
+  // How the weights get into memory — ONE setting, `-lm/--load-mode`. It was
+  // read here as the two booleans that `cfg` version 4 folded into it, which no
+  // longer exist, so every run was described as memory-mapped whatever it did.
+  const mode = str(s, "loadMode") || "auto";
+  const load = LOAD_MODES[mode] ?? LOAD_MODES.auto!;
   rows.push({
     label: "Weights loading",
-    value: mlock
-      ? "locked in RAM (--mlock) — the OS may not page them out"
-      : noMmap
-      ? "copied up front (--no-mmap)"
-      : "memory-mapped — loaded on demand, near-instant warm starts",
-    short: mlock ? "mlock" : noMmap ? "no-mmap" : "mmap",
+    value: load.value,
+    short: load.short,
     tip:
-      "--mlock and --no-mmap set the same llama.cpp load mode, which is why only one is ever shown.",
+      "-lm / --load-mode: one llama.cpp setting. --mlock and --no-mmap were two spellings of it, which is why only one is ever shown.",
   });
 
   const ts = str(s, "tensorSplit").trim();
@@ -245,3 +243,28 @@ export function setupRows(
 
   return rows;
 }
+
+/** What each `--load-mode` value does, in the words the setup table uses. */
+const LOAD_MODES: Record<string, { value: string; short: string }> = {
+  auto: {
+    value: "memory-mapped — loaded on demand, near-instant warm starts",
+    short: "mmap",
+  },
+  mmap: {
+    value: "memory-mapped — loaded on demand, near-instant warm starts",
+    short: "mmap",
+  },
+  none: { value: "copied up front (-lm none)", short: "no-mmap" },
+  mlock: {
+    value: "locked in RAM (-lm mlock) — the OS may not page them out",
+    short: "mlock",
+  },
+  "mmap+mlock": {
+    value: "memory-mapped and locked (-lm mmap+mlock) — never paged out",
+    short: "mmap+mlock",
+  },
+  dio: {
+    value: "read with direct I/O (-lm dio) — bypasses the page cache",
+    short: "dio",
+  },
+};

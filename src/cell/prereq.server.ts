@@ -35,7 +35,8 @@ import {
   manifestUrl,
 } from "../lib/cudaredist.ts";
 import { join } from "@std/path";
-import { disks } from "./hw.server.ts";
+import { disks, nvidiaSmi } from "./hw.server.ts";
+import { quote } from "../lib/command.ts";
 
 /** First line of `--version` output, trimmed — every tool here prints one. */
 function firstLine(s: string): string {
@@ -48,7 +49,9 @@ async function probe(
 ): Promise<{ path: string; version: string } | null> {
   const path = await which(bin);
   if (!path) return null;
-  const r = await exec(path, args);
+  // A ceiling, because a wedged driver tool (nvidia-smi after a suspend is
+  // the known one) would otherwise hang the whole prerequisite scan.
+  const r = await exec(path, args, { timeoutMs: 10_000 });
   if (r.code !== 0 && !r.stdout && !r.stderr) return null;
   return { path, version: firstLine(r.stdout || r.stderr) };
 }
@@ -88,8 +91,9 @@ export function cudaPrefix(version: string): string {
 /**
  * The newest CUDA toolkit this app has installed, if any.
  *
- * Directories only — a half-finished install is removed before it is named, so
- * anything here with an `nvcc` in it is complete.
+ * Directories only, and never a `.partial` staging directory — an install is
+ * renamed to its final name only when every file is in, so anything named
+ * `cuda-<version>` with an `nvcc` in it is complete.
  */
 export async function managedCuda(): Promise<
   { path: string; nvcc: string; version: string } | null
@@ -97,7 +101,10 @@ export async function managedCuda(): Promise<
   let best: { path: string; nvcc: string; version: string } | null = null;
   try {
     for await (const e of Deno.readDir(paths().toolchain)) {
+      // `cuda-<v>.partial` is an install in progress (or one a crash cut
+      // short): it has an `nvcc` long before it has the rest of the toolkit.
       if (!e.isDirectory || !e.name.startsWith("cuda-")) continue;
+      if (e.name.endsWith(".partial")) continue;
       const path = join(paths().toolchain, e.name);
       const nvcc = join(path, "bin", "nvcc");
       if (!(await exists(nvcc))) continue;
@@ -465,9 +472,9 @@ async function resolveCudaFit(
   const version = own?.version ?? nvcc?.version ?? "";
   if (!version) return none;
 
-  const smi = await exec("nvidia-smi", []);
+  const smi = await nvidiaSmi([]);
   if (smi.code !== 0) return none; // no NVIDIA card: nothing to fit
-  const capsOut = await exec("nvidia-smi", [
+  const capsOut = await nvidiaSmi([
     "--query-gpu=compute_cap",
     "--format=csv,noheader",
   ]);
@@ -905,7 +912,10 @@ async function runScript(
   const elev = await elevation();
   if (!elev.ok) {
     onLine(`Cannot run these steps: ${elev.why}. Run them yourself:`);
-    for (const st of plan.steps) onLine(`  sudo bash -c '${st.sh}'`);
+    // POSIX-quoted: a step that itself contains a single quote (the ROCm
+    // repository line does) would otherwise end the string early and print
+    // a command that silently does something else.
+    for (const st of plan.steps) onLine(`  sudo bash -c ${quote(st.sh)}`);
     return { ok: false, message: elev.why };
   }
 

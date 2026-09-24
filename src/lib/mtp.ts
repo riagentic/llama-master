@@ -65,8 +65,13 @@ function stem(file: string): string {
 export function pairKey(file: string): string {
   return stem(file)
     .replace(/(^|[-_. ])mtp([-_. ]|$)/i, "$1")
+    // Every family of label: legacy/K quants (`Q4_K_M`), i-quants (`IQ4_XS`,
+    // `IQ3_XXS`) and ternaries (`TQ1_0`), imatrix tags (`i1`), Unsloth's
+    // dynamic marker (`UD-Q4_K_XL`), and the float and FP4 types. Missing one
+    // is not an edge case: Unsloth publishes almost everything as `UD-…`, and
+    // a model at `IQ4_XS` beside a drafter at `Q8_0` is the ordinary pairing.
     .replace(
-      /[-_. ](?:[QqIi]\d+(?:_[A-Za-z0-9]+)*|f16|bf16|f32|fp16|fp8|mxfp4|nvfp4)(?=[-_. ]|$)/g,
+      /[-_. ](?:[it]?q\d+(?:_[a-z0-9]+)*|i\d+|ud|f16|bf16|f32|fp16|fp8|mxfp4|nvfp4)(?=[-_. ]|$)/gi,
       "",
     )
     .replace(/[-_. ]+/g, "")

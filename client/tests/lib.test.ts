@@ -7,9 +7,12 @@
 
 import { assert, assertEquals } from "@std/assert";
 import {
+  afterSweep,
   baseUrl,
   candidates,
+  dedupeHits,
   hasPort,
+  hitKey,
   isPrivateV4,
   KNOWN_PORTS,
   sweepHosts,
@@ -89,6 +92,107 @@ Deno.test("discover: what the user typed reaches one server, however they typed 
   assert(hasPort("192.168.1.9:8080"));
   assert(!hasPort("192.168.1.9"));
   assertEquals(baseUrl("192.168.1.9:8080"), "http://192.168.1.9:8080");
+});
+
+/** One llama-server bound to 0.0.0.0 answers on 127.0.0.1 AND on every
+ *  address this machine owns — the LAN one and each docker bridge. Counted as
+ *  that many servers, the list said "3 servers", the one-answer auto-connect
+ *  never fired, and the early stop was spent on echoes of this box. */
+Deno.test("discover: this machine's echoes of one server are one server", () => {
+  const own = ["192.168.1.10", "172.17.0.1"];
+  const props = { model: "/m/a.gguf" };
+  const hits = [
+    { url: "http://127.0.0.1:18080", ...props },
+    { url: "http://192.168.1.10:18080", ...props },
+    { url: "http://172.17.0.1:18080", ...props },
+    { url: "http://127.0.0.1:8080", ...props }, // another port: another server
+    { url: "http://192.168.1.20:18080", ...props }, // another machine
+  ];
+  const kept = dedupeHits(hits, own, (h) => h.model);
+  assertEquals(kept.map((h) => h.url), [
+    "http://127.0.0.1:18080",
+    "http://127.0.0.1:8080",
+    "http://192.168.1.20:18080",
+  ], "localhost is the copy kept — it is first in candidate order");
+
+  // Two genuinely different local servers on one port (bound to different
+  // addresses) stay two: identity is part of the key.
+  assertEquals(
+    dedupeHits(
+      [
+        { url: "http://127.0.0.1:18080", model: "a" },
+        { url: "http://172.17.0.1:18080", model: "b" },
+      ],
+      own,
+      (h) => h.model,
+    ).length,
+    2,
+  );
+  assertEquals(
+    hitKey("http://localhost:8080", []),
+    hitKey("http://127.0.0.1:8080", []),
+  );
+  assert(
+    hitKey("http://192.168.1.20:8080", own) !==
+      hitKey("http://192.168.1.10:8080", own),
+  );
+  assertEquals(hitKey("not a url", own), "not a url", "garbage is its own key");
+});
+
+/** A sweep changes which servers are KNOWN, not which one is in use. */
+Deno.test("discover: a sweep puts the connection back the way it found it", () => {
+  const one = [{ url: "http://192.168.1.20:18080" }];
+  // Connected, nothing found: back to connected. Writing "discovering" back
+  // left the chat disabled against a server that was still answering.
+  assertEquals(
+    afterSweep({
+      wasConnected: true,
+      urlNow: "http://a:1",
+      stillDiscovering: true,
+      found: [],
+    }),
+    "restore",
+  );
+  // Connected, one found: a look around, not a switch of server.
+  assertEquals(
+    afterSweep({
+      wasConnected: true,
+      urlNow: "http://a:1",
+      stillDiscovering: true,
+      found: one,
+    }),
+    "restore",
+  );
+  // Connected to nothing, one found: connect — one answer is not a menu.
+  assertEquals(
+    afterSweep({
+      wasConnected: false,
+      urlNow: "",
+      stillDiscovering: true,
+      found: one,
+    }),
+    { connect: "http://192.168.1.20:18080" },
+  );
+  // Two found: a menu.
+  assertEquals(
+    afterSweep({
+      wasConnected: false,
+      urlNow: "",
+      stillDiscovering: true,
+      found: [...one, ...one],
+    }),
+    "restore",
+  );
+  // Something else took over mid-sweep (a connect by hand, a forget): leave it.
+  assertEquals(
+    afterSweep({
+      wasConnected: false,
+      urlNow: "http://b:2",
+      stillDiscovering: false,
+      found: one,
+    }),
+    "leave",
+  );
 });
 
 // ── what the far end says ──────────────────────────────────────────────────

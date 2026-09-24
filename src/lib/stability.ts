@@ -8,7 +8,7 @@
 // Pure, so the warning is computed from the same numbers the bars are drawn
 // from and cannot disagree with them.
 
-import { plan } from "./plan.ts";
+import { effectiveCtx, plan } from "./plan.ts";
 import { bool, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
 
@@ -58,6 +58,38 @@ export function stability(
             (p.vram.overB / GB).toFixed(1)
           } GB more VRAM than the GPUs have. ` +
           `The load will fail or fall back to the CPU mid-model.`,
+      });
+    } else if (!p.devices.fits) {
+      // The pool fits and a CARD does not. A second GPU is not a bigger GPU:
+      // llama.cpp cuts the layers by count, so a split — typed, or pinned by
+      // the tuner for a machine that has since changed — can ask one card for
+      // more than it holds while the total says 3 GB spare. The load dies in
+      // `cudaMalloc` on that card, and "ok" above it would be the one answer
+      // this panel exists not to give.
+      const over = p.devices.bytesB.map((b, i) =>
+        Math.max(0, b - (p.devices.budgetsB[i] ?? 0))
+      );
+      const worst = over.reduce(
+        (w, b, i) => (b > (over[w] ?? 0) ? i : w),
+        0,
+      );
+      // By index first: two identical cards share a name.
+      const name = hw.gpus[worst]?.name ?? "";
+      const card = name ? `GPU ${worst} (${name})` : `GPU ${worst}`;
+      const pinned = str(s, "tensorSplit").trim() !== "";
+      warnings.push({
+        severity: "risk",
+        key: pinned ? "tensorSplit" : "ngl",
+        message: (over[worst] ?? 0) > 0
+          ? `${card} is asked for ${
+            ((over[worst] ?? 0) / GB).toFixed(1)
+          } GB more than it can give, though the cards have room between them. ` +
+            (pinned
+              ? "The tensor split puts too many layers on it — clear it and let the tuner divide them."
+              : "The load will fail on that card.")
+          : `${
+            (p.devices.unplacedB / GB).toFixed(1)
+          } GB of layers have nowhere to go — no card has room for them, however the cut is made.`,
       });
     } else if (p.vram.capacityB > 0 && p.vram.freeB < 256 * 1024 * 1024) {
       warnings.push({
@@ -191,7 +223,10 @@ export function stability(
   }
 
   if (num(s, "parallel") > 1 && meta) {
-    const perSlot = num(s, "ctxSize") / num(s, "parallel");
+    // The context as it will RUN: `-c 0` is llama.cpp's "take it from the
+    // model", not zero tokens, and reading it literally warned that every slot
+    // would get "0 tokens each" on the one setting that gives them the most.
+    const perSlot = effectiveCtx(meta, s) / num(s, "parallel");
     if (perSlot < 512) {
       warnings.push({
         severity: "caution",

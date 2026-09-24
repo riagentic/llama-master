@@ -22,6 +22,7 @@ import {
 } from "../lib/tune.ts";
 import { LOCK_REASON, maxFor, pinMaxFor } from "./actions.ts";
 import { ctxOverride } from "./derive.ts";
+import { DraftInput } from "./kit.tsx";
 
 /**
  * The usable range, drawn.
@@ -158,10 +159,17 @@ export function CtxControls(
   return (
     <div class="ctx-controls">
       <div class="field-inline">
-        <input
+        {
+          /* A DraftInput, not a controlled <input>: `ctxNow` is re-derived on
+             every 1 s hw tick (the tuner's answer moves with the machine), and
+             a controlled box re-rendered with it wrote the derived number back
+             over digits still being typed. The draft is the user's until the
+             box is left; the cell sees one write (`kit.tsx:DraftInput`). */
+        }
+        <DraftInput
           type="number"
           class="one-ctx"
-          aria-label="Context size"
+          ariaLabel="Context size"
           t={`${id}-value`}
           min={MIN_CTX}
           max={props.target || undefined}
@@ -173,11 +181,12 @@ export function CtxControls(
               (props.target || 0).toLocaleString()
             } this model was trained for.`}
           value={String(props.ctxNow)}
-          onChange={(e) =>
-            cfg.setCtxOverride(
-              Number((e.currentTarget as HTMLInputElement).value),
-              models.selected,
-            )}
+          onCommit={(raw) => {
+            // An emptied box is mid-edit, not "pin nothing" — Auto is the
+            // button for that, and it says so.
+            if (raw.trim() === "") return;
+            cfg.setCtxOverride(Number(raw), models.selected);
+          }}
         />
         <span class="unit">tokens</span>
       </div>

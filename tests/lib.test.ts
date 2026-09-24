@@ -79,6 +79,7 @@ import {
 } from "../src/lib/reserve.ts";
 import {
   ctxOf,
+  faultDevice,
   fitDecision,
   fitFault,
   isFitFailure,
@@ -173,8 +174,10 @@ import {
   toggleDevice,
 } from "../src/lib/gpu.ts";
 import {
+  allocBuffer,
   diagnoseServerExit,
   extractErrors,
+  rejectedFlag,
   signalOf,
 } from "../src/lib/serverlog.ts";
 import {
@@ -185,6 +188,7 @@ import {
   cudaVersionForCap,
   driverCudaVersion,
   maxArchFor,
+  minArchFor,
   parseCudaVersion,
 } from "../src/lib/cuda.ts";
 import {
@@ -270,6 +274,7 @@ import {
   parsePrInput,
   parsePrList,
   parseRef,
+  prInputProblem,
   prStateNote,
   refDirName,
   refForPrs,
@@ -2842,7 +2847,63 @@ Deno.test("serverlog: a port clash and a bad flag are told apart", () => {
   const flag = diagnoseServerExit(1, [
     '0.00.1 E error while handling argument "--n-cpu-moe": unknown argument',
   ]);
-  assertStringIncludes(flag.reason, "rejected one of the flags");
+  assertStringIncludes(flag.reason, "rejected --n-cpu-moe");
+});
+
+Deno.test("serverlog: a rejected flag is NAMED, in both of llama.cpp's spellings", () => {
+  // `m[0]` was the phrase "invalid argument", so the reason said a flag was
+  // rejected without saying which — on a command line of thirty.
+  const gone = diagnoseServerExit(1, ["error: invalid argument: --mlock"]);
+  assertStringIncludes(gone.reason, "--mlock");
+  assertStringIncludes(gone.steps[0]!.text, "--mlock");
+  const value = diagnoseServerExit(1, [
+    '0.00.1 E error while handling argument "--lazy-mode": invalid value',
+  ]);
+  assertStringIncludes(value.reason, "--lazy-mode");
+  assertStringIncludes(value.reason, "invalid value");
+  assertEquals(rejectedFlag("error: invalid argument: --mlock"), "--mlock");
+  assertEquals(rejectedFlag("nothing here"), null);
+});
+
+Deno.test("serverlog: a device buffer is VRAM, a host buffer is RAM, and nobody is told to --mlock", () => {
+  const vk = diagnoseServerExit(1, [
+    "0.01.0 E alloc_tensor_range: failed to allocate Vulkan1 buffer of size 9699148288",
+    "0.01.1 E llama_model_load: error loading model: unable to allocate Vulkan1 buffer",
+  ]);
+  assertStringIncludes(vk.reason, "GPU ran out of memory");
+  assertStringIncludes(vk.reason, "card 1");
+  assert(!/system RAM/.test(vk.reason), vk.reason);
+  const rocm = diagnoseServerExit(1, [
+    "0.01.0 E ggml_gallocr_reserve_n_impl: failed to allocate ROCm0 buffer of size 123",
+  ]);
+  assertStringIncludes(rocm.reason, "GPU ran out of memory");
+  const host = diagnoseServerExit(1, [
+    "0.01.0 E ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 123",
+  ]);
+  assertStringIncludes(host.reason, "system RAM");
+  const cpu = diagnoseServerExit(1, [
+    "0.01.0 E alloc_tensor_range: failed to allocate CPU buffer of size 123",
+  ]);
+  assertStringIncludes(cpu.reason, "system RAM");
+  // `--mlock` is removed upstream; the advice names the setting that exists.
+  for (const d of [vk, rocm, host, cpu]) {
+    assert(
+      !d.steps.some((st) => st.text.includes("--mlock")),
+      d.steps[0]?.text,
+    );
+  }
+  assertEquals(allocBuffer("failed to allocate CUDA_Host buffer")?.host, true);
+  assertEquals(allocBuffer("failed to allocate Vulkan0 buffer")?.device, 0);
+  assertEquals(allocBuffer("failed to allocate buffer for kv cache"), null);
+});
+
+Deno.test("serverlog: a missing shared library blames the build, not the model", () => {
+  const d = diagnoseServerExit(127, [
+    "/home/u/.llama-master/data/files/builds/b1/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+  ]);
+  assertStringIncludes(d.reason, "libcudart.so.13");
+  assert(!/model file is not where/.test(d.reason), d.reason);
+  assertEquals(d.steps[0]?.action, { kind: "open-tab", tab: "build" });
 });
 
 Deno.test("serverlog: an unhelpful exit still quotes what it said", () => {
@@ -4611,7 +4672,29 @@ Deno.test("devsplit: -ts boundaries land between slots, never on one", () => {
   assertEquals(tensorSplitValue([37, 7]), "36.5,7.5");
   assertEquals(tensorSplitValue([10, 20, 14]), "9.5,20,14.5");
   assertEquals(tensorSplitValue([44]), "", "one card needs no split");
-  assertEquals(tensorSplitValue([44, 0]), "", "nor does one card doing it all");
+});
+
+Deno.test("devsplit: one card doing it all is still pinned, and never from a zero", () => {
+  // "" here let llama.cpp divide by FREE memory at load time, so a plan that
+  // kept card 0 empty for the display reserve put half the model on it.
+  assertEquals(tensorSplitValue([44, 0]), "44,0");
+  assertEquals(tensorSplitValue([0, 41]), "0,41", "not -0.5,41.5");
+  assertEquals(tensorSplitValue([10, 0, 14]), "9.5,0,14.5");
+  assertEquals(tensorSplitValue([0, 10, 14]), "0,9.5,14.5");
+  assertEquals(tensorSplitValue([10, 14, 0]), "9.5,14.5,0");
+  for (
+    const counts of [[44, 0], [0, 41], [10, 0, 14], [0, 10, 14], [10, 14, 0], [
+      1,
+      0,
+    ], [0, 1, 1]]
+  ) {
+    const total = counts.reduce((a, b) => a + b, 0);
+    assertEquals(
+      countsFromSplit(tensorSplitValue(counts), total, counts.length),
+      counts,
+      `round trip for ${JSON.stringify(counts)}`,
+    );
+  }
 });
 
 Deno.test("devsplit: the split we emit is the split we drew", () => {
@@ -7827,7 +7910,10 @@ Deno.test("srcref: a fork round-trips, downloads from itself, and moves", () => 
   assertEquals(refPrs(r), []);
   // One path segment, always: the ref becomes a source dir and a build id.
   assertEquals(refDirName(r), "fork-PrismML-Eng_llama.cpp");
-  assertEquals(refDirName(b), "fork-PrismML-Eng_llama.cpp-feat_x");
+  assertEquals(
+    refDirName(b),
+    "fork-PrismML-Eng_llama.cpp@feat_x_d03c3cb6",
+  );
   assertStringIncludes(refLabel(r), "PrismML-Eng/llama.cpp");
   // A stored fork spelling that no longer parses must not become a TAG —
   // that would hand codeload `refs/tags/fork:…`. Master is always buildable.
@@ -7926,4 +8012,335 @@ Deno.test("plan: each layer's cache is sized by llama.cpp's own per-layer rules"
   const per = kvByLayer(hy, s, 4096);
   assertEquals(per.filter((b) => b > MB).length, 2, "layers 3 and 7");
   assert(per[3]! > 0 && per[3] === per[7]);
+});
+
+// ── audit round: planner, tuner, parsers ─────────────────────────────────────
+
+Deno.test("fitladder: a KV cache that did not fit is the CONTEXT, though its buffer line reads like weights", () => {
+  // The cache is allocated through the same `alloc_tensor_range` the weights
+  // are; only the next line says whose buffer it was. Read as weights, the
+  // ladder moved experts to the host rung after rung and never shortened -c.
+  const kv = [
+    "0.03.1 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 18432.00 MiB on device 0: cudaMalloc failed: out of memory",
+    "0.03.1 E alloc_tensor_range: failed to allocate CUDA0 buffer of size 19327352832",
+    "0.03.2 E llama_init_from_model: failed to initialize the context: failed to allocate buffer for kv cache",
+    "0.03.2 E common_init_from_params: failed to create context with model '/m.gguf'",
+  ];
+  assertEquals(fitFault(kv), "context");
+  assertEquals(
+    fitDecision({
+      lines: kv,
+      ctx: 131072,
+      tries: 0,
+      auto: true,
+      nCpuMoe: 10,
+      nLayer: 43,
+      expertPerLayerB: 2.5 * 1024 ** 3,
+      deviceFreeB: [20 * 1024 ** 3],
+    }).kind,
+    "retry",
+  );
+  // The weights shape is untouched.
+  assertEquals(fitFault(WEIGHTS_OOM), "weights");
+});
+
+Deno.test("fitladder: the failing card is read from the buffer name, and an unknown card is not an empty one", () => {
+  assertEquals(
+    faultDevice([
+      "E alloc_tensor_range: failed to allocate Vulkan1 buffer of size 1",
+    ]),
+    1,
+  );
+  assertEquals(
+    faultDevice([
+      "E llama_model_load: error loading model: unable to allocate ROCm0 buffer",
+    ]),
+    0,
+  );
+  assertEquals(
+    faultDevice(["E failed to allocate CUDA_Host buffer of size 1"]),
+    -1,
+    "a host buffer names no device",
+  );
+  // No device named anywhere: the shortfall is sized against the SMALLEST free
+  // figure, not against zero — which read the whole 33.9 GiB request as the
+  // shortfall and gave away 14 layers where 6 were needed.
+  const GiB = 1024 ** 3;
+  const d = fitDecision({
+    lines: [
+      // Metal names its buffer with no index: which card is not said.
+      "E alloc_tensor_range: failed to allocate Metal buffer of size 36364237312",
+      "E llama_model_load: error loading model: unable to allocate Metal buffer",
+    ],
+    ctx: 65536,
+    tries: 0,
+    auto: true,
+    nCpuMoe: 29,
+    nLayer: 43,
+    expertPerLayerB: 2.5 * GiB,
+    deviceFreeB: [22 * GiB, 30 * GiB],
+  });
+  assertEquals(d.kind, "offload");
+  if (d.kind === "offload") assertEquals(d.nCpuMoe, 35);
+});
+
+Deno.test("stability: a card that overflows under a pinned split is a risk, though the pool fits", () => {
+  const machine = hw({ gpus: [gpu(24), gpu(24)] });
+  const s = { ...defaults(), ngl: 999, ctxSize: 4096, tensorSplit: "1,0" };
+  const p = plan(moeMeta(), machine, s);
+  assertEquals(p.vram.overB, 0, "the pool alone says it fits");
+  assertEquals(p.devices.fits, false);
+  const st = stability(moeMeta(), machine, s);
+  assertEquals(st.level, "risk");
+  const w = st.warnings.find((x) => x.key === "tensorSplit");
+  assert(w, JSON.stringify(st.warnings));
+  assertStringIncludes(w!.message, "GPU 0");
+});
+
+Deno.test("stability: -c 0 is the model's context, not zero tokens per slot", () => {
+  const st = stability(meta({ nCtxTrain: 8192 }), hw(), {
+    ...defaults(),
+    ctxSize: 0,
+    parallel: 4,
+  });
+  assert(
+    !st.warnings.some((w) => w.key === "parallel"),
+    JSON.stringify(st.warnings),
+  );
+  // And a real shortage still speaks, with the real number.
+  const tight = stability(meta({ nCtxTrain: 8192 }), hw(), {
+    ...defaults(),
+    ctxSize: 1024,
+    parallel: 4,
+  });
+  assert(tight.warnings.some((w) => w.message.includes("256 tokens each")));
+});
+
+Deno.test("plan/setup: the load mode is read from loadMode, not the retired booleans", () => {
+  const rows = (loadMode: string) =>
+    setupRows(meta(), { ...defaults(), loadMode }, hw()).find((r) =>
+      r.label === "Weights loading"
+    )!;
+  assertEquals(rows("auto").short, "mmap");
+  assertEquals(rows("mlock").short, "mlock");
+  assertEquals(rows("none").short, "no-mmap");
+  assertEquals(rows("dio").short, "dio");
+  // plan's own note fires when mlock meets a full machine.
+  const full = hw({
+    mem: {
+      totalB: 8 * 1024 ** 3,
+      availableB: 6 * 1024 ** 3,
+      usedB: 2 * 1024 ** 3,
+      swapTotalB: 0,
+      swapUsedB: 0,
+    },
+  });
+  const p = plan(meta(), full, { ...defaults(), ngl: 0, loadMode: "mlock" });
+  assert(p.notes.some((n) => n.includes("--mlock")), JSON.stringify(p.notes));
+});
+
+Deno.test("tune: a drafter the tuner attached is cleared for the next model, one the user chose is kept", () => {
+  const m = meta({ nextnLayers: 0 });
+  const stale = tune(m, hw(), {
+    ...defaults(),
+    draftModel: "/models/gemma/gemma-4-E4B-it-mtp-Q4_0.gguf",
+  }, "vram");
+  assertEquals(stale.settings.draftModel, "", "another model's head");
+  const mine = tune(m, hw(), {
+    ...defaults(),
+    draftModel: "/models/qwen/Qwen3-0.6B-Q8_0.gguf",
+  }, "vram");
+  assertEquals(mine.settings.draftModel, "/models/qwen/Qwen3-0.6B-Q8_0.gguf");
+});
+
+Deno.test("tune: a hybrid note counts layers the way llama.cpp does", () => {
+  // `-ngl N` counts the output head, and `--n-cpu-moe` counts from layer 0 —
+  // both of which the note read straight off the flags.
+  const check = (m: ModelMeta, machine: Hw) => {
+    const t = tune(m, machine, defaults(), "hybrid");
+    const p = plan(m, machine, t.settings);
+    const r = t.reasons.map((x) =>
+      /(\d+) of (\d+) layers on the GPU(?:, and the routed experts of (\d+) of them)?/
+        .exec(x)
+    ).find(Boolean);
+    assert(r, JSON.stringify(t.reasons));
+    assertEquals(Number(r![1]), p.layersOnGpu, r![0]);
+    if (r![3]) assert(Number(r![3]) <= p.layersOnGpu, r![0]);
+  };
+  check(meta({ layers: layers(32, 500 * 1024 ** 2) }), hw({ gpus: [gpu(8)] }));
+  // Measured before the fix: "4 of 32 layers on the GPU, and the routed
+  // experts of 32 of them in RAM" — for 3 layers, whose experts are 3.
+  const m = moeMeta();
+  const small = hw({ gpus: [gpu(2)] });
+  check(m, small);
+  const t = tune(m, small, defaults(), "hybrid");
+  assert(
+    t.reasons.some((r) =>
+      r.includes(
+        "3 of 32 layers on the GPU, and the routed experts of 3 of them",
+      )
+    ),
+    JSON.stringify(t.reasons),
+  );
+});
+
+Deno.test("quant: experts held in RAM count as layers in RAM", () => {
+  const rows = quantOptions(moeMeta(), hw({ gpus: [gpu(16)] }), defaults());
+  const mine = rows.find((r) => r.current)!;
+  assert(mine.possible);
+  assert(
+    mine.layersInRam > 0,
+    "a MoE with its experts on the host is spilling, whatever -ngl says",
+  );
+});
+
+Deno.test("mtp: i-quants and Unsloth's UD tag pair like any other quant", () => {
+  const k = pairKey("Qwen3.5-9B-mtp-Q8_0.gguf");
+  assertEquals(pairKey("Qwen3.5-9B-IQ4_XS.gguf"), k);
+  assertEquals(pairKey("Qwen3.5-9B-IQ3_XXS.gguf"), k);
+  assertEquals(pairKey("Qwen3.5-9B-UD-Q4_K_XL.gguf"), k);
+  assertEquals(pairKey("Qwen3.5-9B-i1-Q4_K_M.gguf"), k);
+  assert(pairKey("Qwen3.5-27B-IQ4_XS.gguf") !== k, "sizes still differ");
+});
+
+Deno.test("srcref: only upstream's pull requests are pull requests here", () => {
+  assertEquals(
+    parsePrInput("https://github.com/ggml-org/llama.cpp/pull/27754"),
+    27754,
+  );
+  assertEquals(
+    parsePrInput("https://github.com/ggerganov/llama.cpp/pull/27754"),
+    27754,
+    "the old home redirects with the same numbers",
+  );
+  assertEquals(
+    parsePrInput("https://github.com/PrismML-Eng/llama.cpp/pull/12"),
+    null,
+  );
+  assertEquals(
+    parsePrList("27773, https://github.com/PrismML-Eng/llama.cpp/pull/12"),
+    [27773],
+  );
+  assertStringIncludes(
+    prInputProblem("https://github.com/PrismML-Eng/llama.cpp/pull/12") ?? "",
+    "PrismML-Eng/llama.cpp",
+  );
+  assertEquals(prInputProblem("27773, #28136"), null);
+});
+
+Deno.test("srcref: fork directory names cannot collide", () => {
+  const names = ["a/b@c", "a/b-c", "a/b@feat/x", "a/b@feat_x", "a/b@feat-x"]
+    .map((x) => refDirName(parseForkInput(x)!));
+  assertEquals(new Set(names).size, names.length, JSON.stringify(names));
+  assertEquals(
+    refDirName(parseForkInput("PrismML-Eng/llama.cpp")!),
+    "fork-PrismML-Eng_llama.cpp",
+    "the default branch keeps the name its build already has",
+  );
+  for (const n of names) assert(!n.includes("/"), n);
+});
+
+Deno.test("richtext: a one-line ```cmd``` is inline code, not a fence that eats the reply", () => {
+  const b = replyBlocks(
+    "Run ```ls -la``` first.\n```ls -la```\nThen read the output.",
+  );
+  assert(b.every((x) => x.kind === "text"), JSON.stringify(b));
+  assertStringIncludes(
+    b.map((x) => x.text).join("\n"),
+    "Then read the output.",
+  );
+  // A real fence is still one.
+  const f = replyBlocks("```sh\nls\n```\nafter");
+  assertEquals(f[0]?.kind, "code");
+});
+
+Deno.test("cuda: a card below the toolkit's floor is refused up front, and no upgrade strands it", () => {
+  assertEquals(minArchFor(12.0), 50);
+  assertEquals(minArchFor(13.0), 75);
+  const pascal = cudaPlan("13.0.48", [6.1]);
+  assertEquals(pascal.mode, "impossible");
+  assertStringIncludes(pascal.reason, "sm_61");
+  assertStringIncludes(pascal.remedy, "13.0");
+  assertEquals(cudaPlan("12.4", [6.1]).mode, "native");
+  assertEquals(cudaPlan("13.0", [7.5]).mode, "native");
+  // A Pascal beside a GB10 (12.1, needs 13.0): 13.0 would lose the Pascal.
+  assertEquals(cudaUpgradeFor("12.0", [6.1, 12.1]), null);
+});
+
+Deno.test("diagnose: an unsupported arch offers the app's own toolkit, never the distro's", () => {
+  const d = diagnoseFailure(
+    "nvcc fatal : Unsupported gpu architecture 'compute_120a'",
+    { origin: "source", backend: "cuda", ...LINUX },
+  );
+  const ids = d.steps.map((s) =>
+    s.action?.kind === "fix-prereq" ? s.action.id : null
+  ).filter(Boolean);
+  assertEquals(ids, ["cuda-arch"]);
+});
+
+Deno.test("envvars: an unclosed quote and a backslash are refused, not guessed at", () => {
+  assertEquals(parseEnvVars("A='x y").bad, ["A='x y"]);
+  assertEquals(parseEnvVars('A="x y').vars, []);
+  // A shell would read `\ ` as an escaped space — one token, `x y`. Split
+  // here, both halves are refused rather than one of them quietly kept.
+  assertEquals(parseEnvVars("A=x\\ y").bad, ["A=x\\", "y"]);
+  assertEquals(parseEnvVars('A="x\\y"').bad, ['A="x\\y"']);
+  // In single quotes a backslash is a byte to a shell too.
+  assertEquals(parseEnvVars("A='x\\y'").vars, [{ name: "A", value: "x\\y" }]);
+  // Order and good neighbours survive.
+  const r = parseEnvVars("B=1 bare C='2");
+  assertEquals(r.vars, [{ name: "B", value: "1" }]);
+  assertEquals(r.bad, ["bare", "C='2"]);
+});
+
+Deno.test("command: an IPv6 host is bracketed in the URL", () => {
+  assertEquals(serverUrl({ host: "::1", port: 8080 }), "http://[::1]:8080");
+  assertEquals(serverUrl({ host: "[::1]", port: 8080 }), "http://[::1]:8080");
+  assertEquals(serverUrl({ host: "::", port: 8080 }), "http://127.0.0.1:8080");
+  assertEquals(serverUrl({ host: "10.0.0.2", port: 81 }), "http://10.0.0.2:81");
+});
+
+Deno.test("command: a value the old build does by default is not reported dropped", () => {
+  // `-lm mmap` on a build from before `--load-mode`: its legacy spelling is
+  // EMPTY because mapping is what that build already does.
+  const caps = ["--port", "-m", "-ngl", "-c", "-np", "--mlock", "--no-mmap"];
+  const dropped = droppedFlags("server", {
+    settings: { ...defaults(), loadMode: "mmap" },
+    caps,
+  });
+  assert(!dropped.some((d) => d.key === "loadMode"), JSON.stringify(dropped));
+});
+
+Deno.test("command: quote survives a shell, single quotes included (fixplan manual steps)", async () => {
+  const step =
+    `echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.4 noble main'`;
+  const out = await new Deno.Command("bash", {
+    args: ["-c", `bash -c ${quote(step)}`],
+    stdout: "piped",
+  }).output();
+  assertEquals(
+    new TextDecoder().decode(out.stdout).trim(),
+    "deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.4 noble main",
+  );
+});
+
+Deno.test("buildlog: a batch longer than the bound is still bounded", () => {
+  const big = Array.from({ length: 1000 }, (_, i) => `l${i}`);
+  const out = appendLog(["old"], big, 400);
+  assertEquals(out.length, 400);
+  assertEquals(out.at(-1), "l999");
+  assertEquals(appendLog(["a"], ["b"], 0), []);
+});
+
+Deno.test("ollama: a model pulled from hf.co keeps its registry in the name", () => {
+  assertEquals(
+    nameFromManifestPath(`${MANIFEST_ROOT}/hf.co/unsloth/Qwen3-8B-GGUF/Q4_K_M`),
+    "hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M",
+  );
+  assertEquals(
+    nameFromManifestPath(
+      `${MANIFEST_ROOT}/registry.ollama.ai/someone/model/latest`,
+    ),
+    "someone/model:latest",
+  );
 });

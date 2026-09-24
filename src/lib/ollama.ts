@@ -30,19 +30,26 @@ type Manifest = {
  * Name a model from the path of its manifest.
  *
  * `…/manifests/registry.ollama.ai/library/llama3.2/3b` → `llama3.2:3b`
- * `…/manifests/registry.ollama.ai/hf.co/user/repo/q4`  → `hf.co/user/repo:q4`
+ * `…/manifests/registry.ollama.ai/user/model/latest`   → `user/model:latest`
+ * `…/manifests/hf.co/user/repo/q4`                      → `hf.co/user/repo:q4`
  *
  * The `library/` namespace is dropped because ollama itself hides it — a user
- * types `ollama run llama3.2:3b`, never `library/llama3.2:3b`.
+ * types `ollama run llama3.2:3b`, never `library/llama3.2:3b`. So is ollama's
+ * own registry host, which is the default. Any OTHER host is part of the name:
+ * `ollama pull hf.co/user/repo:q4` files the model under `hf.co` as the
+ * REGISTRY, and dropping it listed `user/repo:q4` — a name `ollama run` does
+ * not know.
  */
 export function nameFromManifestPath(path: string): string | null {
   const parts = path.split("/").filter(Boolean);
   const at = parts.lastIndexOf("manifests");
   // Need at least: manifests / registry / namespace / name / tag
   if (at < 0 || parts.length - at < 5) return null;
+  const host = parts[at + 1] as string;
   const after = parts.slice(at + 2); // drop "manifests" and the registry host
   const tag = after.pop() as string;
-  if (after[0] === "library") after.shift();
+  if (host !== "registry.ollama.ai") after.unshift(host);
+  else if (after[0] === "library") after.shift();
   if (after.length === 0) return null;
   return `${after.join("/")}:${tag}`;
 }

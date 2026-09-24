@@ -139,9 +139,22 @@ export const chat = cell("chat", {
       return true;
     },
 
-    /** Drop one waiting message — the ✕ on a queue chip. */
-    unqueue(s, i: number) {
-      s.queue = queueRemove(s.queue, i);
+    /**
+     * Drop one waiting message — the ✕ on a queue chip.
+     *
+     * By CONTENT, with the index as a hint. The chip was drawn from a replica,
+     * and the drain shifts the head off this queue the moment a reply lands —
+     * so by the time the click arrives, position `i` can hold the NEXT message,
+     * and removing by index alone deleted one the user never touched. The text
+     * is the identity that survives the shift: the entry at `i` when it still
+     * holds it, else the first that does, else nothing (it was already sent).
+     * Two queued messages with the same text are the same message to send, so
+     * which of them goes is not a distinction anyone can observe — which is
+     * why content serves as the id without a persisted shape change.
+     */
+    unqueue(s, i: number, text: string) {
+      const at = s.queue[i] === text ? i : s.queue.indexOf(text);
+      if (at >= 0) s.queue = queueRemove(s.queue, at);
     },
 
     /** Drop every waiting message, leaving the conversation alone. */
@@ -344,6 +357,19 @@ async function turn(
           });
         }
       } else {
+        // What arrived before the failure is still the model's answer so
+        // far — a server that dies mid-generation (an OOM at a long context
+        // is the common one) must not also erase the half-reply the user was
+        // reading, leaving their question with nothing under it. Kept, and
+        // marked by the error beside it.
+        if (acc || think) {
+          s.messages.push({
+            role: "assistant",
+            content: acc,
+            ...(think ? { thinking: think } : {}),
+            ...(tps ? { tps } : {}),
+          });
+        }
         // Never a raw error: a dead socket is the server going away, and what
         // to do about it is part of the message. `fetch failed` is Deno 2.9's
         // wording, `error sending request` the older one.

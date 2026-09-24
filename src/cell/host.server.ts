@@ -178,6 +178,9 @@ export async function execStream(
     }
   };
   opts.signal?.addEventListener("abort", abort, { once: true });
+  // An `abort` listener added to a signal that has ALREADY fired never runs,
+  // so a Cancel pressed before this spawn would let the whole command run.
+  if (opts.signal?.aborted) abort();
 
   const pump = async (
     stream: ReadableStream<Uint8Array>,

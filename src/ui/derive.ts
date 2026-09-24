@@ -129,7 +129,15 @@ export function activeBuild(): Build | null {
  * garbage, so this has to be said before Start, not diagnosed after.
  */
 export function modelRuntime(): Diagnosis | null {
-  const m = currentModel();
+  return modelRuntimeFor(models.selected);
+}
+
+/** `modelRuntime` for a model named by path — a gesture that selects and
+ *  starts in one go (the Models table's Run) must judge the model it is about
+ *  to start, not the replica's idea of what is selected, which can still be
+ *  the previous one for a round trip. */
+export function modelRuntimeFor(path: string): Diagnosis | null {
+  const m = models.items.find((x) => x.path === path);
   const b = activeBuild();
   if (!m || !b) return null;
   return runtimeMismatch(m.meta?.vendor, b.ref, builds.installed);
@@ -143,10 +151,14 @@ export function modelRuntime(): Diagnosis | null {
  * outlive the build that said it (`cfg.unsupported`).
  */
 export function unsupportedHere(): readonly string[] {
+  return unsupportedFor(models.selected);
+}
+
+/** `unsupportedHere` for an explicit model path — see `modelRuntimeFor`. */
+export function unsupportedFor(path: string): readonly string[] {
   const b = builds.activeId;
-  const m = models.selected;
-  if (!b || !m) return [];
-  return cfg.unsupported[`${b}\n${m}`] ?? [];
+  if (!b || !path) return [];
+  return cfg.unsupported[`${b}\n${path}`] ?? [];
 }
 
 export function buildBusy(): boolean {
@@ -179,7 +191,10 @@ export function hwSnapshot(): Hw {
   return {
     cpu: hw.cpu,
     mem: hw.mem,
-    gpus: enabledGpus(backend, hw.gpus, str(cfg.settings, "device")),
+    // The RUN's `-dev` while one is up, like every other "what is running"
+    // reading: filtering a live run's cards by a value typed since would
+    // describe a process that does not exist (`shownSettings`).
+    gpus: enabledGpus(backend, hw.gpus, str(shownSettings(), "device")),
     os: hw.os,
     arch: hw.arch,
     // The tuner needs it too: which flags are even loadable depends on the
@@ -628,6 +643,39 @@ const placementsC = computed(() => {
 });
 export function placements(): Record<Placement, Tuning> | null {
   return placementsC.value;
+}
+
+/**
+ * `placements()` for a model, pin and base settings named EXPLICITLY.
+ *
+ * A gesture that dispatches and then tunes — select-then-Run, pin-then-retune,
+ * reset-a-flag-then-start — cannot read the answer back out of the replica: the
+ * dispatch is a round trip, and until it lands `models.selected`,
+ * `ctxOverride()` and `cfg.settings` still describe the moment BEFORE the
+ * click. So the caller passes what it just asked for. When that is exactly the
+ * current state the memoised answer is returned; otherwise the same `tuneAll`
+ * runs over the values given, so the two paths cannot tune differently.
+ */
+export function tuningsFor(
+  path: string,
+  pin: number,
+  base: Settings = cfg.settings,
+): Record<Placement, Tuning> | null {
+  if (
+    path === models.selected && pin === ctxOverride() && base === cfg.settings
+  ) {
+    return placements();
+  }
+  const m = models.items.find((x) => x.path === path);
+  if (!m?.meta) return null;
+  return tuneAll(
+    m.meta,
+    planningHw(),
+    base,
+    pin || undefined,
+    measuredCtx(path) || undefined,
+    { mtpSibling: findMtpSibling(path, models.items), caps: activeCaps() },
+  );
 }
 
 /**

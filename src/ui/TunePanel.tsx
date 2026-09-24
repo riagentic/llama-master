@@ -15,7 +15,12 @@ import { DevicePicker } from "./DevicePicker.tsx";
 import type { Param } from "../lib/types.ts";
 import { plan as computePlan } from "../lib/plan.ts";
 import { pinnedCtx, PLACEMENTS, trainedCtx } from "../lib/tune.ts";
-import { applyOptimal, currentStability, runLocked } from "./actions.ts";
+import {
+  applyOptimal,
+  currentStability,
+  LOCK_REASON,
+  runLocked,
+} from "./actions.ts";
 import {
   DraftInput,
   Empty,
@@ -40,6 +45,7 @@ import {
   isTouched,
   paramBlocker,
   planningHw,
+  shownSettings,
 } from "./derive.ts";
 
 /** One control, chosen by the parameter's declared kind.
@@ -54,13 +60,23 @@ export function ParamControl(props: { p: Param }) {
   // Some flags are only meaningful for some models — offering one this model
   // cannot honour is a load failure with the app's name on it.
   const blocker = paramBlocker(p.key);
+  // One model runs at a time, and the command on screen describes it: every
+  // flag is read-only while it is up, on this page as on the all-in-one one
+  // (which fences the same controls with a disabled <fieldset>). Guarded here,
+  // in the one control both pages render, so neither can forget.
+  const locked = runLocked();
+  const lockTip = locked ? LOCK_REASON : undefined;
 
   const control = p.kind === "bool"
     ? (
       <Toggle
         checked={value === true}
+        // The name is printed in the row's heading, so it is not repeated
+        // beside the switch — but a screen reader still needs it.
         label=""
-        tip={p.tip}
+        ariaLabel={p.label}
+        tip={lockTip ?? p.tip}
+        disabled={locked}
         onChange={(v) => cfg.set(p.key, v)}
       />
     )
@@ -69,8 +85,8 @@ export function ParamControl(props: { p: Param }) {
       <select
         aria-label={p.label}
         value={String(value)}
-        disabled={blocker !== ""}
-        title={blocker || undefined}
+        disabled={locked || blocker !== ""}
+        title={lockTip ?? (blocker || undefined)}
         onChange={(e) =>
           cfg.set(p.key, (e.currentTarget as HTMLSelectElement).value)}
       >
@@ -103,6 +119,8 @@ export function ParamControl(props: { p: Param }) {
         ariaLabel={p.label}
         placeholder={p.unit ?? ""}
         value={String(value)}
+        disabled={locked}
+        title={lockTip}
         onCommit={(v) => cfg.set(p.key, v)}
       />
     )
@@ -114,6 +132,8 @@ export function ParamControl(props: { p: Param }) {
         max={p.max}
         step={p.step ?? (p.kind === "float" ? 0.01 : 1)}
         value={String(value)}
+        disabled={locked}
+        title={lockTip}
         onCommit={(v) => cfg.set(p.key, v)}
       />
     );
@@ -128,7 +148,10 @@ export function ParamControl(props: { p: Param }) {
             <button
               type="button"
               class="btn tiny"
-              title={`Reset to the llama.cpp default (${String(p.def)})`}
+              aria-label={`Reset ${p.label} to its default`}
+              disabled={locked}
+              title={lockTip ??
+                `Reset to the llama.cpp default (${String(p.def)})`}
               onClick={() => cfg.resetOne(p.key)}
             >
               ↺
@@ -206,12 +229,15 @@ export function TunePanel() {
   // The pin ceiling is the ADVERTISED length; the auto-tuner's native-first
   // aim stays its own business (see the same note in OnePage).
   const target = meta ? trainedCtx(meta) : 0;
-  // The same clamp the tuner applies, so the number shown is the number that
-  // would run (`pinnedCtx`, src/lib/tune.ts).
-  const ctxNow = pinnedCtx(
-    ctxOverride() || num(cfg.settings, "ctxSize"),
-    target,
-  );
+  const locked = runLocked();
+  // While a server is up: the context it RUNS at, as the all-in-one page
+  // shows it — the panel may have been edited since, and a locked control
+  // displaying a number nobody is running is a lie with a padlock on it.
+  // Otherwise the same clamp the tuner applies, so the number shown is the
+  // number that would run (`pinnedCtx`, src/lib/tune.ts).
+  const ctxNow = locked
+    ? num(shownSettings(), "ctxSize")
+    : pinnedCtx(ctxOverride() || num(cfg.settings, "ctxSize"), target);
   return (
     <div class="tab-body">
       <div class="tune-head">
@@ -231,9 +257,11 @@ export function TunePanel() {
           <Segmented
             value={cfg.placement}
             options={PLACEMENTS}
+            disabled={locked}
             onChange={(p) => {
               cfg.setPlacement(p);
-              applyOptimal();
+              // Named, not read back — see `actions.ts:RunTarget`.
+              applyOptimal({ placement: p });
             }}
           />
           <Toggle
@@ -256,15 +284,26 @@ export function TunePanel() {
             type="button"
             class="btn primary"
             t="optimal"
-            disabled={!meta}
-            title={meta
+            disabled={!meta || locked}
+            title={locked
+              ? LOCK_REASON
+              : meta
               ? "Compute the best settings for this model on this machine"
               : "Select a model with a readable header first"}
             onClick={() => applyOptimal()}
           >
             Optimal settings
           </button>
-          <button type="button" class="btn" onClick={() => cfg.reset()}>
+          <button
+            type="button"
+            class="btn"
+            t="reset-all"
+            disabled={locked}
+            title={locked
+              ? LOCK_REASON
+              : "Every setting back to its default, and the pinned context cleared"}
+            onClick={() => cfg.reset()}
+          >
             Reset all
           </button>
         </div>
@@ -282,7 +321,7 @@ export function TunePanel() {
             <CtxControls
               ctxNow={ctxNow}
               target={target}
-              locked={runLocked()}
+              locked={locked}
               meta={meta}
               t="tune-ctx"
             />
@@ -346,6 +385,8 @@ export function TunePanel() {
                   <button
                     type="button"
                     class="btn tiny"
+                    aria-label="Dismiss the reasons"
+                    title="Dismiss"
                     onClick={() => cfg.clearReasons()}
                   >
                     ✕

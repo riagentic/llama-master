@@ -152,6 +152,16 @@ export function parseRef(ref: string): SrcRef {
   return { kind: "tag", tag: s };
 }
 
+/** A pull request URL: the repository, then the number. */
+const PR_URL = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/i;
+
+/** Is this `owner/name` upstream llama.cpp? Its old home redirects to the new
+ *  one with the same numbers, so a link from before the move is still ours. */
+function isUpstream(repo: string): boolean {
+  const r = repo.toLowerCase();
+  return r === REPO.toLowerCase() || r === "ggerganov/llama.cpp";
+}
+
 /**
  * A pull request number out of whatever the user pasted.
  *
@@ -163,14 +173,38 @@ export function parseRef(ref: string): SrcRef {
 export function parsePrInput(text: string): number | null {
   const s = text.trim();
   if (!s) return null;
-  const url = /github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/i.exec(s);
-  if (url) return Number(url[1]);
+  const url = PR_URL.exec(s);
+  // Upstream's pull requests only. A PR number means nothing without its
+  // repository: `PrismML-Eng/llama.cpp/pull/12` read as a number built
+  // UPSTREAM's #12 — somebody else's change, under a name that looked right.
+  if (url) return isUpstream(url[1]!) ? Number(url[2]) : null;
   const bare = /^#?(\d+)$/.exec(s);
   if (!bare) return null;
   const n = Number(bare[1]);
   // A PR number is a small positive integer. Anything else is a paste error,
   // and turning it into a URL would produce a 404 the user cannot explain.
   return n > 0 && n < 10_000_000 ? n : null;
+}
+
+/**
+ * Why the PR box refused something, or `null` when it did not.
+ *
+ * `parsePrInput` answers null for a pull request against another repository,
+ * and a box that ignores a paste without saying so is the one thing worse than
+ * one that refuses it: this names the repository, and what would build it.
+ */
+export function prInputProblem(text: string): string | null {
+  for (const part of text.split(/[\s,;]+/)) {
+    const url = PR_URL.exec(part);
+    if (url && !isUpstream(url[1]!)) {
+      return `#${url[2]} is a pull request against ${
+        url[1]
+      }, not ${REPO} — only upstream's pull requests can be merged into master here. To build that repository, paste its URL (github.com/${
+        url[1]
+      }) instead.`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -305,10 +339,38 @@ export function refDirName(r: SrcRef): string {
       // touch the same lines — so it is part of the name, not sorted away.
       return `stack-${r.prs.join("-")}`;
     case "fork": {
-      const safe = (x: string) => x.replace(/[^A-Za-z0-9._-]/g, "_");
-      return `fork-${safe(r.repo)}${r.ref ? `-${safe(r.ref)}` : ""}`;
+      // Injective, because two refs that share a directory share a source
+      // tree and a build id — one fork's build silently replaced by
+      // another's. It was not: `a/b@c` and `a/b-c` were both `fork-a_b-c`,
+      // and `feat/x` and `feat_x` were one branch.
+      //
+      // The repo half is safe as it stands — an owner has no `_`, so the first
+      // one IS the slash. The ref is joined with `@`, which the repo half can
+      // never contain; a ref made only of `[A-Za-z0-9.-]` is spelled as is,
+      // and any other ref is filtered AND tagged with a hash of its real
+      // spelling, so a filtered name can never meet a literal one (a literal
+      // has no `_`) or another filtered one. A fork on its default branch
+      // keeps the name it always had; one on a named ref gets a new directory
+      // once — a fork is re-fetched on every build anyway (`refMoves`), so
+      // the cost is one build under the old id left for the user to remove.
+      const repo = r.repo.replace(/[^A-Za-z0-9._-]/g, "_");
+      if (!r.ref) return `fork-${repo}`;
+      const lit = r.ref.replace(/[^A-Za-z0-9.-]/g, "_");
+      return `fork-${repo}@${lit === r.ref ? lit : `${lit}_${fnv1a(r.ref)}`}`;
     }
   }
+}
+
+/** FNV-1a, 32 bits, as eight hex digits — a stable name for a string, not a
+ *  secret. Pure, and the same on every machine, which a directory name has to
+ *  be. */
+function fnv1a(text: string): string {
+  let h = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(text)) {
+    h ^= byte;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
 }
 
 /** What to call this ref on screen. */

@@ -590,6 +590,80 @@ testCell(chat, "removing a queued message leaves the rest in order", (t) => {
   t.expect.state((s) => s.queue.length === 0);
 });
 
+testCell(
+  chat,
+  "a queued message is removed by what it says, not where it was",
+  (t) => {
+    // The chip is drawn from a replica, and the drain shifts the head off the
+    // queue the moment a reply lands. A click aimed at "b" (index 1 when it was
+    // drawn) arrives as index 0 of a queue whose index 0 is now "b" — or, the
+    // other way round, as an index that now holds a message the user never
+    // touched. The text is the identity; the index only a hint.
+    t.init({ queue: ["a", "b", "c"] });
+    t.send.unqueue(0, "b"); // stale index — the text wins
+    t.expect.state((s) => s.queue.join() === "a,c", "removed b, kept a");
+    t.send.unqueue(0, "gone"); // already sent — nothing to remove
+    t.expect.state(
+      (s) => s.queue.join() === "a,c",
+      "an absent text is a no-op",
+    );
+    t.send.unqueue(1, "c"); // a hint that is still right
+    t.expect.state((s) => s.queue.join() === "a");
+  },
+);
+
+testCell(
+  chat,
+  "a server that dies mid-reply keeps the half it had sent",
+  async (t) => {
+    // The commonest real case is llama-server running out of memory part-way
+    // through a long answer. Only the Stop path used to keep `acc`: an ERROR
+    // dropped every token that had arrived, and the user's question sat there
+    // with nothing under it but an error line.
+    // A raw socket, not `Deno.serve`: the point is a body that is CUT — the
+    // chunked stream never gets its terminator — which is what a killed
+    // process looks like from the client, and what `serve` will not produce
+    // without logging the error it was handed.
+    const enc = new TextEncoder();
+    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const serving = (async () => {
+      const conn = await listener.accept();
+      const buf = new Uint8Array(4096);
+      await conn.read(buf); // the request; its content does not matter here
+      const chunk = (text: string) =>
+        `${enc.encode(text).length.toString(16)}\r\n${text}\r\n`;
+      let body = "";
+      for (const word of ["Half", " an", " answer"]) {
+        body += chunk(
+          `data: ${
+            JSON.stringify({ choices: [{ delta: { content: word } }] })
+          }\n\n`,
+        );
+      }
+      await conn.write(enc.encode(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n" +
+          "transfer-encoding: chunked\r\n\r\n" + body,
+      ));
+      await new Promise((r) => setTimeout(r, 50));
+      conn.close(); // the process dies: no terminating chunk
+    })();
+    const url = `http://127.0.0.1:${(listener.addr as Deno.NetAddr).port}`;
+
+    t.init();
+    await t.send.send(url, "explain");
+
+    t.expect.state((s) => s.streaming === false);
+    t.expect.state((s) => s.lastError.length > 0, "the failure is reported");
+    t.expect.state((s) => s.messages.length === 2, "question AND half-reply");
+    t.expect.state((s) => s.messages[1]?.role === "assistant");
+    t.expect.state((s) => s.messages[1]?.content === "Half an answer");
+    t.expect.state((s) => s.partial === "");
+
+    await serving;
+    listener.close();
+  },
+);
+
 testCell(chat, "clear wipes the conversation and the last error", (t) => {
   t.init();
   t.send.setSystem("be brief");

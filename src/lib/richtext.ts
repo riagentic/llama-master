@@ -77,7 +77,12 @@ export function replyBlocks(md: string): Block[] {
   for (const line of lines) {
     const m = FENCE.exec(line);
     if (code === null) {
-      if (m) {
+      // A backtick fence's info string may not contain a backtick
+      // (CommonMark 4.5), and that rule is what keeps a one-line ```ls -la```
+      // — which models write all the time — inline code. Read as an opening
+      // fence it had no closer, so every line of prose after it was swallowed
+      // into one unterminated block.
+      if (m && !((m[2] ?? "").startsWith("`") && (m[3] ?? "").includes("`"))) {
         flushText();
         indent = m[1] ?? "";
         marker = m[2] ?? "```";

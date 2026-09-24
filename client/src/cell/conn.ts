@@ -11,7 +11,7 @@
 // inside a method (dep/aio/docs/build/imports.md).
 
 import { cell } from "aio";
-import { baseUrl, hasPort, KNOWN_PORTS } from "../lib/discover.ts";
+import { afterSweep, baseUrl, hasPort, KNOWN_PORTS } from "../lib/discover.ts";
 import {
   NO_OCCUPANCY,
   type Occupancy,
@@ -81,9 +81,10 @@ export const conn = cell("conn", {
     progress: null as { done: number; total: number } | null,
     lastError: "",
   } as ConnState,
-  // A second Discover while one is running is the user saying "not that one,
-  // this one" — newest wins, and the first is aborted rather than racing it.
-  cancelOn: { discover: ["self"] },
+  // No `cancelOn` for `discover`: a second one while a sweep runs is refused
+  // by the `scanning` guard (and the button is disabled), and the sweep reads
+  // no signal — a `["self"]` entry here promised a cancellation that did not
+  // happen.
   methods: {
     // Both coerce rather than trust. The address is the one field a dispatch
     // can reach from outside the UI — `am dispatch conn:setHost …`, a script, a
@@ -95,9 +96,11 @@ export const conn = cell("conn", {
       s.host = typeof host === "string" ? host : "";
       s.lastError = "";
     },
+    // An invalid port keeps the previous one: 0 is not a port, and writing it
+    // (a cleared box once did) turned the next Connect into a request to :80.
     setPort(s, port: number) {
       const n = typeof port === "number" ? port : Number(port);
-      s.port = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) s.port = n;
       s.lastError = "";
     },
 
@@ -109,8 +112,8 @@ export const conn = cell("conn", {
      * really does is decide which base URL every later poll and every message
      * goes to.
      */
-    async connect(s, urlOverride?: string) {
-      const target = urlOverride ??
+    async connect(s, urlOverride = "") {
+      const target = urlOverride ||
         baseUrl(s.host, hasPort(s.host) ? undefined : s.port);
       if (!target) {
         s.lastError =
@@ -122,9 +125,12 @@ export const conn = cell("conn", {
       s.url = target;
       const io = await import("./conn.server.ts");
       // aiol-ok: `target` was read before the await and everything below writes
-      // the RESULT of probing it — the only state read after the await is the
-      // one being replaced.
+      // the RESULT of probing it. The one thing re-read is `url`: a later
+      // connect (or a forget) that moved it while this probe was in the air
+      // owns the state now, and a slow answer from the old address must not
+      // be written under the new one.
       const props = await io.probe(target, 2500);
+      if (s.url !== target) return; // aiol-ok: superseded — see above
       if (!props) {
         s.status = "unreachable";
         s.info = null;
@@ -143,6 +149,7 @@ export const conn = cell("conn", {
       // user can see and edit afterwards.
       const u = new URL(target);
       s.host = u.hostname;
+      // aiol-ok: the fallback is the port this connect was made with
       s.port = Number(u.port) || s.port;
     },
 
@@ -167,6 +174,11 @@ export const conn = cell("conn", {
      */
     async discover(s) {
       if (s.scanning) return;
+      // What the sweep interrupts, so it can be put back. A sweep changes which
+      // servers are KNOWN, not which one is in use: leaving "discovering" behind
+      // disabled the chat against a server that was still connected.
+      const before = s.status;
+      const wasConnected = s.url !== "";
       s.scanning = true;
       s.status = "discovering";
       s.found = [];
@@ -174,38 +186,49 @@ export const conn = cell("conn", {
       s.lastError = "";
       try {
         const io = await import("./conn.server.ts");
+        // One interface list for both the candidates and the de-duplication:
+        // this machine answers on 127.0.0.1 AND on each of its own addresses.
+        const ifaces = io.interfaces();
         const hits = await io.sweep(
-          io.interfaces(),
+          ifaces,
           (done, total) => {
             s.progress = { done, total }; // aiol-ok: progress IS the state here
           },
         );
-        s.found = hits.map((h) => ({
+        const found = hits.map((h) => ({
           url: h.url,
           model: parseProps(h.props)?.model ?? "unknown model",
         }));
-        if (s.found.length === 0) { // aiol-ok: `found` is what we just wrote
-          // `url` is where the user is connected NOW: a sweep that finished
-          // after they connected by hand must not undo that.
-          s.status = s.url ? s.status : "idle"; // aiol-ok
+        s.found = found;
+        // `url`/`status` are re-read on purpose: a connect made by hand during
+        // the sweep wins over anything the sweep would do.
+        // aiol-ok: re-read on purpose — see above
+        const urlNow = s.url;
+        // aiol-ok: re-read on purpose — see above
+        const stillDiscovering = s.status === "discovering";
+        const verdict = afterSweep({
+          wasConnected,
+          urlNow,
+          stillDiscovering,
+          found,
+        });
+        if (found.length === 0) {
           s.lastError =
             "Nothing answered on this network. A llama.cpp server is only reachable from other machines when it was started with --host 0.0.0.0; otherwise type the address and port by hand.";
-        } else if (s.found.length === 1 && s.status === "discovering") {
-          // One answer is not a menu. Connecting to it is what the user was
-          // going to do next anyway.
-          const only = s.found[0];
+        }
+        if (typeof verdict === "object") {
           // aiol-ok — a second dispatch, and safe because the URL travels as an
           // ARGUMENT: `connect` reads `s.host`/`s.port` only when it is given
           // no override, so there is nothing of this method's writes for it to
           // read stale. Its own action is also what the user wants here — the
           // connect shows up in the journal as a connect.
-          if (only) await conn.connect(only.url);
-        } else {
-          s.status = s.url ? "connected" : "idle"; // aiol-ok — as above
+          await conn.connect(verdict.connect);
+        } else if (verdict === "restore") {
+          restore(s, before);
         }
       } catch (e) {
         s.lastError = String(e);
-        s.status = "unreachable";
+        restore(s, before);
       } finally {
         s.scanning = false;
         s.progress = null;
@@ -228,6 +251,9 @@ export const conn = cell("conn", {
       // aiol-ok: this method IS the observer of state that changes underneath
       // it — reading the freshest status after each await is its whole job.
       const health = await io.json(url, "/health", 1500);
+      // aiol-ok: after every await — a connect or forget that moved `url`
+      // meanwhile owns the state, and this sample describes the old server.
+      if (s.url !== url) return;
       const alive = health !== null;
       const detail = alive
         ? String((health as Record<string, unknown>)?.status ?? "ok")
@@ -236,6 +262,7 @@ export const conn = cell("conn", {
       if (!alive) {
         // Lost, not unreachable: it answered once. The difference is what the
         // user should do about it — wait, rather than re-check the address.
+        // aiol-ok: this method IS the observer of state that changes under it
         s.status = s.status === "connected" || s.status === "lost"
           ? "lost"
           // aiol-ok: this method IS the observer of state that changes
@@ -251,14 +278,17 @@ export const conn = cell("conn", {
       s.healthDetail = detail;
 
       const props = await io.probe(url, 1500);
+      if (s.url !== url) return; // aiol-ok — as above
       if (props) s.info = parseProps(props);
 
       // Metrics first, slots second, nothing third — and the UI says which.
       const metrics = await io.text(url, "/metrics", 1500);
+      if (s.url !== url) return; // aiol-ok — as above
       if (metrics) {
         s.occupancy = parseMetrics(metrics);
       } else {
         const slots = await io.json(url, "/slots", 1500);
+        if (s.url !== url) return; // aiol-ok — as above
         s.occupancy = slots ? parseSlots(slots) : NO_OCCUPANCY;
       }
     },
@@ -283,3 +313,11 @@ export const conn = cell("conn", {
     usable: (s): boolean => s.status === "connected" && s.ready,
   },
 });
+
+/** Put back the status a sweep interrupted — unless something else (a connect
+ *  made by hand, a forget) already replaced "discovering", in which case that
+ *  is the truth and the sweep has no business overwriting it. */
+function restore(s: ConnState, before: ConnStatus): void {
+  if (s.status !== "discovering") return;
+  s.status = before === "discovering" ? "idle" : before;
+}

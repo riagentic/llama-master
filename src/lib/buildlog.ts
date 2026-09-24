@@ -26,7 +26,10 @@ export function appendLog(
   lines: string[],
   keep = 400,
 ): string[] {
+  // Slicing the OLD tail alone is not enough: a batch longer than `keep` (a
+  // compiler error with a long template trace arrives as one chunk) left the
+  // result over the bound, and "bounded" has to hold whatever arrives.
   const out = log.slice(Math.max(0, log.length + lines.length - keep));
   out.push(...lines);
-  return out;
+  return out.length > keep ? out.slice(out.length - Math.max(0, keep)) : out;
 }

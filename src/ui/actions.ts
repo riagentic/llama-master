@@ -17,10 +17,10 @@ import { models } from "../cell/models.ts";
 import { srv } from "../cell/srv.ts";
 import { ui } from "../cell/ui.ts";
 import { argv, serverUrl } from "../lib/command.ts";
-import { num, str } from "../lib/params.ts";
+import { num, param, str } from "../lib/params.ts";
 import { availableBackends } from "../lib/assets.ts";
 import { compilableBackends, preferredBackends } from "../lib/backend.ts";
-import type { Backend, ModelMeta } from "../lib/types.ts";
+import type { Backend, ModelMeta, Settings } from "../lib/types.ts";
 import { bestPlacement, PLACEMENTS, tune } from "../lib/tune.ts";
 import { vetoUnsupported } from "../lib/fitladder.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
@@ -36,14 +36,17 @@ import {
   hwSnapshot,
   maxTunings,
   measuredCtx,
-  modelRuntime,
-  paramBlocker,
+  modelRuntimeFor,
+  ourUsageB,
   placements,
   planningHw,
   reserveCost,
   serverRunning,
   shownEnv,
-  unsupportedHere,
+  shownSettings,
+  tuningsFor,
+  unsupportedFor,
+  vramUsedB,
 } from "./derive.ts";
 
 // Re-exported so panels have one import for "the current thing".
@@ -117,8 +120,10 @@ export function cliBin(): string {
   return activeBuild()?.cliBin ?? "";
 }
 
+/** Where the server answers: the RUNNING one's address while it is up (the
+ *  panel may have been edited since), the next start's otherwise. */
 export function endpoint(): string {
-  return serverUrl(cfg.settings);
+  return serverUrl(shownSettings());
 }
 
 /**
@@ -161,21 +166,65 @@ export const LOCK_REASON = "Stop the server first — one model runs at a time."
  *
  * `--spec-type draft-mtp` is the tuner's decision FOR a model that ships a
  * multi-token-prediction block; against any other model llama.cpp asserts on
- * `n_layer_nextn > 0` and refuses to load. Like a pinned context, the value
- * belongs to the model it was chosen for — carrying it over would be
- * "optimal settings" that do not start. Every UI path that changes the
+ * `n_layer_nextn > 0` and refuses to load. `-md` is the same kind of value and
+ * worse when it survives: a drafter is paired to ONE model's vocabulary, so
+ * carried to the next it loads, rejects every draft — a silent slowdown — and
+ * spends VRAM the plan does not bill. Like a pinned context, both belong to
+ * the model they were chosen for — carrying them over would be "optimal
+ * settings" that do not start, or start worse. Every UI path that changes the
  * selection goes through here.
+ *
+ * Returns the settings as the cell will hold them once these resets land, so
+ * a caller that starts straight away (`runModel`) spawns what it asked for
+ * rather than the replica's pre-click copy.
  */
-export function selectModel(path: string): void {
+export function selectModel(path: string): Settings {
+  const switched = path !== models.selected;
   models.select(path);
   const meta = models.items.find((m) => m.path === path)?.meta;
-  if (str(cfg.settings, "specType") !== "" && (meta?.nextnLayers ?? 0) === 0) {
-    cfg.resetOne("specType");
+  const next: Settings = { ...cfg.settings };
+  const voided: string[] = [];
+  if (str(next, "specType") !== "" && (meta?.nextnLayers ?? 0) === 0) {
+    voided.push("specType");
   }
+  if (switched && str(next, "draftModel") !== "") voided.push("draftModel");
+  for (const key of voided) {
+    cfg.resetOne(key);
+    next[key] = param(key)?.def ?? "";
+  }
+  return next;
 }
 
-/** Why the app cannot start a server right now, or "" when it can. */
-export function startBlocker(): string {
+/**
+ * What a run is FOR: the model, the placement and the pinned context.
+ *
+ * Named explicitly by every gesture that dispatches a change and then tunes or
+ * starts — select-then-Run, pin-then-retune, choose-a-placement-then-retune.
+ * The dispatch is a round trip, so reading `models.selected`, `cfg.placement`
+ * or `ctxOverride()` straight after it answers with the state from BEFORE the
+ * click: the Models table's Run started the previously selected model, and a
+ * placement button re-tuned for the placement it had just replaced. Anything
+ * not named defaults to the current state, which is what a plain Start means.
+ */
+export type RunTarget = { path: string; placement: Placement; pin: number };
+
+function runTarget(over: Partial<RunTarget> = {}): RunTarget {
+  const path = over.path ?? models.selected;
+  return {
+    path,
+    placement: over.placement ?? cfg.placement,
+    // A pin belongs to the model it was typed for (`ctxOverride`), so naming a
+    // different model voids it unless the caller pins one of its own.
+    pin: over.pin ?? (path === models.selected ? ctxOverride() : 0),
+  };
+}
+
+/** Why the app cannot start a server right now, or "" when it can. `path`
+ *  names the model a combined gesture is about to start (`runTarget`). */
+export function startBlocker(
+  path: string = models.selected,
+  settings: Settings = cfg.settings,
+): string {
   if (runLocked()) return LOCK_REASON;
   if (!activeBuild()) {
     return "No llama.cpp build installed — go to the Build tab.";
@@ -185,16 +234,17 @@ export function startBlocker(): string {
   if (lib) {
     return `The active build cannot start: it cannot load ${lib}. It was built by an older version of this app that left its libraries in the build cache, and that cache has since been replaced. Rebuild it on the Build tab, or pick another build.`;
   }
-  if (!currentModel()) return "No model selected — scan for models first.";
-  const need = modelRuntime();
+  const model = models.items.find((m) => m.path === path);
+  if (!model) return "No model selected — scan for models first.";
+  const need = modelRuntimeFor(path);
   if (need) return need.reason;
   // Backstop for a restored session or any selection path around
   // `selectModel`: spawning with a stale `--spec-type` is a server that
   // refuses to load, and with auto-optimal off nothing else would clear it
   // (when it is on, Start re-tunes and the tuner resets the flag itself).
   if (
-    !cfg.autoOptimal && str(cfg.settings, "specType") !== "" &&
-    paramBlocker("specType") !== ""
+    !cfg.autoOptimal && str(settings, "specType") !== "" &&
+    (model.meta?.nextnLayers ?? 0) === 0
   ) {
     return "Speculative decoding is set, but this model ships no multi-token-prediction block — llama.cpp refuses to load. Press Optimal settings, or reset --spec-type in Tune.";
   }
@@ -237,24 +287,30 @@ export function betterPlacement(
 }
 
 /**
- * The tuning to actually use: the selected placement, or the fastest one that
- * can run this model when the selected one cannot.
+ * The tuning to actually use: the chosen placement, or the fastest one that
+ * can run this model when the chosen one cannot.
  *
  * Both "Optimal settings" and Start go through this, so the button and the
  * spawn can never disagree about which placement was used. Silently switching
  * would be wrong, so the swap is returned as a reason and shown.
+ *
+ * `t` and `base` are what the caller just asked for (`RunTarget`); reading
+ * them back from the replica would tune for the moment before the click.
  */
-function tunedForStart(): { tuning: Tuning; reasons: string[] } | null {
-  const all = placements();
+function tunedForStart(
+  t: RunTarget,
+  base: Settings = cfg.settings,
+): { tuning: Tuning; reasons: string[] } | null {
+  const all = tuningsFor(t.path, t.pin, base);
   if (!all) return null;
-  let chosen = cfg.placement;
+  let chosen = t.placement;
   const extra: string[] = [];
   // NEVER fall back off a pinned context's placement. The refusal at a pin is
   // the compute-scratch ESTIMATE talking, and the estimate has been measured
   // pessimistic (512k ran where it said no) — silently switching a pinned
   // 640k to CPU-only is the app overruling an instruction on a guess. The
   // allocator has the final say at Start; the warning says so.
-  if (!all[chosen].possible && !ctxOverride()) {
+  if (!all[chosen].possible && !t.pin) {
     const fallback = bestPlacement(all);
     if (all[fallback].possible) {
       extra.push(
@@ -270,18 +326,25 @@ function tunedForStart(): { tuning: Tuning; reasons: string[] } | null {
   // Anything this build has already refused for this model comes back out
   // before the settings are applied — otherwise auto-optimal proposes it on
   // every start and the ladder pays a whole reload to drop it again.
-  const veto = vetoUnsupported(tuning.settings, unsupportedHere());
+  const veto = vetoUnsupported(tuning.settings, unsupportedFor(t.path));
   return {
     tuning: { ...tuning, settings: veto.settings },
     reasons: [...extra, ...tuning.reasons, ...veto.reasons],
   };
 }
 
-/** Apply the tuner for the selected placement (falling back if it cannot run). */
-export function applyOptimal(): void {
-  const r = tunedForStart();
-  if (!r) return;
+/**
+ * Apply the tuner for the chosen placement (falling back if it cannot run).
+ *
+ * A caller that has just dispatched the placement or the pin names it here —
+ * `cfg.setPlacement(p); applyOptimal({ placement: p })` — rather than letting
+ * this read a replica that has not heard about it yet.
+ */
+export function applyOptimal(over: Partial<RunTarget> = {}): Settings | null {
+  const r = tunedForStart(runTarget(over));
+  if (!r) return null;
   cfg.apply(r.tuning.settings, r.reasons);
+  return r.tuning.settings;
 }
 
 /**
@@ -317,7 +380,7 @@ export function pinMaxFor(placement: Placement): void {
   if (!t || !t.possible || t.ctx <= 0) return;
   cfg.setPlacement(placement);
   cfg.setCtxOverride(t.ctx, models.selected);
-  applyOptimal();
+  applyOptimal({ placement, pin: t.ctx });
 }
 
 /** Is the current configuration going to hurt? Recomputed on every render, so
@@ -345,22 +408,44 @@ export function currentStability(): Stability {
  * Returns the promise rather than dropping it: a click can ignore it, but
  * `updateNow` and the tests need to know when the spawn has actually happened.
  */
-export function startServer(): Promise<void> {
-  if (startBlocker()) return Promise.resolve();
-  const model = currentModel();
+export function startServer(over: Partial<RunTarget> = {}): Promise<void> {
+  const t = runTarget(over);
+  if (startBlocker(t.path)) return Promise.resolve();
+  const model = models.items.find((m) => m.path === t.path);
   let settings = cfg.settings;
+  let tuned = false;
   if (cfg.autoOptimal && model?.meta) {
     // The same path "Optimal settings" takes, fallback included: starting must
     // not spawn a placement the tuner has already established cannot run.
-    const r = tunedForStart();
+    const r = tunedForStart(t);
     if (r) {
       settings = r.tuning.settings;
+      tuned = true;
       cfg.apply(r.tuning.settings, r.reasons);
     }
   }
+  return launch(t, settings, tuned);
+}
+
+/**
+ * Spawn `settings` for `t` — the one place a run's context is assembled, so
+ * Start, Run and the drift restart cannot record different things about the
+ * process they started.
+ *
+ * `tuned` says whether the APP chose these settings. Only then may the fit
+ * ladder rewrite them: a context the user typed is an instruction, and halving
+ * it because it did not fit would be the app overruling them silently
+ * (`src/lib/fitladder.ts`).
+ */
+function launch(
+  t: RunTarget,
+  settings: Settings,
+  tuned: boolean,
+): Promise<void> {
+  const model = models.items.find((m) => m.path === t.path);
   const command = argv("server", {
     bin: serverBin(),
-    model: model?.path ?? "",
+    model: t.path,
     settings,
     // What THIS build understands. A flag it has never heard of is not an
     // ignored setting — llama-server exits with `unknown argument` before it
@@ -368,19 +453,16 @@ export function startServer(): Promise<void> {
     caps: activeCaps(),
   });
   return srv.start(command, serverUrl(settings), {
-    model: model?.path ?? "",
+    model: t.path,
     settings,
     env: shownEnv(),
     freeAtStart: freeNowB(),
-    // The ladder is only for settings the APP chose. A context the user typed
-    // is an instruction, and halving it because it did not fit would be the app
-    // overruling them silently (`src/lib/fitladder.ts`).
-    autoFit: cfg.autoOptimal && !ctxOverride(),
+    autoFit: tuned && !t.pin,
     // A pinned context does not pin the MICRO-BATCH. The tuner raised `-ub`
     // above 512 to spend VRAM it thought was spare; if the load then dies for
     // want of compute buffer, it may take that back without shortening the
     // context the user asked for (`fitladder.ts:autoUbatch`).
-    autoUbatch: cfg.autoOptimal,
+    autoUbatch: tuned,
     lowPriority: cfg.lowPriority,
     shape: modelShape(model?.meta ?? null),
     // The cards llama.cpp will see, not every card the machine has. Both readers
@@ -390,10 +472,13 @@ export function startServer(): Promise<void> {
     // this machine's AMD iGPU in it — harmless while the NVIDIA cards happen to
     // sort first, and an off-by-one attributing card 1's memory to card 0 the
     // moment they do not.
-    cardFreeB: hwSnapshot().gpus.map((g) =>
-      Math.max(0, g.vramTotalB - g.vramUsedB)
-    ),
+    cardFreeB: cardFreeNowB(),
   }).then(() => {});
+}
+
+/** Free VRAM per card llama.cpp will see, for the per-card baseline. */
+function cardFreeNowB(): number[] {
+  return hwSnapshot().gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB));
 }
 
 /**
@@ -448,43 +533,48 @@ export function stopServer(): Promise<void> {
  * says it does.
  */
 export async function restartTuned(): Promise<void> {
-  const model = currentModel();
-  const bin = serverBin();
-  if (!model || !bin) return;
+  const t = runTarget();
+  const model = models.items.find((m) => m.path === t.path);
+  if (!model || !serverBin()) return;
+  // What OUR run holds, measured while it still runs: the moment it stops,
+  // `ourUsageB()` reads 0 while the telemetry still carries our bytes, and a
+  // tune in that gap plans against a machine that looks full of somebody
+  // else's model — under-provisioning the very restart meant to use the room.
+  const ours = ourUsageB();
+  const usedBefore = vramUsedB();
   await srv.stop();
+  await untilReleased(usedBefore, ours.vramB);
   let settings = cfg.settings;
-  const r = tunedForStart();
+  const r = tunedForStart(t);
   if (r) {
     settings = r.tuning.settings;
     cfg.apply(r.tuning.settings, r.reasons);
   }
-  const command = argv("server", {
-    bin,
-    model: model.path,
-    settings,
-    caps: activeCaps(),
-  });
-  await srv.start(command, serverUrl(settings), {
-    model: model.path,
-    settings,
-    env: shownEnv(),
-    freeAtStart: freeNowB(),
-    // The same run context `startServer` records, for the same reasons — this
-    // is the restart most likely to meet a machine that just changed, so it
-    // needs the fit ladder's weights rung (`shape`) and the per-card baseline
-    // (`cardFreeB`) MORE than a plain start does, not less. Without them a
-    // weights overflow fell through to the context rung, which cannot move a
-    // single model byte, and the live memory map lost its measured per-card
-    // attribution. The ladder stays reserved for settings the APP chose: only
-    // when the re-tune actually produced them, and never over a typed pin.
-    autoFit: r !== null && !ctxOverride(),
-    autoUbatch: r !== null,
-    lowPriority: cfg.lowPriority,
-    shape: modelShape(model.meta ?? null),
-    cardFreeB: hwSnapshot().gpus.map((g) =>
-      Math.max(0, g.vramTotalB - g.vramUsedB)
-    ),
-  });
+  // The same run context `startServer` records, for the same reasons — this
+  // is the restart most likely to meet a machine that just changed, so it
+  // needs the fit ladder's weights rung (`shape`) and the per-card baseline
+  // (`cardFreeB`) MORE than a plain start does, not less. The ladder stays
+  // reserved for settings the APP chose: only when the re-tune actually
+  // produced them, and never over a typed pin.
+  await launch(t, settings, r !== null);
+}
+
+/**
+ * Wait until the driver reports the VRAM a stopped run held as free again.
+ *
+ * `srv.stop` returns once the process has EXITED, which is not the same moment
+ * the telemetry says so: the 1 s sampler may not have run since, and the
+ * driver can take a beat to hand the memory back. Forced samples until the
+ * device-wide figure has dropped by at least half of what the run held,
+ * bounded at ~5 s — a machine whose other tenants grew in the meantime must
+ * not hang the restart, it just gets planned as it is.
+ */
+async function untilReleased(usedBeforeB: number, ourVramB: number) {
+  for (let i = 0; i < 20; i++) {
+    await hw.refresh(true);
+    if (ourVramB <= 0 || vramUsedB() <= usedBeforeB - ourVramB / 2) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
 }
 
 /**
@@ -515,6 +605,11 @@ export async function updateNow(): Promise<void> {
   // `lowPriority` here silently defaulted the resumed run to low even when the
   // run it replaces had the switch off.
   const autoFitBefore = srv.autoFit;
+  // The micro-batch rung's permission too: it is a separate grant from
+  // `autoFit` (a pinned context keeps the second and loses the first), and
+  // leaving it out resumed an app-tuned `-ub 4096` that could no longer be
+  // taken back when the resumed load ran short of compute buffer.
+  const autoUbatchBefore = srv.autoUbatch;
   const lowPriorityBefore = srv.runLowPriority;
   // And the environment the run carried — same reason: the resumed run is the
   // run that was, and its variables are part of what it was.
@@ -543,22 +638,38 @@ export async function updateNow(): Promise<void> {
           env: envBefore ?? undefined,
           freeAtStart: freeNowB(),
           autoFit: autoFitBefore,
+          autoUbatch: autoUbatchBefore,
           lowPriority: lowPriorityBefore,
           shape: shapeBefore,
-          cardFreeB: hwSnapshot().gpus.map((g) =>
-            Math.max(0, g.vramTotalB - g.vramUsedB)
-          ),
+          cardFreeB: cardFreeNowB(),
         },
       );
     }
   }
 }
 
-/** Models table "Run": select, tune, start, and show the server. One gesture,
- *  because that is what "run this model" means to a user. */
-export function runModel(path: string): void {
-  selectModel(path);
-  applyOptimal();
+/**
+ * Models table "Run": select, tune, start, and show the server. One gesture,
+ * because that is what "run this model" means to a user.
+ *
+ * Every value is carried from the dispatch that set it to the spawn that uses
+ * it — the path, the settings `selectModel` voided, the tuner's answer — and
+ * none is read back from the replica in between: that read answered with the
+ * PREVIOUS model for a round trip, and Run started it. Tunes whatever the
+ * auto-optimal switch says, as the button's title promises.
+ */
+export function runModel(path: string): Promise<void> {
+  // The button is disabled while a server runs; this is the backstop, because
+  // selecting under a live run is exactly what the lock exists to prevent.
+  if (runLocked()) return Promise.resolve();
+  const base = selectModel(path);
+  const t = runTarget({ path });
+  const r = tunedForStart(t, base);
+  if (r) cfg.apply(r.tuning.settings, r.reasons);
+  const settings = r ? r.tuning.settings : base;
+  // The Server page it lands on names whatever is still in the way — for THIS
+  // model, which is why the model was selected even when it cannot start.
   ui.go("server");
-  void startServer();
+  if (startBlocker(path, settings)) return Promise.resolve();
+  return launch(t, settings, r !== null);
 }

@@ -131,6 +131,11 @@ export function droppedFlags(
     const value = opts.settings[p.key] ?? p.def;
     const wanted = emit(p, value);
     if (wanted.length === 0 || p.flag === "") continue;
+    // An EMPTY legacy spelling is not a drop, it is the old build's default
+    // doing the same thing: `-lm mmap` on a build from before `--load-mode`
+    // has nothing to say because mapping is what it already does. Reporting
+    // it put "not supported by this build" under a setting that was honoured.
+    if (p.legacy?.[String(value)]?.length === 0) continue;
     if (emitFor(p, value, opts.caps).length === 0) {
       out.push({ key: p.key, label: p.label, flag: wanted[0] as string });
     }
@@ -263,5 +268,8 @@ export function serverUrl(settings: Settings): string {
   const port = Number(settings.port ?? 8080);
   // 0.0.0.0 is a bind address, not a destination — clients must dial loopback.
   const dial = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  return `http://${dial}:${port}`;
+  // An IPv6 literal is bracketed in a URL (RFC 3986 §3.2.2), or its colons
+  // read as the port: `http://::1:8080` is not an address anything can dial.
+  const h = dial.includes(":") && !dial.startsWith("[") ? `[${dial}]` : dial;
+  return `http://${h}:${port}`;
 }

@@ -32,6 +32,12 @@ export function extractErrors(lines: readonly string[]): string[] {
     // reduced a named hard limit to "exited with code 134".
     else if (/GGML_ASSERT|ggml_abort|CUDA error/.test(l)) {
       out.push(l.trim());
+    } // The dynamic loader speaks before llama.cpp does, and it starts the
+    // line with the BINARY's path: `/…/llama-server: error while loading
+    // shared libraries: libcudart.so.13: cannot open shared object file`.
+    // Anchored on `error`, the only line that explains the exit was dropped.
+    else if (/error while loading shared libraries/i.test(l)) {
+      out.push(l.trim());
     }
   }
   return out;
@@ -81,7 +87,73 @@ const RESTART_OTHER: Step = {
     "If another llama-server is still running, stop it first — it holds its VRAM until it exits.",
 };
 
+/**
+ * The buffer an allocation failure names, and which pool that is.
+ *
+ * Every backend names its buffer type in the message — `CUDA0`, `Vulkan1`,
+ * `ROCm0` are device memory; `CPU` and the pinned `CUDA_Host`-style buffers are
+ * system RAM. Reading every `failed to allocate … buffer` as RAM told a user
+ * whose Vulkan card was full to go and free system memory. A message that
+ * names no buffer at all (`failed to allocate buffer for kv cache`, alone) is
+ * `null`: which pool is not something the log said.
+ */
+export function allocBuffer(
+  text: string,
+): { name: string; device: number | null; host: boolean } | null {
+  const m = /(?:failed|unable) to allocate ([A-Za-z][\w-]*?) buffer/i.exec(
+    text,
+  );
+  if (m?.[1] && !/^buffer$/i.test(m[1])) {
+    const name = m[1];
+    const host = /^cpu/i.test(name) || /_host$/i.test(name);
+    const idx = /(\d+)$/.exec(name);
+    return {
+      name,
+      device: host || !idx ? null : Number(idx[1]),
+      host,
+    };
+  }
+  // Vulkan's own allocator names neither a buffer type nor a pool — only the
+  // error it got back, which does.
+  if (/ErrorOutOfDeviceMemory/i.test(text)) {
+    return { name: "Vulkan", device: null, host: false };
+  }
+  return null;
+}
+
+/** The flag an argument error is about, from either spelling llama.cpp uses:
+ *  `error: invalid argument: --mlock` (a flag it has never heard of) and
+ *  `error while handling argument "--lazy-mode": invalid value` (a flag it
+ *  knows, given a value it does not). `null` when neither names one. */
+export function rejectedFlag(text: string): string | null {
+  const m = /error while handling argument "([^"]+)"/i.exec(text) ??
+    /(?:invalid|unknown) argument:\s*(-{1,2}[\w-]+)/i.exec(text);
+  return m?.[1] ?? null;
+}
+
 const SIGNATURES: Sig[] = [
+  {
+    // FIRST, and in particular before "no such file", which is also in this
+    // line and would blame the model: `libcudart.so.13: cannot open shared
+    // object file: No such file or directory` is the BUILD missing a library,
+    // not the model missing from disk. The usual cause is a build that
+    // borrowed its libraries from a source tree that has since been replaced,
+    // or a CUDA runtime that was never installed beside a prebuilt binary.
+    match: /error while loading shared libraries:\s*([^\s:]+)(?::\s*(.*))?/i,
+    reason: (m) =>
+      `llama-server could not start: the system could not load ${
+        m[1] ?? "a library it needs"
+      }${
+        m[2] ? ` (${m[2].trim()})` : ""
+      }. The build is incomplete on this machine — the model was never opened.`,
+    steps: [
+      {
+        text:
+          "Rebuild or reinstall this llama.cpp build on the Build tab. A prebuilt CUDA release needs its runtime archive beside it; a source build needs the libraries it was linked against.",
+        action: { kind: "open-tab", tab: "build" },
+      },
+    ],
+  },
   {
     match:
       /cudaMalloc failed: out of memory|unable to allocate CUDA\d* buffer/i,
@@ -111,22 +183,42 @@ const SIGNATURES: Sig[] = [
         {
           text:
             "Otherwise lower “GPU layers” on the Tune tab, or shrink the context, and watch the VRAM bar: it shows what is already in use by other processes.",
-          action: { kind: "open-tab", tab: "dashboard" },
+          action: { kind: "open-tab", tab: "settings" },
         },
       ];
     },
   },
   {
     match:
-      /failed to allocate.*buffer|ggml_backend_alloc|cannot allocate memory/i,
-    reason: () =>
-      "The machine ran out of memory while loading the model — system RAM this time, not VRAM.",
-    steps: [
-      {
-        text:
-          "Turn off --mlock, lower the context, or pick a smaller quantisation. The RAM bar on the Tune tab predicts this before you start.",
-      },
-    ],
+      /failed to allocate.*buffer|unable to allocate \w+ buffer|ErrorOutOfDeviceMemory|ggml_backend_alloc|cannot allocate memory/i,
+    reason: (m) => {
+      const b = allocBuffer(m.input);
+      if (b && !b.host) {
+        return `The GPU ran out of memory while loading the model — ${
+          b.device === null ? "the card" : `card ${b.device}`
+        } (${b.name}) could not allocate its buffer. Something else is already using the VRAM, or the plan asked that card for more than it has.`;
+      }
+      return "The machine ran out of memory while loading the model — system RAM this time, not VRAM.";
+    },
+    steps: (m) => {
+      const b = allocBuffer(m.input);
+      if (b && !b.host) {
+        return [
+          RESTART_OTHER,
+          {
+            text:
+              "Otherwise lower “GPU layers” or the context on the Tune tab — or re-run the tuner, which sizes each card separately — and watch the VRAM bar: it shows what is already in use by other processes.",
+            action: { kind: "open-tab", tab: "settings" },
+          },
+        ];
+      }
+      return [
+        {
+          text:
+            "Lower the context or pick a smaller quantisation, and leave “Model loading” on auto: mlock pins the weights and none copies the whole file into RAM, and both need more of it. The RAM bar on the Tune tab predicts this before you start.",
+        },
+      ];
+    },
   },
   {
     match: /bind.*(Address already in use|EADDRINUSE)|couldn't bind/i,
@@ -184,17 +276,30 @@ const SIGNATURES: Sig[] = [
     ],
   },
   {
+    // The FLAG, not the phrase. `m[0]` is "invalid argument" — quoting it
+    // told the user a flag was rejected without saying which, on a command
+    // line of thirty. The line itself names it, in one of two spellings.
     match: /unknown argument|invalid argument|error while handling argument/i,
-    reason: (m) =>
-      `This build of llama-server rejected one of the flags: ${
-        m[0].slice(0, 80)
-      }. Older builds do not have every option.`,
-    steps: [
-      {
-        text:
-          "Reset that setting to its default on the Tune tab, or update to a newer llama.cpp build.",
-      },
-    ],
+    reason: (m) => {
+      const flag = rejectedFlag(m.input);
+      const why = /error while handling argument "[^"]+":\s*([^\n]+)/i
+        .exec(m.input)?.[1]?.trim();
+      return flag
+        ? `This build of llama-server rejected ${flag}${
+          why ? ` (${why.slice(0, 80)})` : ""
+        }. Older builds do not have every option, and upstream removes flags as well as adding them.`
+        : "This build of llama-server rejected one of the flags. Older builds do not have every option, and upstream removes flags as well as adding them.";
+    },
+    steps: (m) => {
+      const flag = rejectedFlag(m.input);
+      return [
+        {
+          text: `Reset ${
+            flag ? `the setting behind ${flag}` : "that setting"
+          } to its default on the Tune tab, or update to a newer llama.cpp build.`,
+        },
+      ];
+    },
   },
   {
     // AFTER the cudaMalloc signature (a named allocation is more specific) and
@@ -215,7 +320,7 @@ const SIGNATURES: Sig[] = [
       {
         text:
           "Or lower the context or “GPU layers” by hand on the Tune tab, and watch the VRAM bar while generating.",
-        action: { kind: "open-tab", tab: "dashboard" },
+        action: { kind: "open-tab", tab: "settings" },
       },
     ],
   },
@@ -316,7 +421,7 @@ export function diagnoseServerExit(
         steps: [
           {
             text:
-              "Lower the context or turn off --mlock so the model needs less RAM, then start again.",
+              "Lower the context, or set “Model loading” back to auto (mlock pins the weights, none copies them all into RAM), so the model needs less RAM, then start again.",
           },
         ],
       };

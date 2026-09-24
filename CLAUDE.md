@@ -13,8 +13,8 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.0-beta`**, vendored at `dep/aio` → symlink to the
-  provisioned release (`~/.local/lib/aio-versions/v1.0.0-beta`). Never
+- **Deno 2.9+ + aio `1.0.9-beta`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.9-beta`). Never
   `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
   `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
   version the symlink actually resolves to — `deno task aiol` says so when they
@@ -41,6 +41,13 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
   a `machine:` key — so `--force` was the right answer and the finding went to
   the framework's feedback file. Anything that breaks from here is a bug in aio,
   not a step this app missed.
+  - **beta → 1.0.9-beta (2026-09-23) was the same: a pin change.** The suite was
+    green before any app edit. `am pin` still refused over
+    `perfBudget: { reduce: 100 }` (1.0.1-beta fixed the `machine:` case only),
+    so `--force` again. `am fix` moved Electron to aio's tested `44.4.1` in BOTH
+    apps — but run inside `client/` it also pinned `v1.0.8-beta` and made a
+    `client/dep/aio` link nothing imports; the client resolves aio through
+    `../dep/aio` and must carry neither. Both went to the feedback file.
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.

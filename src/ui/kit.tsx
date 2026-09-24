@@ -119,7 +119,13 @@ export function ErrorNote(props: { message: string; onDismiss?: () => void }) {
       <span class="error-text">{props.message}</span>
       {props.onDismiss
         ? (
-          <button type="button" class="x" onClick={props.onDismiss}>
+          <button
+            type="button"
+            class="x"
+            aria-label="Dismiss this error"
+            title="Dismiss"
+            onClick={props.onDismiss}
+          >
             ✕
           </button>
         )
@@ -612,17 +618,28 @@ export function Waiting() {
 export function Toggle(props: {
   checked: boolean;
   label: string;
+  /** The accessible name when the visible `label` is empty because the name is
+   *  already printed beside the switch (a catalog row's heading). A checkbox
+   *  with no name is announced as "checkbox", which says nothing. */
+  ariaLabel?: string;
   tip?: string;
   /** Stable handle for tests, when the label is not addressable enough. */
   t?: string;
+  /** A switch that cannot be flipped must SAY so: guarding only the handler
+   *  leaves the box flipping in the DOM over state that never changed. */
+  disabled?: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
-    <label class="toggle" title={props.tip}>
+    <label
+      class={props.disabled ? "toggle is-disabled" : "toggle"}
+      title={props.tip}
+    >
       <input
         type="checkbox"
         checked={props.checked}
-        aria-label={props.label}
+        aria-label={props.ariaLabel || props.label}
+        disabled={props.disabled}
         t={props.t}
         onChange={(e) =>
           props.onChange((e.currentTarget as HTMLInputElement).checked)}
@@ -636,6 +653,7 @@ export function Toggle(props: {
 export function Segmented<T extends string>(props: {
   value: T;
   options: readonly { id: T; label: string; tip?: string }[];
+  disabled?: boolean;
   onChange: (v: T) => void;
 }) {
   return (
@@ -645,7 +663,11 @@ export function Segmented<T extends string>(props: {
           key={o.id}
           type="button"
           class={o.id === props.value ? "seg on" : "seg"}
+          // The selection is otherwise a CSS class — invisible to a screen
+          // reader, which announced three identical buttons.
+          aria-pressed={o.id === props.value ? "true" : "false"}
           title={o.tip}
+          disabled={props.disabled}
           onClick={() => props.onChange(o.id)}
         >
           {o.label}

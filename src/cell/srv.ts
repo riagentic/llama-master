@@ -476,6 +476,15 @@ export const srv = cell("srv", {
       s.rssFileB = 0;
       try {
         const io = await import("./srv.server.ts");
+        // The one window a Stop can land in before the spawn: this await. The
+        // spawn below is synchronous, so the server module's own generation
+        // check cannot see a Stop that arrived HERE — but `stop` writes
+        // "stopping" before its first await, and that write is visible now.
+        // aio-ok — reading what a concurrent Stop wrote is the point.
+        if (s.status !== "starting") {
+          s.pid = 0;
+          return;
+        }
         const { pid } = io.start(argv, run?.env);
         s.pid = pid;
         s.startedAt = Date.now();
@@ -556,7 +565,7 @@ export const srv = cell("srv", {
     },
 
     /** Single writer of liveness. Cheap when nothing changed. */
-    async poll(s) {
+    async poll(s) { // aio-ok — an OBSERVER: every read after an await is deliberate
       if (s.status === "stopped") return;
       // aiol-ok: this method IS the observer of state that changes underneath
       // it — reading the freshest status after the await is its whole job.

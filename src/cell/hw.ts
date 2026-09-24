@@ -164,6 +164,7 @@ export const hw = cell("hw", {
         const gpuUtil = snap.gpus.length
           ? Math.max(...snap.gpus.map((g) => g.utilPct))
           : 0;
+        // aio-ok — a rolling window, appended to (see cpuHistory above).
         s.gpuHistory = pushHistory(s.gpuHistory.slice(), gpuUtil);
 
         // Device-wide memory use, sampled over the last minute. Note "device

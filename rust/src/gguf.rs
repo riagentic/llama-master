@@ -172,6 +172,15 @@ struct Cur<'a> {
 /// is a normal first-attempt outcome, never an error the user sees.
 type R<T> = Result<T, usize>;
 
+/// A length from the file, narrowed to what this target can index. On wasm32
+/// `usize` is 32 bits, so `as usize` would read a u64 length of `2^32 + 5` as
+/// `5` and carry on seeking from the wrong byte — every field after it silently
+/// wrong. A length the target cannot even address is not "read more"; it is a
+/// header this build cannot read.
+fn narrow<T: TryFrom<u64>>(n: u64) -> R<T> {
+    T::try_from(n).map_err(|_| usize::MAX)
+}
+
 impl<'a> Cur<'a> {
     fn take(&mut self, n: usize) -> R<&'a [u8]> {
         let end = self.p.checked_add(n).ok_or(usize::MAX)?;
@@ -199,8 +208,12 @@ impl<'a> Cur<'a> {
             self.u64()
         }
     }
+    /// `len()` as an index — see `narrow`.
+    fn len_usize(&mut self) -> R<usize> {
+        narrow(self.len()?)
+    }
     fn str(&mut self) -> R<String> {
-        let n = self.len()? as usize;
+        let n = self.len_usize()?;
         let s = self.take(n)?;
         Ok(String::from_utf8_lossy(s).into_owned())
     }
@@ -257,7 +270,7 @@ fn read_value(c: &mut Cur, t: u32) -> R<Val> {
         8 => Val::Str(c.str()?),
         9 => {
             let it = c.u32()?;
-            let n = c.len()? as usize;
+            let n = c.len_usize()?;
             if fixed_size(it).is_some() && n <= MAX_ARR {
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -271,7 +284,7 @@ fn read_value(c: &mut Cur, t: u32) -> R<Val> {
                 c.skip(n.saturating_mul(sz))?;
             } else if it == 8 {
                 for _ in 0..n {
-                    let l = c.len()? as usize;
+                    let l = c.len_usize()?;
                     c.skip(l)?;
                 }
             } else {
@@ -505,6 +518,14 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     let a = |suffix: &str| -> Option<f64> { kv_num(&kv, &format!("{}.{}", arch, suffix)) };
 
     let n_layer = a("block_count").unwrap_or(0.0) as usize;
+    // The table below is allocated from this, so it is bounded before it is
+    // trusted: a hostile `block_count` of four billion is a 64 GB allocation,
+    // which is a trap in the WASM module rather than an error for one file.
+    // Rejected, not clamped — a header that lies about its own depth describes
+    // no model the planner could size.
+    if n_layer > MAX_LAYERS {
+        return Err(usize::MAX);
+    }
     let n_embd = a("embedding_length").unwrap_or(0.0) as u64;
     let n_head = a("attention.head_count").unwrap_or(0.0) as u64;
     // An ARRAY (one per layer, Gemma-4) is not "absent": falling back to the
@@ -565,7 +586,9 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         let _offset = c.u64()?;
 
         let size = match type_info(t) {
-            Some((block, per_block)) if block > 0 => elems / block * per_block,
+            // Saturating throughout: `elems` is a product of header-supplied
+            // dims, and a wrapped size is a small, plausible, wrong number.
+            Some((block, per_block)) if block > 0 => (elems / block).saturating_mul(per_block),
             _ => {
                 unknown_types += 1;
                 0
@@ -576,7 +599,7 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
             params = params.saturating_add(elems);
         }
         match type_hist.iter_mut().find(|(ty, _)| *ty == t) {
-            Some((_, n)) => *n += size,
+            Some((_, n)) => *n = n.saturating_add(size),
             None => type_hist.push((t, size)),
         }
 
@@ -594,9 +617,10 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
                 if i >= layers.len() {
                     layers.resize(i + 1, Layer::default());
                 }
-                layers[i].bytes += size;
+                let l = &mut layers[i];
+                l.bytes = l.bytes.saturating_add(size);
                 if is_expert(&name) {
-                    layers[i].expert_bytes += size;
+                    l.expert_bytes = l.expert_bytes.saturating_add(size);
                 }
             }
             // `per_layer_token_embd` is qwen4exp's PLE n-gram gather table (and
@@ -606,8 +630,11 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
             // file; filing it under "output" hands a quarter of the model to
             // the head that `-ngl` offloads, and every VRAM plan is wrong.
             _ if name.starts_with("token_embd")
-                || name.starts_with("per_layer_token_embd") => embd_bytes += size,
-            _ => output_bytes += size,
+                || name.starts_with("per_layer_token_embd") =>
+            {
+                embd_bytes = embd_bytes.saturating_add(size)
+            }
+            _ => output_bytes = output_bytes.saturating_add(size),
         }
     }
 
@@ -1124,6 +1151,58 @@ mod tests {
             Err(need) => assert!(need > 40 && need != usize::MAX, "need = {}", need),
             Ok(_) => panic!("truncated header must not parse"),
         }
+    }
+
+    /// A hostile `block_count` sized the layer table before anything checked
+    /// it: four billion layers is a 64 GB allocation, a trap in the WASM module
+    /// instead of an error for one file.
+    #[test]
+    fn a_block_count_past_the_ceiling_is_refused_not_allocated() {
+        let mut b = Buf::new();
+        b.u64(0);
+        b.u64(2);
+        b.kv_str("general.architecture", "llama");
+        b.kv_u32("llama.block_count", 4_000_000_000);
+        assert_eq!(parse(&b.0).err(), Some(usize::MAX));
+
+        let mut ok = Buf::new();
+        ok.u64(0);
+        ok.u64(2);
+        ok.kv_str("general.architecture", "llama");
+        ok.kv_u32("llama.block_count", MAX_LAYERS as u32);
+        assert_eq!(parse(&ok.0).unwrap().layers.len(), MAX_LAYERS, "the ceiling itself is allowed");
+    }
+
+    /// Dims are header-supplied, so a tensor's size is too. Unchecked, the
+    /// size and every running total wrapped (release) or panicked (debug).
+    #[test]
+    fn tensor_sizes_saturate_instead_of_overflowing() {
+        let mut b = Buf::new();
+        b.u64(5);
+        b.u64(1);
+        b.kv_str("general.architecture", "llama");
+        b.tensor("blk.0.ffn_up_exps.weight", &[u64::MAX], 0); // F32: x4 overflows
+        b.tensor("blk.0.ffn_down_exps.weight", &[u64::MAX, 2], 0);
+        b.tensor("token_embd.weight", &[u64::MAX], 0);
+        b.tensor("token_embd.extra", &[u64::MAX], 0);
+        b.tensor("output.weight", &[u64::MAX], 0);
+        let g = parse(&b.0).unwrap();
+        assert_eq!(g.layers[0].bytes, u64::MAX);
+        assert_eq!(g.layers[0].expert_bytes, u64::MAX);
+        assert_eq!(g.embd_bytes, u64::MAX);
+        assert_eq!(g.output_bytes, u64::MAX);
+        assert_eq!(g.tensor_bytes, u64::MAX);
+    }
+
+    /// On wasm32 `as usize` truncated a u64 length (`2^32 + 5` read as 5) and
+    /// the cursor carried on from the wrong byte. `narrow` is the one door, and
+    /// it is exercised here at 32 bits — the width the WASM build runs at —
+    /// because a 64-bit test host cannot overflow its own `usize`.
+    #[test]
+    fn a_length_the_target_cannot_address_is_refused() {
+        assert_eq!(narrow::<u32>((1u64 << 32) + 5), Err(usize::MAX));
+        assert_eq!(narrow::<u32>(u32::MAX as u64), Ok(u32::MAX));
+        assert_eq!(narrow::<usize>(7), Ok(7));
     }
 
     #[test]

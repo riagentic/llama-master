@@ -20,9 +20,9 @@ import { SpeedPanel } from "./SpeedPanel.tsx";
 import { SetupPanel } from "./SetupView.tsx";
 import {
   activeBuild,
-  currentModel,
   modelRuntime,
   serverRunning,
+  shownModel,
 } from "./derive.ts";
 
 /**
@@ -146,7 +146,9 @@ function Props() {
 export function ServerPanel() {
   const blocker = startBlocker();
   const running = serverRunning();
-  const model = currentModel();
+  // What is RUNNING while it runs, like the command and the memory view on
+  // this page — the selection can have moved since (`shownModel`).
+  const model = shownModel();
   const build = activeBuild();
   const url = endpoint();
 
