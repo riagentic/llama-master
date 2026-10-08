@@ -65,6 +65,17 @@ import { queueNote, submitKind } from "../lib/queue.ts";
 import { transcript } from "../lib/richtext.ts";
 import { updateFor } from "../lib/update.ts";
 import { runtimeMismatch } from "../lib/runtime.ts";
+import {
+  strataArgs,
+  strataMismatch,
+  strataModel,
+  strataNeeds,
+  strataOffer,
+  strataReserveMib,
+  strataRunOf,
+  strataSetupRows,
+} from "../lib/strata.ts";
+import type { StrataModel } from "../lib/strata.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { UpdateCheck } from "../lib/update.ts";
 import type { FixPlan } from "../lib/fixplan.ts";
@@ -140,7 +151,100 @@ export function modelRuntimeFor(path: string): Diagnosis | null {
   const m = models.items.find((x) => x.path === path);
   const b = activeBuild();
   if (!m || !b) return null;
-  return runtimeMismatch(m.meta?.vendor, b.ref, builds.installed);
+  return runtimeMismatch(m.meta?.vendor, b.ref, builds.installed) ??
+    strataMismatch(m.file, b.ref, builds.installed);
+}
+
+/**
+ * The Strata run this page is about, or null on a llama.cpp build: the
+ * RUNNING one read back from its own argv, else what Start would spawn. The
+ * one source for every Strata-specific line on screen — setup rows, the load
+ * bar's total, the memory note, the Start check.
+ */
+export function strataView():
+  | {
+    model: StrataModel;
+    ctx: number;
+    reserveMib: number;
+    cards: number;
+    /** Estimates, both (`strata.ts:strataNeeds`). */
+    vramB: number;
+    ramB: number;
+    running: boolean;
+  }
+  | null {
+  if (activeBuild()?.engine !== "strata") return null;
+  const running = srv.runModel !== "" && srv.argv.length > 0;
+  const m = running ? shownModel() : currentModel();
+  const model = m ? strataModel(m.file) : null;
+  if (!m || !model) return null;
+  const run = strataRunOf(
+    running
+      ? srv.argv
+      : strataCommand(m.path, cfg.settings, ctxOverride()) ?? [],
+  );
+  if (!run) return null;
+  const cards = hw.gpus.filter((g) => g.vendor === "nvidia").length;
+  return {
+    model,
+    ...run,
+    cards,
+    ...strataNeeds({
+      fileB: m.sizeB,
+      // A live run is sized against the machine it was started on: its own
+      // bytes are gone from "free now".
+      freeVramB: running && srv.startFreeVramB > 0
+        ? srv.startFreeVramB
+        : vramTotalB() - vramUsedB(),
+      cards,
+      reserveMib: run.reserveMib,
+    }),
+    running,
+  };
+}
+
+/** "A faster engine exists for this model" — an offer beside Start, never a
+ *  blocker (`src/lib/strata.ts`). */
+export function engineOffer(): Diagnosis | null {
+  const m = models.items.find((x) => x.path === models.selected);
+  const b = activeBuild();
+  if (!m || !b) return null;
+  return strataOffer(
+    m.file,
+    b.ref,
+    builds.installed,
+    hw.gpus.some((g) => g.vendor === "nvidia"),
+  );
+}
+
+/**
+ * The argv a Strata build runs for `path`, or null when the active build is
+ * llama.cpp (or the model is not one of Strata's). The ONE composer: Start
+ * spawns this array and the Command panel draws it.
+ */
+export function strataCommand(
+  path: string,
+  settings: Settings,
+  pin = 0,
+): string[] | null {
+  const b = activeBuild();
+  if (b?.engine !== "strata") return null;
+  const model = strataModel(path);
+  if (!model) return null;
+  return [
+    b.serverBin,
+    ...strataArgs({
+      modelPath: path,
+      model,
+      ctx: pin || Number(settings.ctxSize) || 0,
+      reserveMib: strataReserveMib(
+        cfg.reservePerGpuVramB,
+        cfg.reserveConnectedVramB,
+      ),
+      host: String(settings.host ?? "127.0.0.1"),
+      port: Number(settings.port ?? 8080),
+    }),
+  ];
 }
 
 /**
@@ -231,6 +335,11 @@ export function headroomNow(): string {
  */
 export function driftNow(): Drift {
   if (!memoryIsLive()) return { kind: "none" };
+  // Drift is measured against a llama.cpp plan. A Strata run fills every card
+  // and copies its experts into RAM by DESIGN, so against that plan it is
+  // "over" from its first second — "something else has taken memory" about
+  // memory the run itself holds, with a restart button under it.
+  if (activeBuild()?.engine) return { kind: "none" };
   const p = currentStatePlan();
   const d = drift({
     vramOverB: p.vram.overB,
@@ -267,6 +376,7 @@ export function loadingNow():
   | (LoadProgress & { startedAt: number; note: string })
   | null {
   if (srv.status !== "starting" || srv.pid === 0) return null;
+  const st = strataView();
   const p = currentStatePlan();
   return {
     ...loadProgress({
@@ -274,7 +384,9 @@ export function loadingNow():
       startFreeVramB: srv.startFreeVramB,
       freeVramB: vramTotalB() - vramUsedB(),
       rssB: srv.rssB,
-      plannedB: p.vram.usedB + p.ram.usedB,
+      // Strata's own footprint: the llama.cpp plan for the same file is a
+      // different placement, and a bar measured against it ends early.
+      plannedB: st ? st.vramB + st.ramB : p.vram.usedB + p.ram.usedB,
     }),
     startedAt: srv.startedAt,
     // The ladder's step-down note belongs with the progress it restarted.
@@ -382,6 +494,8 @@ export function envProblems(): { token: string; why: string }[] {
  * server's rows describe what it was STARTED with.
  */
 export function shownSetup(): SetupRow[] {
+  const st = strataView();
+  if (st) return strataSetupRows(st);
   return setupRows(shownModel()?.meta ?? null, shownSettings(), hwSnapshot());
 }
 

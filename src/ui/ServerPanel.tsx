@@ -20,6 +20,7 @@ import { SpeedPanel } from "./SpeedPanel.tsx";
 import { SetupPanel } from "./SetupView.tsx";
 import {
   activeBuild,
+  engineOffer,
   modelRuntime,
   serverRunning,
   shownModel,
@@ -216,6 +217,14 @@ export function ServerPanel() {
             )
             : blocker
             ? <div class="warn-note">{blocker}</div>
+            : engineOffer()
+            ? (
+              <Guidance
+                diagnosis={engineOffer()!}
+                tone="warn"
+                t="srv-engine"
+              />
+            )
             : null}
           <div class="kv-grid">
             <KV k="Build" v={build ? `${build.ref} · ${build.backend}` : "—"} />

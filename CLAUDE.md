@@ -13,8 +13,8 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.9-beta`**, vendored at `dep/aio` → symlink to the
-  provisioned release (`~/.local/lib/aio-versions/v1.0.9-beta`). Never
+- **Deno 2.9+ + aio `1.0.19-beta`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.19-beta`). Never
   `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
   `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
   version the symlink actually resolves to — `deno task aiol` says so when they
@@ -48,6 +48,12 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
     apps — but run inside `client/` it also pinned `v1.0.8-beta` and made a
     `client/dep/aio` link nothing imports; the client resolves aio through
     `../dep/aio` and must carry neither. Both went to the feedback file.
+  - **1.0.9-beta → 1.0.19-beta (2026-10-08): a pin change again, and `am pin` no
+    longer refuses.** No `--force` — the `perfBudget: { reduce: 100 }` false
+    positive is gone. The pin moved Electron to `44.5.1`, esbuild to `0.25.12`
+    and happy-dom to `20.14.5` in the app; the CLIENT's three were matched by
+    hand in `client/deno.json` (no `am fix` there — see above). Both suites
+    green, `am migrations` reports no drift.
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.
@@ -1092,6 +1098,81 @@ cannot act on is a bug.
   Another person's fork is `unknown` and never blocked: the app cannot see into
   it. A Hadamard-folded `Q2_0` loads on upstream and answers GARBAGE, which is
   why this is a block and not a warning.
+- **Strata is a second ENGINE behind the same Start button, not a port.**
+  `Niko1221/Strata` runs one model family — Qwen3.8-Flash-Next — with a
+  per-expert VRAM cache, its own kernels and an MTP draft layer, where llama.cpp
+  streams every routed expert from RAM. Measured 2026-10-08, the same UD-Q4_K_XL
+  file, two 24 GB Blackwell cards, 4 GB reserved on each, the app's own bench
+  prompts, warm: **53-64 tok/s against 11-15, and a 28,863-token prompt read at
+  2,690 tok/s against 159** (41-54 without the draft layer). Built and started
+  THROUGH the app: 80 s to build, ~110 s to load, 51-69 tok/s at a 131,072
+  context.
+  - **It is a build like any other** (`fork:Niko1221/Strata`,
+    `Build.engine ===
+    "strata"`), and `src/lib/strata.ts` is everything the
+    app decides about it: which files it takes (`strataModel`, anchored on the
+    first shard's exact name — Strata refuses every other quant, and a loose
+    match would offer an engine that then says no), the argv, the OFFER on a
+    llama.cpp build (`strataOffer` — never a block, llama.cpp runs the file
+    correctly) and the BLOCK on a Strata build with any other model
+    (`strataMismatch`).
+  - **What the app spawns is a launcher it wrote** (`llama-master-strata`, in
+    the build directory, so the builds-root sandbox holds): it runs Strata's
+    `setup.py` for the model — a rewrite of the config when nothing else changed
+    — then `exec`s the Python server. One pid, one log, and the argv on screen
+    is the argv that ran. `srv.server.ts` recognises the orphan by
+    `/serve/server.py` because the `exe` is an interpreter outside the root.
+  - **Three things its installer would do and must not here.** `sudo apt-get`
+    for Python or CUDA: a `sudo` that refuses is first on the launcher's PATH,
+    and `STRATA_NVCC` names the app's own toolkit. Download the model:
+    `--gguf-dir` hands it the files on disk — the one fetch is the draft layer,
+    **6.5 GB**, stated on the offer before the button. Fill the display card:
+    `--vram-reserve-mib` carries the user's reserve (one number for every card,
+    so it is the display card's).
+  - **Packs and the draft layer live in `cache/strata/`, not in the build**, so
+    an engine update does not fetch 6.5 GB again. Built IN PLACE, unlike a
+    llama.cpp build: a venv bakes absolute paths into every script, so
+    stage-then-rename breaks it. Debian's `python3` has no `ensurepip`; the venv
+    falls back to `uv`.
+  - **Strata is not llama-server, and three callers had to learn it.** No
+    `--help` vocabulary (`builds.probe` skips an `engine` build — its launcher
+    would answer by running a setup), no tuner and no fit ladder (`-c` and
+    `--n-cpu-moe` are flags this command does not have), and no `/completion`:
+    both `probe` and `bench` fall back to `/v1/chat/completions` on a 404, which
+    returns the same `timings`. Without the probe's half a run that generated
+    fine stayed "unproven" for ever.
+  - **A Strata run is described from ITS OWN argv and from measurement, never
+    from a llama.cpp plan of the same file.** The first version left every
+    llama.cpp reading in place and each one was wrong in its own way: `drift`
+    announced "something else has taken memory" about memory the run itself held
+    (Strata fills every card and copies its experts into RAM by design, so
+    against a llama.cpp plan it is "over" from second one); the Setup chips said
+    `MoE→RAM · q8_0 · np 1`; the status tooltip said `TypeError: fetch failed`
+    for the whole load, because Strata opens its port only once the model is in
+    where llama-server answers 503; and `srv.rss` read the Python WRAPPER — 0.2
+    GB for a run holding 83 — so the map drew the engine's memory as somebody
+    else's. Now `derive.ts:strataView` is the one source (the running argv via
+    `strataRunOf`, else what Start would spawn): Setup rows, the load bar's
+    total, the memory forecast, the live figures and the Start check all read
+    it; `driftNow` is `none` on an engine build; `rss` sums the process TREE
+    (per thread — a child belongs to the thread that spawned it); the spawn
+    records `cardFreeB` so each card's share is measured.
+  - **Its footprint is an estimate of a different kind** (`strataNeeds`): VRAM
+    is "whatever is free, less the reserve on each card" (predicted 34.7 GB,
+    took 35.6) and RAM is 0.75 of the FILE (111.3 GB on disk, 82.8 GB resident,
+    79.6 of it anonymous). That RAM is not a mapping the kernel can drop, so
+    `strataRamShort` BLOCKS Start when less is free — the alternative is the OOM
+    killer picking a neighbour. One file on one machine; every use says "about".
+  - **On a Strata build the page drops what it cannot honour**: the placement
+    picker, the quantisation hint, the tuner's switch, the thinking switch,
+    stability and the llama.cpp catalog. Context is Strata's six sizes as
+    buttons (`STRATA_CONTEXTS`), the reserve boxes stay — they are the one
+    setting both engines share.
+  - **Still open.** The memory MAP's bands inside a card (weights / KV /
+    compute) are apportioned from a llama.cpp plan; only the card totals and the
+    RAM figure are measured. The Tune and Server pages still show llama.cpp's
+    controls. A failed Strata rebuild leaves it unlisted until the next good
+    one.
 - **Upstream ships Linux CUDA again (b11039+), in two archives.** The binary
   (`llama-bNNN-bin-ubuntu-cuda-13.3-x64.tar.gz`) and its runtime
   (`cudart-<same name>`; Windows: `cudart-llama-bin-win-cuda-X.Y-x64.zip`, no

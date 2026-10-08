@@ -10,6 +10,17 @@
 /** The phases llama-server actually passes through, newest match wins.
  *  Ordered specific-first; scanned from the newest log line backwards. */
 const PHASES: readonly { re: RegExp; label: string }[] = [
+  // Strata (`src/lib/strata.ts`) narrates its own load in sentences. Its
+  // "still starting (N s)" lines match nothing, so the phase before them
+  // stands.
+  { re: /\[strata\] almost ready/, label: "almost ready" },
+  {
+    re: /filling the GPU's expert cache/,
+    label: "filling the GPUs with experts",
+  },
+  { re: /loading the experts into RAM/, label: "copying experts into RAM" },
+  { re: /starting the engine: reading/, label: "reading the weights" },
+  { re: /^=== Step \d+:/, label: "checking the Strata setup" },
   { re: /warming up|warmup/i, label: "warming up" },
   {
     re: /compute buffer|graph splits|sched_reserve/i,

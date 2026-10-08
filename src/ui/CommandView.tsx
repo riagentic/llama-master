@@ -18,14 +18,18 @@
 import { cfg } from "../cell/cfg.ts";
 import { hw } from "../cell/hw.ts";
 import { ui } from "../cell/ui.ts";
-import { commandBlock, droppedFlags } from "../lib/command.ts";
+import { srv } from "../cell/srv.ts";
+import { argvBlock, commandBlock, droppedFlags } from "../lib/command.ts";
 import { cliBin, serverBin } from "./actions.ts";
 import {
+  activeBuild,
   activeCaps,
+  ctxOverride,
   envProblems,
   shownEnv,
   shownModel,
   shownSettings,
+  strataCommand,
 } from "./derive.ts";
 import { LOCK_REASON, runLocked } from "./actions.ts";
 import { CopyButton, DraftInput, Panel } from "./kit.tsx";
@@ -33,6 +37,12 @@ import { CopyButton, DraftInput, Panel } from "./kit.tsx";
 /** The argv of one target, as one pasteable line. */
 function commandFor(target: "server" | "cli"): string[] {
   const model = shownModel();
+  // Another engine: the argv Start spawns (or the running one's own), drawn
+  // the same way. It has no chat CLI, so both targets show the server.
+  const strata = srv.runModel && srv.argv.length > 0 && activeBuild()?.engine
+    ? srv.argv
+    : strataCommand(model?.path ?? "", shownSettings(), ctxOverride());
+  if (strata) return argvBlock(strata, hw.osHome);
   const bin = target === "server"
     ? serverBin() || "llama-server"
     : cliBin() || "llama-cli";
@@ -112,6 +122,7 @@ function CommandBlock(props: {
  * to report.
  */
 function Dropped(props: { target: "server" | "cli"; t: string }) {
+  if (activeBuild()?.engine) return null;
   const gone = droppedFlags(props.target, {
     settings: shownSettings(),
     caps: activeCaps(),

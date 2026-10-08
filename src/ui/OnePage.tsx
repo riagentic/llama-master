@@ -52,6 +52,7 @@ import {
   CopyButton,
   Empty,
   ErrorNote,
+  KV,
   MappedBar,
   Panel,
   Pill,
@@ -64,6 +65,7 @@ import { Guidance } from "./Guidance.tsx";
 import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
 import {
+  activeBuild,
   benchNow,
   changedCount,
   chatHasContent,
@@ -72,6 +74,7 @@ import {
   currentModel,
   currentStatePlan,
   driftNow,
+  engineOffer,
   loadingNow,
   mappedModelB,
   memoryIsLive,
@@ -82,10 +85,12 @@ import {
   serverRunning,
   shownModel,
   shownSettings,
+  strataView,
   vramTotalB,
   vramUsedB,
 } from "./derive.ts";
 import type { Plan } from "../lib/plan.ts";
+import { STRATA_CONTEXTS } from "../lib/strata.ts";
 
 /**
  * The four vitals, 2×2: CPU and GPU on top, their memory under each.
@@ -262,6 +267,10 @@ function RunStrip() {
   const blocker = startBlocker();
   const running = serverRunning();
   const locked = runLocked();
+  // Another engine (`src/lib/strata.ts`): llama.cpp's controls describe a
+  // command it does not run, so they give way to the few things it is given.
+  const engine = activeBuild()?.engine;
+  const strata = strataView();
   const st = currentStability();
   const all = placements();
   // The PIN ceiling is the advertised length (`trainedCtx`), not the tuner's
@@ -370,14 +379,28 @@ function RunStrip() {
           </button>
         </label>
 
-        <QuantHint />
+        {engine ? null : <QuantHint />}
 
+        {
+          /* Another engine places the model itself: a placement picker, a
+             quantisation hint and the tuner's switch would all be controls
+             over a command that is not the one being run. */
+        }
         <div class="run-row">
           <span class="run-label">Runs on</span>
-          <div class="ctx-controls">
-            <PlacementPicker all={all} locked={locked} />
-            <PlacementAdvice all={all} locked={locked} />
-          </div>
+          {strata
+            ? (
+              <span class="dim" t="one-strata-place">
+                Strata decides: every GPU, filled with the most-used experts up
+                to your reserve; about {bytes(strata.ramB)} of the rest in RAM.
+              </span>
+            )
+            : (
+              <div class="ctx-controls">
+                <PlacementPicker all={all} locked={locked} />
+                <PlacementAdvice all={all} locked={locked} />
+              </div>
+            )}
         </div>
 
         {
@@ -387,13 +410,17 @@ function RunStrip() {
         }
         <div class="run-row">
           <span class="run-label">Context</span>
-          <CtxControls
-            ctxNow={ctxNow}
-            target={target}
-            locked={locked}
-            meta={m?.meta ?? null}
-            t="one-ctx"
-          />
+          {strata
+            ? <StrataCtx ctx={strata.ctx} locked={locked} />
+            : (
+              <CtxControls
+                ctxNow={ctxNow}
+                target={target}
+                locked={locked}
+                meta={m?.meta ?? null}
+                t="one-ctx"
+              />
+            )}
         </div>
 
         {
@@ -417,7 +444,7 @@ function RunStrip() {
           <div class="run-prefs">
             <LanSwitch t="one-lan" />
             <PrioritySwitch t="one-prio" />
-            <ThinkSwitch t="one-think" />
+            {engine ? null : <ThinkSwitch t="one-think" />}
           </div>
         </div>
       </div>
@@ -427,13 +454,15 @@ function RunStrip() {
 
       <div class="run-actions">
         <StatusBig />
-        <Toggle
-          checked={cfg.autoOptimal}
-          label="Optimal automatically"
-          tip="Re-tune for the selected model every time the server starts"
-          t="one-auto-optimal"
-          onChange={() => cfg.toggleAutoOptimal()}
-        />
+        {engine ? null : (
+          <Toggle
+            checked={cfg.autoOptimal}
+            label="Optimal automatically"
+            tip="Re-tune for the selected model every time the server starts"
+            t="one-auto-optimal"
+            onChange={() => cfg.toggleAutoOptimal()}
+          />
+        )}
         <span class="spacer" />
         {running
           ? (
@@ -491,9 +520,11 @@ function RunStrip() {
         )
         : blocker
         ? <div class="warn-note">{blocker}</div>
+        : engineOffer()
+        ? <Guidance diagnosis={engineOffer()!} tone="warn" t="one-engine" />
         : null}
 
-      {st.level !== "ok"
+      {st.level !== "ok" && !engine
         ? (
           <div
             class={st.level === "risk" ? "error-note" : "warn-note"}
@@ -523,6 +554,31 @@ function RunStrip() {
  * plan's total for the running command; the server's own log names the phase.
  * The total is an estimate and says so — the movement is what matters.
  */
+/** Strata's contexts are a short list it was tuned at, not a range. */
+function StrataCtx(props: { ctx: number; locked: boolean }) {
+  return (
+    <div class="ctx-controls" t="one-strata-ctx">
+      <div class="ctx-bands">
+        {STRATA_CONTEXTS.map((c) => (
+          <button
+            key={c}
+            type="button"
+            class={c === props.ctx ? "btn small on" : "btn small"}
+            aria-pressed={c === props.ctx}
+            disabled={props.locked}
+            title={props.locked
+              ? LOCK_REASON
+              : "A longer context leaves less GPU memory for experts, so it is a little slower"}
+            onClick={() => cfg.setCtxOverride(c, models.selected)}
+          >
+            {c.toLocaleString()}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function LoadNote() {
   const lp = loadingNow();
   if (!lp) return null;
@@ -840,9 +896,68 @@ function ChatActions() {
  * taken, and it is here rather than a tab away because this is the panel whose
  * every other number is an estimate until it has run.
  */
+/**
+ * What starting Strata will take, in words. The map this replaces is a
+ * llama.cpp placement of the same file — layers, a KV cache, experts held
+ * back — and Strata makes none of those decisions.
+ */
+function StrataProjection() {
+  const s = strataView()!;
+  const freeRam = hw.mem?.availableB ?? 0;
+  return (
+    <div class="kv-grid" t="mem-strata">
+      <KV
+        k="VRAM"
+        v={`about ${bytes(s.vramB)}`}
+        tip={`Everything free on ${s.cards} GPU${
+          s.cards === 1 ? "" : "s"
+        }, less the ${s.reserveMib.toLocaleString()} MiB kept free on each. Full cards are the design.`}
+      />
+      <KV
+        k="RAM"
+        v={`about ${bytes(s.ramB)} of ${bytes(freeRam)} free`}
+        tip="The experts that do not fit on the GPU, copied into RAM. Estimated from one measured file."
+      />
+      <KV k="Context" v={`${s.ctx.toLocaleString()} tokens`} />
+      <KV
+        k="Load"
+        v="2–3 minutes"
+        tip="The machine can be sluggish while the experts are copied into RAM."
+      />
+    </div>
+  );
+}
+
 function LiveMemoryDetail(props: { plan: Plan }) {
   const b = benchNow();
   const tps = b ? b.genTps : chat.lastTps;
+  const strata = strataView();
+  if (strata) {
+    // Measured figures only. The table below itemises a llama.cpp placement
+    // (layers, KV cache, experts held back) that this engine never made.
+    const held = srv.startFreeVramB > 0
+      ? Math.max(0, srv.startFreeVramB - (vramTotalB() - vramUsedB()))
+      : 0;
+    return (
+      <>
+        <div class="kv-grid" t="mem-strata-live">
+          <KV
+            k="Strata on the GPUs"
+            v={held > 0 ? bytes(held) : "—"}
+            tip="Free VRAM when it started, less free VRAM now. Full cards are the design: the more experts on the GPU, the faster it writes."
+          />
+          <KV
+            k="Strata in RAM"
+            v={srv.rssB > 0 ? bytes(srv.rssB) : "—"}
+            tip="Resident memory of the server and its engine. It moves a little as experts are swapped between RAM and the GPUs."
+          />
+          <KV k="Context" v={`${strata.ctx.toLocaleString()} tokens`} />
+          <KV k="Speed" v={tps > 0 ? `${tps.toFixed(1)} tok/s` : "—"} />
+        </div>
+        <SpeedCheck t="one-speed" />
+      </>
+    );
+  }
   return (
     <>
       <MemoryDetail
@@ -998,7 +1113,7 @@ export function OnePage() {
               <div class="mem-section-head">
                 <span class="mem-section-title">After starting</span>
               </div>
-              {projected
+              {strataView() ? <StrataProjection /> : projected
                 ? (
                   <>
                     <MemoryMap plan={projected} compact />
@@ -1069,7 +1184,7 @@ export function OnePage() {
           right={<TpsPill />}
         >
           <RunStrip />
-          <AllSettings />
+          {activeBuild()?.engine ? null : <AllSettings />}
         </Panel>
         {
           /* The log takes every remaining pixel of the column — during a long

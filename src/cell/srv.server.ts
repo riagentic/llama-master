@@ -115,8 +115,11 @@ export async function findOrphans(): Promise<Orphan[]> {
       } catch {
         // Not permitted or already gone — argv still decides.
       }
+      // Strata's server is a Python script, so its `exe` is an interpreter
+      // outside the builds root; its argv names the script inside it.
       const isOurs = (path: string) =>
-        path.startsWith(root) && path.endsWith(BIN_NAME);
+        path.startsWith(root) &&
+        (path.endsWith(BIN_NAME) || path.endsWith("/serve/server.py"));
       if (isOurs(exe) || argv.some(isOurs)) {
         out.push({ pid, argv: argv.join(" ") });
       }
@@ -173,6 +176,28 @@ export type Status = {
  * snapshot of in-process state, and a blocking file read inside it would put
  * every client's next action behind a disk touch on the 1 s poll.
  */
+/** `pid` and every descendant, from `/proc/<pid>/task/<tid>/children` — per
+ *  THREAD, because a child belongs to the thread that spawned it. Bounded: a
+ *  process tree is a tree, but /proc is read while it changes. */
+async function processTree(pid: number): Promise<number[]> {
+  const out = [pid];
+  for (let i = 0; i < out.length && out.length < 64; i++) {
+    const tasks = `/proc/${out[i]}/task`;
+    try {
+      for await (const t of Deno.readDir(tasks)) {
+        const kids = await Deno.readTextFile(`${tasks}/${t.name}/children`);
+        for (const k of kids.split(/\s+/).map(Number)) {
+          if (k > 0 && !out.includes(k)) out.push(k);
+        }
+      }
+    } catch {
+      // exited mid-walk, or a kernel without CONFIG_PROC_CHILDREN: what was
+      // found so far still stands.
+    }
+  }
+  return out;
+}
+
 export async function rss(): Promise<{ rssB: number; fileB: number }> {
   const pid = slot?.pid ?? 0;
   // Same as findOrphans: /proc/<pid>/status exists on Linux and nowhere else.
@@ -185,12 +210,21 @@ export async function rss(): Promise<{ rssB: number; fileB: number }> {
     // RSS 139 GB, of which 138 GB RssFile — while `free` said 22 GB used and
     // a real user concluded the model was not in RAM at all. Sampling the
     // file-backed share is what lets the UI draw it as its own colour.
-    const txt = await Deno.readTextFile(`/proc/${pid}/status`);
-    const kb = (key: string): number => {
-      const m = new RegExp(`^${key}:\\s+(\\d+) kB`, "m").exec(txt);
-      return Number(m?.[1] ?? 0);
-    };
-    return { rssB: kb("VmRSS") * 1024, fileB: kb("RssFile") * 1024 };
+    // The whole process TREE: Strata's server is a Python wrapper around the
+    // engine it spawns, and reading the wrapper alone reported 0.2 GB for a
+    // run holding 83 — which then drew the engine's memory as somebody else's.
+    let rssB = 0;
+    let fileB = 0;
+    for (const p of await processTree(pid)) {
+      const txt = await Deno.readTextFile(`/proc/${p}/status`).catch(() => "");
+      const kb = (key: string): number => {
+        const m = new RegExp(`^${key}:\\s+(\\d+) kB`, "m").exec(txt);
+        return Number(m?.[1] ?? 0);
+      };
+      rssB += kb("VmRSS") * 1024;
+      fileB += kb("RssFile") * 1024;
+    }
+    return { rssB, fileB };
   } catch {
     return { rssB: 0, fileB: 0 }; // exited between the check and the read
   }
@@ -426,8 +460,11 @@ export async function health(
     // 503 while the model loads is the expected pre-ready state.
     const body = await res.text();
     return { ok: false, detail: `${res.status}: ${body.slice(0, 120)}` };
-  } catch (e) {
-    return { ok: false, detail: String(e) };
+  } catch {
+    // Nothing is listening yet. llama-server opens its port early and answers
+    // 503; Strata opens it only once the model is in, so this is every second
+    // of its load — and `TypeError: fetch failed` is not a status.
+    return { ok: false, detail: "not answering yet — still loading" };
   }
 }
 
@@ -463,20 +500,33 @@ export async function probe(
   timeoutMs = 120_000,
 ): Promise<{ kind: "ok" | "refused" | "dead" | "slow"; detail: string }> {
   try {
-    const res = await fetch(`${baseUrl}/completion`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        // Long enough to exercise the batched prompt path, not just decode.
-        prompt:
-          "The quick brown fox jumps over the lazy dog. Counting to twelve: " +
-          "one two three four five six seven eight nine ten eleven twelve.",
-        n_predict: 2,
-        temperature: 0,
-        cache_prompt: false,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
+    // Long enough to exercise the batched prompt path, not just decode.
+    const prompt =
+      "The quick brown fox jumps over the lazy dog. Counting to twelve: " +
+      "one two three four five six seven eight nine ten eleven twelve.";
+    const post = (path: string, json: Record<string, unknown>) =>
+      fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(json),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    let res = await post("/completion", {
+      prompt,
+      n_predict: 2,
+      temperature: 0,
+      cache_prompt: false,
     });
+    if (res.status === 404) {
+      // Not llama-server: Strata has no /completion (see `bench` below). A
+      // 404 read as `refused` left a run that generates fine "unproven".
+      await res.body?.cancel();
+      res = await post("/v1/chat/completions", {
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 2,
+        temperature: 0,
+      });
+    }
     const body = await res.text();
     if (res.ok) return { kind: "ok", detail: "generated" };
     return { kind: "refused", detail: `${res.status}: ${body.slice(0, 120)}` };
@@ -514,14 +564,29 @@ export async function bench(
 ): Promise<
   { ok: true; json: unknown; latencyMs: number } | { ok: false; detail: string }
 > {
-  const began = performance.now();
+  let began = performance.now();
   try {
-    const res = await fetch(`${baseUrl}/completion`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const post = (path: string, json: Record<string, unknown>) =>
+      fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(json),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    let res = await post("/completion", body);
+    if (res.status === 404) {
+      // Not llama-server: Strata has no native /completion, but its chat
+      // endpoint returns the same `timings` block. The same prompt, the same
+      // token count, thinking off for the reason `bench.ts` gives.
+      await res.body?.cancel();
+      began = performance.now();
+      res = await post("/v1/chat/completions", {
+        messages: [{ role: "user", content: body.prompt }],
+        max_tokens: body.n_predict,
+        temperature: body.temperature,
+        reasoning_effort: "off",
+      });
+    }
     const text = await res.text();
     if (!res.ok) {
       return { ok: false, detail: `${res.status}: ${text.slice(0, 200)}` };

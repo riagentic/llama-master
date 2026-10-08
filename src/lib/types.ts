@@ -356,6 +356,9 @@ export type Build = {
    *  above llama.cpp's stock 30 — the "bypass the graph-split limit" option.
    *  Absent = stock. Recorded so a build that behaves differently says why. */
   schedCap?: number;
+  /** Set when this build is not llama.cpp at all but another engine behind
+   *  the same Start button (`src/lib/strata.ts`). Absent = llama.cpp. */
+  engine?: "strata";
 };
 
 export type Backend = "cpu" | "cuda" | "vulkan" | "hip" | "metal";

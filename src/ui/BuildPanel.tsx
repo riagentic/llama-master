@@ -16,6 +16,7 @@ import {
   refPrs,
 } from "../lib/srcref.ts";
 import { hw } from "../cell/hw.ts";
+import { models } from "../cell/models.ts";
 import { availableBackends, isBinaryAsset, pickAsset } from "../lib/assets.ts";
 import { SCHED_SPLIT_CAP, targetReadiness } from "../lib/backend.ts";
 import type { Backend } from "../lib/types.ts";
@@ -252,7 +253,7 @@ function Chooser() {
               : ready.pending
               ? "Checking what is available…"
               : ready.diagnosis?.reason}
-            onClick={() => builds.start()}
+            onClick={() => builds.start(models.selected)}
           >
             {source ? "Build llama.cpp" : "Install llama.cpp"}
           </button>

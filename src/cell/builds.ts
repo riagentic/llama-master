@@ -172,7 +172,11 @@ async function probeInto(
 ): Promise<void> {
   if (!id) return;
   if (!force && s.caps[id]) return;
-  const bin = s.installed.find((b) => b.id === id)?.serverBin ?? "";
+  const b = s.installed.find((b) => b.id === id);
+  // Another engine has no llama.cpp vocabulary to ask about, and its
+  // launcher answers `--help` by running a setup.
+  if (b?.engine) return;
+  const bin = b?.serverBin ?? "";
   if (!bin) return;
   const io = await import("./builds.server.ts");
   try {
@@ -476,6 +480,7 @@ export const builds = cell("builds", {
      */
     async update(
       s: BuildsState & Partial<MethodDraftMeta>,
+      model = "",
     ): Promise<Job["status"]> {
       const active = s.installed.find((b) => b.id === s.activeId) ?? null;
       if (!active || s.job?.status === "running") return "cancelled";
@@ -487,9 +492,9 @@ export const builds = cell("builds", {
       // Hand the status back rather than making the caller read state across
       // the bridge — see `start`.
       const call = (s as unknown as {
-        $call: { start(): Promise<Job["status"]> };
+        $call: { start(model?: string): Promise<Job["status"]> };
       }).$call;
-      return await call.start();
+      return await call.start(model);
     },
 
     async scan(s) {
@@ -560,6 +565,9 @@ export const builds = cell("builds", {
      *  patch may not have arrived yet, so the read sees the previous value. */
     async start(
       s: BuildsState & Partial<MethodDraftMeta>,
+      /** The selected model — read only by a build of another engine, which
+       *  is set up for one model (`strata.server.ts`). */
+      model = "",
     ): Promise<Job["status"]> {
       if (s.job?.status === "running") return "running";
       const source = s.origin === "source";
@@ -615,7 +623,7 @@ export const builds = cell("builds", {
         const io = await import("./builds.server.ts");
         const built = source
           ? await io.buildFromSource(
-            { ref, backend, jobs, native, schedCap, signal },
+            { ref, backend, jobs, native, schedCap, model, signal },
             onProgress,
           )
           : await io.installRelease(

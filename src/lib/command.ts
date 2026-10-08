@@ -243,7 +243,18 @@ export function commandBlock(
     caps?: BuildFlags;
   },
 ): string[] {
-  const parts = argv(target, opts).map((t) => displayToken(t, opts.home ?? ""));
+  const lines = argvBlock(argv(target, opts), opts.home);
+  // The env prefix leads, as its own line — never appended after the command,
+  // because a shell reads `NAME=value` only in FRONT of the program.
+  if (opts.env?.length) lines.unshift(envPrefix(opts.env));
+  return lines;
+}
+
+/** Any argv as display lines, one flag (and its value) per line. Its own
+ *  function because another engine's command is not composed by `argv`
+ *  (`src/lib/strata.ts`) and must still be drawn the same way. */
+export function argvBlock(tokens: readonly string[], home = ""): string[] {
+  const parts = tokens.map((t) => displayToken(t, home));
   const lines: string[] = [];
   let cur = parts.shift() ?? "";
   while (parts.length) {
@@ -256,9 +267,6 @@ export function commandBlock(
     cur = value ? `  ${flag} ${value}` : `  ${flag}`;
   }
   lines.push(cur);
-  // The env prefix leads, as its own line — never appended after the command,
-  // because a shell reads `NAME=value` only in FRONT of the program.
-  if (opts.env?.length) lines.unshift(envPrefix(opts.env));
   return lines;
 }
 

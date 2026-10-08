@@ -55,6 +55,7 @@ import {
 } from "../lib/srcref.ts";
 import { resolveCmake } from "./prereq.server.ts";
 import { DEMO_ENV, demoBuilds } from "../lib/demo.ts";
+import { isStrataRef, STRATA_LAUNCHER } from "../lib/strata.ts";
 
 const REPO = "ggml-org/llama.cpp";
 const API = `https://api.github.com/repos/${REPO}`;
@@ -266,7 +267,7 @@ export function buildId(
   return `${origin}-${refDirName(parseRef(ref))}-${backend}`;
 }
 
-async function writeMeta(dir: string, b: Build): Promise<void> {
+export async function writeMeta(dir: string, b: Build): Promise<void> {
   await Deno.writeTextFile(join(dir, META), JSON.stringify(b, null, 2));
 }
 
@@ -288,8 +289,13 @@ export async function listBuilds(): Promise<Build[]> {
         ) as Build;
         // Trust the directory over the metadata: a moved app home must not
         // leave every build pointing at paths that no longer exist.
-        const serverBin = await findBinary(dir, BIN_SERVER);
-        const cliBin = await findBinary(dir, BIN_CLI);
+        // Another engine's build has no llama-server: what the app spawns is
+        // the launcher it wrote there (`strata.server.ts`).
+        const launcher = join(dir, STRATA_LAUNCHER);
+        const serverBin = meta.engine === "strata"
+          ? (await exists(launcher) ? launcher : null)
+          : await findBinary(dir, BIN_SERVER);
+        const cliBin = meta.engine ? null : await findBinary(dir, BIN_CLI);
         if (!serverBin) continue;
         out.push({
           ...meta,
@@ -789,10 +795,17 @@ export async function buildFromSource(
     native: boolean;
     /** Raise `GGML_SCHED_MAX_SPLIT_INPUTS` to this value; 0/absent = stock. */
     schedCap?: number;
+    /** The selected model's path. Only another engine needs it: Strata is set
+     *  up for one model, llama.cpp for none. */
+    model?: string;
     signal?: AbortSignal;
   },
   onProgress: OnProgress,
 ): Promise<Build> {
+  if (isStrataRef(opts.ref)) {
+    const { buildStrata } = await import("./strata.server.ts");
+    return await buildStrata(opts, onProgress);
+  }
   const steps = ["Fetch source", "Configure", "Compile", "Install"];
   const p = (step: number, progress: number | null, lines?: string[]) =>
     onProgress({ step, steps, progress, lines });

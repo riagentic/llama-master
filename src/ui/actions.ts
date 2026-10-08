@@ -25,6 +25,7 @@ import { bestPlacement, PLACEMENTS, tune } from "../lib/tune.ts";
 import { vetoUnsupported } from "../lib/fitladder.ts";
 import type { Placement, Tuning } from "../lib/tune.ts";
 import { stability } from "../lib/stability.ts";
+import { strataRamShort, strataSettings } from "../lib/strata.ts";
 import type { Stability } from "../lib/stability.ts";
 import {
   activeBuild,
@@ -44,6 +45,8 @@ import {
   serverRunning,
   shownEnv,
   shownSettings,
+  strataCommand,
+  strataView,
   tuningsFor,
   unsupportedFor,
   vramUsedB,
@@ -238,11 +241,19 @@ export function startBlocker(
   if (!model) return "No model selected — scan for models first.";
   const need = modelRuntimeFor(path);
   if (need) return need.reason;
+  // Strata copies most of the file into RAM as anonymous memory; short of
+  // that, Start ends in the OOM killer rather than in an error message.
+  const st = strataView();
+  if (st && path === models.selected) {
+    const short = strataRamShort(st.ramB, hw.mem?.availableB ?? 0);
+    if (short) return short;
+  }
   // Backstop for a restored session or any selection path around
   // `selectModel`: spawning with a stale `--spec-type` is a server that
   // refuses to load, and with auto-optimal off nothing else would clear it
   // (when it is on, Start re-tunes and the tuner resets the flag itself).
   if (
+    !activeBuild()?.engine &&
     !cfg.autoOptimal && str(settings, "specType") !== "" &&
     (model.meta?.nextnLayers ?? 0) === 0
   ) {
@@ -414,7 +425,9 @@ export function startServer(over: Partial<RunTarget> = {}): Promise<void> {
   const model = models.items.find((m) => m.path === t.path);
   let settings = cfg.settings;
   let tuned = false;
-  if (cfg.autoOptimal && model?.meta) {
+  // Another engine places the model itself: the tuner's answer is about
+  // llama.cpp's flags, and applying it would rewrite settings nothing reads.
+  if (cfg.autoOptimal && model?.meta && !activeBuild()?.engine) {
     // The same path "Optimal settings" takes, fallback included: starting must
     // not spawn a placement the tuner has already established cannot run.
     const r = tunedForStart(t);
@@ -443,6 +456,24 @@ function launch(
   tuned: boolean,
 ): Promise<void> {
   const model = models.items.find((m) => m.path === t.path);
+  // A Strata build: its own argv, and none of llama.cpp's retry machinery —
+  // the fit ladder rewrites `-c` and `--n-cpu-moe`, flags this command does
+  // not have (`src/lib/strata.ts`).
+  const strata = strataCommand(t.path, settings, t.pin);
+  if (strata) {
+    return srv.start(strata, serverUrl(settings), {
+      model: t.path,
+      settings: strataSettings(
+        t.pin ? { ...settings, ctxSize: t.pin } : settings,
+      ),
+      env: shownEnv(),
+      freeAtStart: freeNowB(),
+      lowPriority: cfg.lowPriority,
+      // The per-card baseline, so the memory map draws what each card holds
+      // of OURS from a measurement and not as somebody else's memory.
+      cardFreeB: cardFreeNowB(),
+    });
+  }
   const command = argv("server", {
     bin: serverBin(),
     model: t.path,
@@ -619,7 +650,7 @@ export async function updateNow(): Promise<void> {
   // The RETURN value, not `builds.job`: a state read straight after an await
   // can still hold the previous value on a browser client, which would skip
   // the restart after a successful update (aiol flags exactly this).
-  const status = await builds.update();
+  const status = await builds.update(models.selected);
 
   // Only come back up if the update actually produced a working build.
   if (wasRunning && status === "done") {
