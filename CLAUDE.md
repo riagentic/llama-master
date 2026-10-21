@@ -13,8 +13,8 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.19-beta`**, vendored at `dep/aio` → symlink to the
-  provisioned release (`~/.local/lib/aio-versions/v1.0.19-beta`). Never
+- **Deno 2.9+ + aio `1.0.23-beta`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.23-beta`). Never
   `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
   `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
   version the symlink actually resolves to — `deno task aiol` says so when they
@@ -54,6 +54,22 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
     and happy-dom to `20.14.5` in the app; the CLIENT's three were matched by
     hand in `client/deno.json` (no `am fix` there — see above). Both suites
     green, `am migrations` reports no drift.
+  - **1.0.19-beta → 1.0.20-beta (2026-10-14): a pin change, plus one opt-in.**
+    Spell the version with its `v` (`am pin v1.0.20-beta`; the bare number is
+    refused). Electron `44.7.0`, matched by hand in the client; refresh the
+    client's lock by running ITS `verify`, not `deno install` — that resolved
+    the whole `dep/aio` graph into it (react, std/tar…). Adopted
+    `electron: { ignoreDebugEnv: true }`: this machine runs several aio apps,
+    and an inherited `AIO_CDP`/`AIO_PORT` opened a door on this one; `am eval`
+    needs `am restart --cdp`, which it already did. The client's verify also
+    caught `client/src/shared/` stale since v0.13.0 — the ROOT verify does not
+    run `client/tests`, so after any `src/lib` edit run `deno task sync` in
+    `client/`.
+  - **1.0.20-beta → 1.0.23-beta (2026-10-21): a pin change.** Electron `44.9.0`,
+    matched by hand in the client; no app edit. None of the three releases'
+    behaviour changes reach this app (no `REDUCE_ERROR` checks, no `onGlobalKey`
+    chords, no `build.splash`). The window's Chromium profile moved itself into
+    `~/.llama-master/electron/` on the first start.
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.
@@ -1163,6 +1179,11 @@ cannot act on is a bug.
     79.6 of it anonymous). That RAM is not a mapping the kernel can drop, so
     `strataRamShort` BLOCKS Start when less is free — the alternative is the OOM
     killer picking a neighbour. One file on one machine; every use says "about".
+    Two traps, both shipped in v0.13.0: the VRAM side must sum only the cards
+    the build can use (`usableGpus` — `hw.gpus` lists this machine's AMD iGPU
+    too; a live run reads `srv.runCardFreeB`), and the RAM check must credit a
+    RUNNING engine's own anonymous RSS (`ownB`), or Strata blocks its own
+    restart.
   - **On a Strata build the page drops what it cannot honour**: the placement
     picker, the quantisation hint, the tuner's switch, the thinking switch,
     stability and the llama.cpp catalog. Context is Strata's six sizes as

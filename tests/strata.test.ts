@@ -208,6 +208,10 @@ Deno.test("strata: too little RAM blocks Start, and an unknown reading does not"
   assertEquals(strataRamShort(83e9, 141e9), "");
   // No reading (0) is not a reason to refuse.
   assertEquals(strataRamShort(83e9, 0), "");
+  // A running engine's own copy comes back on restart: 30 GB free + its 80.
+  assertEquals(strataRamShort(83e9, 30e9, 80e9), "");
+  assert(strataRamShort(83e9, 30e9, 40e9).includes("65.2 GB"), "credited");
+  assertEquals(strataRamShort(83e9, 59e9, NaN), strataRamShort(83e9, 59e9));
 });
 
 Deno.test("strata: the load names its phase from Strata's own log", () => {

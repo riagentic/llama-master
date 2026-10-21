@@ -281,12 +281,19 @@ export function strataNeeds(a: {
 /**
  * Why Start would end in the OOM killer, or "". Strata's experts are
  * anonymous memory: with less free than it copies, the kernel does not slow
- * down, it kills something — and not necessarily Strata.
+ * down, it kills something — and not necessarily Strata. `ownB` is the
+ * anonymous memory a RUNNING engine gives back when a restart stops it;
+ * without it a running Strata blocks its own restart.
  */
-export function strataRamShort(needB: number, availableB: number): string {
-  if (!(needB > 0) || !(availableB > 0) || availableB >= needB) return "";
+export function strataRamShort(
+  needB: number,
+  availableB: number,
+  ownB = 0,
+): string {
+  const freeB = availableB + (Number.isFinite(ownB) && ownB > 0 ? ownB : 0);
+  if (!(needB > 0) || !(availableB > 0) || freeB >= needB) return "";
   return `Strata keeps about ${bytes(needB)} of this model in RAM, and ${
-    bytes(availableB)
+    bytes(freeB)
   } is free. Starting now would run the machine out of memory — close something large first, or run this model on llama.cpp, which can leave it on disk.`;
 }
 

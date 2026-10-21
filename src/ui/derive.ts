@@ -24,6 +24,7 @@ import { models } from "../cell/models.ts";
 import { prereq } from "../cell/prereq.ts";
 import { srv } from "../cell/srv.ts";
 import { enabledGpus } from "../lib/gpu.ts";
+import { usableGpus } from "../lib/backend.ts";
 import { drift, headroomKey } from "../lib/adapt.ts";
 import {
   bestPlacement,
@@ -184,7 +185,12 @@ export function strataView():
       : strataCommand(m.path, cfg.settings, ctxOverride()) ?? [],
   );
   if (!run) return null;
-  const cards = hw.gpus.filter((g) => g.vendor === "nvidia").length;
+  // The cards a CUDA build can use — `hw.gpus` also lists this machine's AMD
+  // iGPU, whose free memory Strata will never fill. All of them, whatever
+  // `-dev` says: Strata is spawned with `--gpus all`.
+  const gpus = usableGpus(activeBuild()?.backend, hw.gpus);
+  const cards = gpus.length;
+  const atStartB = srv.runCardFreeB.reduce((a, b) => a + b, 0);
   return {
     model,
     ...run,
@@ -193,9 +199,9 @@ export function strataView():
       fileB: m.sizeB,
       // A live run is sized against the machine it was started on: its own
       // bytes are gone from "free now".
-      freeVramB: running && srv.startFreeVramB > 0
-        ? srv.startFreeVramB
-        : vramTotalB() - vramUsedB(),
+      freeVramB: running && atStartB > 0
+        ? atStartB
+        : gpus.reduce((a, g) => a + Math.max(0, g.vramTotalB - g.vramUsedB), 0),
       cards,
       reserveMib: run.reserveMib,
     }),

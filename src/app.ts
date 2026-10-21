@@ -29,6 +29,11 @@ await aio.run({
   // Boot fails loudly if a cell was defined but not listed above — a cell that
   // is imported and unregistered dispatches into the void.
   strictCells: true,
+  // This machine runs several aio apps, and a desktop window inherits whatever
+  // launched it: an `AIO_CDP`/`AIO_PORT` left over from another one would open
+  // a DevTools or TCP door on this one, which can start processes. `--cdp` and
+  // `--port` still work when typed (aio 1.0.20-beta).
+  electron: { ignoreDebugEnv: true },
   // Everything stays strict EXCEPT the handful of methods whose job is genuinely
   // slow. This app used to raise `effect` to 1000 and `effectTimeoutMs` to 30 s
   // globally, because a cmake build and a 1 s poll shared one budget — which

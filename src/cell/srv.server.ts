@@ -169,19 +169,12 @@ export type Status = {
   lines: string[];
 };
 
-/**
- * What the running process actually holds in RAM, from /proc.
- *
- * Kept out of `status()` and asynchronous on purpose: `status()` is a sync
- * snapshot of in-process state, and a blocking file read inside it would put
- * every client's next action behind a disk touch on the 1 s poll.
- */
 /** `pid` and every descendant, from `/proc/<pid>/task/<tid>/children` — per
  *  THREAD, because a child belongs to the thread that spawned it. Bounded: a
  *  process tree is a tree, but /proc is read while it changes. */
 async function processTree(pid: number): Promise<number[]> {
   const out = [pid];
-  for (let i = 0; i < out.length && out.length < 64; i++) {
+  for (let i = 0; i < out.length && i < 64; i++) {
     const tasks = `/proc/${out[i]}/task`;
     try {
       for await (const t of Deno.readDir(tasks)) {
@@ -198,6 +191,13 @@ async function processTree(pid: number): Promise<number[]> {
   return out;
 }
 
+/**
+ * What the running process actually holds in RAM, from /proc.
+ *
+ * Kept out of `status()` and asynchronous on purpose: `status()` is a sync
+ * snapshot of in-process state, and a blocking file read inside it would put
+ * every client's next action behind a disk touch on the 1 s poll.
+ */
 export async function rss(): Promise<{ rssB: number; fileB: number }> {
   const pid = slot?.pid ?? 0;
   // Same as findOrphans: /proc/<pid>/status exists on Linux and nowhere else.

@@ -245,7 +245,11 @@ export function startBlocker(
   // that, Start ends in the OOM killer rather than in an error message.
   const st = strataView();
   if (st && path === models.selected) {
-    const short = strataRamShort(st.ramB, hw.mem?.availableB ?? 0);
+    const short = strataRamShort(
+      st.ramB,
+      hw.mem?.availableB ?? 0,
+      st.running ? srv.rssB - srv.rssFileB : 0,
+    );
     if (short) return short;
   }
   // Backstop for a restored session or any selection path around
