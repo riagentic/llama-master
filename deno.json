@@ -73,6 +73,7 @@
     "targets": [
       "browser",
       "electron"
-    ]
+    ],
+    "electronRuntime": "online"
   }
 }
