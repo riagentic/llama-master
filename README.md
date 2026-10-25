@@ -20,12 +20,11 @@ builds and runs. Nothing else is needed: CMake and SPIRV-Headers are downloaded
 into the app's own directory if a source build of llama.cpp asks for them, and a
 prebuilt llama.cpp needs no toolchain.
 
-From a clone — aio is vendored by symlink, so the two sit side by side:
+From a clone — `am pin` provisions the pinned aio release and links `dep/aio`:
 
 ```sh
-git clone https://github.com/riagentic/aio.git
 git clone https://github.com/riagentic/llama-master.git
-cd llama-master && mkdir -p dep && ln -s ../../aio dep/aio
+cd llama-master && am pin v1.0.25-beta   # provisions aio, links dep/aio
 deno task am fix    # import paths, electron, config
 deno task dev
 ```

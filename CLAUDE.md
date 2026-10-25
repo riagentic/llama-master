@@ -13,8 +13,8 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
 
 ## Stack
 
-- **Deno 2.9+ + aio `1.0.23-beta`**, vendored at `dep/aio` → symlink to the
-  provisioned release (`~/.local/lib/aio-versions/v1.0.23-beta`). Never
+- **Deno 2.9+ + aio `1.0.25-beta`**, vendored at `dep/aio` → symlink to the
+  provisioned release (`~/.local/lib/aio-versions/v1.0.25-beta`). Never
   `npm`/`node`. aio internals: `dep/aio/CLAUDE.md`; docs index:
   `dep/aio/docs/content.md`. The pin in `deno.json` (`aioVersion`) must name the
   version the symlink actually resolves to — `deno task aiol` says so when they
@@ -70,6 +70,10 @@ Framework rules: `.katana/_aio.md`. Universal rules: `.katana/_universal.md`.
     behaviour changes reach this app (no `REDUCE_ERROR` checks, no `onGlobalKey`
     chords, no `build.splash`). The window's Chromium profile moved itself into
     `~/.llama-master/electron/` on the first start.
+  - **1.0.23-beta → 1.0.25-beta (2026-10-25): a pin change.** Electron `44.9.3`,
+    matched by hand in the client; no app edit. 1.0.25 keeps every window frame
+    inside the work area (the NVIDIA X driver can end the X session on a frame
+    at a negative coordinate).
 - JSX via `jsxImportSource: "aio"` (`class=`, not `className`); state via
   `cell({ state, methods })`; persistence is automatic SQLite in
   `~/.llama-master/data/`.
