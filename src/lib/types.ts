@@ -17,7 +17,8 @@ export type LayerBytes = {
  *  file name, so without this the library is a list of unreadable hashes. */
 export type ModelSource = "file" | "lmstudio" | "ollama";
 
-/** A GGUF model on disk, with everything the planner needs. */
+/** A model on disk: a GGUF, with everything the planner needs, or an
+ *  engine's own pack (`src/lib/packs.ts`), which only that engine reads. */
 export type Model = {
   path: string;
   /** Display name: the file name, or the ollama model name (`llama3.2:3b`). */
@@ -27,7 +28,8 @@ export type Model = {
   dir: string;
   sizeB: number;
   mtime: number;
-  /** Parsed header — null while unparsed, or when the file is not readable. */
+  /** Parsed header — null while unparsed, when the file is not readable, or
+   *  for a pack (no GGUF header; `metaError` is then null too). */
   meta: ModelMeta | null;
   /** Set when the header could not be parsed; shown instead of silent absence. */
   metaError: string | null;
@@ -363,11 +365,16 @@ export type Build = {
    *  Absent = stock. Recorded so a build that behaves differently says why. */
   schedCap?: number;
   /** Set when this build is not llama.cpp at all but another engine behind
-   *  the same Start button (`src/lib/strata.ts`). Absent = llama.cpp. */
-  engine?: "strata";
+   *  the same Start button (`src/lib/strata.ts`, `src/lib/basalt.ts`).
+   *  Absent = llama.cpp. */
+  engine?: Engine;
 };
 
 export type Backend = "cpu" | "cuda" | "vulkan" | "hip" | "metal";
+
+/** An engine that is not llama.cpp. Basalt is a Strata fork, so both share
+ *  the one-card / pack / reserve vocabulary in `src/lib/strata.ts`. */
+export type Engine = "strata" | "basalt";
 
 /** A long-running job (build, download, extract) with progress a bar can show. */
 export type Job = {

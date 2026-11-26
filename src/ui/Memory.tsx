@@ -237,7 +237,8 @@ function Region(props: {
 /** A card of the device plan, shaped as the Pool the map's Region draws —
  *  one implementation of the band-drawing, whatever it is drawing. */
 function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
-  const usedB = c.weightsB + c.kvB + c.computeB;
+  const expertsB = c.expertsB ?? 0;
+  const usedB = c.weightsB + expertsB + c.kvB + c.computeB;
   return {
     label: `GPU ${i}`,
     capacityB: c.capacityB,
@@ -248,6 +249,7 @@ function cardAsPool(c: Plan["devices"]["cards"][number], i: number): Pool {
     overB: c.overB,
     buckets: [
       { key: "weights", label: "Weights", bytes: c.weightsB },
+      { key: "experts", label: "Experts", bytes: expertsB },
       { key: "kv", label: "KV cache", bytes: c.kvB },
       { key: "compute", label: "Compute (est.)", bytes: c.computeB },
     ],

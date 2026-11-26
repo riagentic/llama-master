@@ -166,6 +166,9 @@ export type DevicePlan = {
     weightsB: number;
     kvB: number;
     computeB: number;
+    /** Routed experts on this card — set only by an engine that reports them
+     *  apart (`enginePlan`); a llama.cpp plan files them under weights. */
+    expertsB?: number;
     /** Past this card's capacity, after everything above. */
     overB: number;
   }[];
@@ -512,6 +515,99 @@ function pool(
     reservedB,
     freeB: Math.max(0, capacityB - total),
     overB: Math.max(0, total - capacityB),
+  };
+}
+
+/** What a second engine reports it holds, MEASURED by the engine itself
+ *  (`basalt.ts:basaltParts`): per card by nvidia-smi number, and the experts
+ *  it keeps in host RAM. */
+export type EngineParts = {
+  cards: { index: number; expertsB: number; kvB: number; otherB: number }[];
+  ramExpertsB: number;
+};
+
+/**
+ * The machine with an engine run on it, from the engine's own figures.
+ *
+ * A Basalt pack has no GGUF header, so the llama.cpp plan of it is empty and
+ * the map drew the run's ~20 GB as "in use elsewhere" beside an idle card.
+ * Nothing here is estimated: each card's experts, KV cache and "other" (dense
+ * weights, drafter, graphs, CUDA context) are what the engine says it holds —
+ * on the run that motivated this they summed to the card's used bytes to the
+ * byte. `hw` is the CUDA view (`hwSnapshot`), so a card's POSITION is its
+ * nvidia-smi number. `ramOursB` is the run's own resident memory.
+ */
+export function enginePlan(
+  hw: Hw,
+  parts: EngineParts,
+  ctx: number,
+  ramOursB: number,
+): Plan {
+  const cards = hw.gpus.map((g, i) => {
+    const p = parts.cards.find((c) => c.index === i);
+    const expertsB = whole(p?.expertsB ?? 0);
+    const kvB = whole(p?.kvB ?? 0);
+    const weightsB = whole(p?.otherB ?? 0);
+    const oursB = expertsB + kvB + weightsB;
+    // The engine counts its CUDA context, the driver's figure may not: never
+    // let "everyone else" go negative.
+    const otherB = Math.max(0, whole(g.vramUsedB) - oursB);
+    return {
+      name: g.name,
+      capacityB: whole(g.vramTotalB),
+      otherB,
+      reservedB: 0,
+      weightsB,
+      kvB,
+      computeB: 0,
+      expertsB,
+      overB: Math.max(0, oursB + otherB - whole(g.vramTotalB)),
+    };
+  });
+  const total = (f: (c: typeof cards[number]) => number) => sum(cards.map(f));
+  const vram = pool(
+    "VRAM",
+    total((c) => c.capacityB),
+    total((c) => c.otherB),
+    0,
+    [
+      { key: "weights", label: "Weights", bytes: total((c) => c.weightsB) },
+      { key: "experts", label: "Experts", bytes: total((c) => c.expertsB) },
+      { key: "kv", label: "KV cache", bytes: total((c) => c.kvB) },
+    ],
+  );
+  const ramExpertsB = whole(parts.ramExpertsB);
+  const ramOurs = Math.max(whole(ramOursB), ramExpertsB);
+  const mem = hw.mem;
+  const ram = pool(
+    "RAM",
+    mem?.totalB ?? 0,
+    mem ? Math.max(0, mem.totalB - mem.availableB - ramOurs) : 0,
+    0,
+    [
+      { key: "experts", label: "Experts", bytes: ramExpertsB },
+      { key: "weights", label: "Engine", bytes: ramOurs - ramExpertsB },
+    ],
+  );
+  return {
+    nLayer: 0,
+    layersOnGpu: 0,
+    moeOnCpu: 0,
+    ctx,
+    vram,
+    ram,
+    kvPerTokenB: 0,
+    kvTotalB: vram.buckets.find((b) => b.key === "kv")?.bytes ?? 0,
+    fits: vram.overB === 0 && ram.overB === 0,
+    devices: {
+      bytesB: cards.map((c) => c.weightsB + c.kvB + c.expertsB),
+      budgetsB: cards.map((c) => c.capacityB),
+      tensorSplit: "",
+      fits: true,
+      cards,
+      unplacedB: 0,
+    },
+    notes: [],
   };
 }
 

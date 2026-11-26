@@ -64,8 +64,10 @@ import { MapLegend, MemoryMap } from "./Memory.tsx";
 import { Guidance } from "./Guidance.tsx";
 import { OrphanBanner, ServerLog, StatusBig } from "./ServerPanel.tsx";
 import { useStickyBottom } from "./sticky.ts";
+import type { BasaltKv } from "../lib/basalt.ts";
 import {
   activeBuild,
+  basaltCardChoices,
   benchNow,
   changedCount,
   chatHasContent,
@@ -90,7 +92,7 @@ import {
   vramUsedB,
 } from "./derive.ts";
 import type { Plan } from "../lib/plan.ts";
-import { STRATA_CONTEXTS } from "../lib/strata.ts";
+import { packInfo } from "../lib/packs.ts";
 
 /**
  * The four vitals, 2×2: CPU and GPU on top, their memory under each.
@@ -363,7 +365,11 @@ function RunStrip() {
                   selected={x.path === models.selected}
                 >
                   {x.file}
-                  {x.meta ? ` · ${x.meta.quant} · ${bytes(x.sizeB)}` : ""}
+                  {x.meta
+                    ? ` · ${x.meta.quant} · ${bytes(x.sizeB)}`
+                    : packInfo(x.file)
+                    ? ` · ${packInfo(x.file)!.engine} pack · ${bytes(x.sizeB)}`
+                    : ""}
                 </option>
               ))}
           </select>
@@ -388,11 +394,18 @@ function RunStrip() {
         }
         <div class="run-row">
           <span class="run-label">Runs on</span>
-          {strata
+          {strata?.name === "Basalt"
+            ? <BasaltCards locked={locked} split={strata.cards > 1} />
+            : strata
             ? (
               <span class="dim" t="one-strata-place">
-                Strata decides: every GPU, filled with the most-used experts up
-                to your reserve; about {bytes(strata.ramB)} of the rest in RAM.
+                {strata.model.cards === "one"
+                  ? `${strata.name} decides: one GPU, filled with the experts that fit; about ${
+                    bytes(strata.ramB)
+                  } of the rest in RAM or computed on the CPU.`
+                  : `Strata decides: every GPU, filled with the most-used experts up to your reserve; about ${
+                    bytes(strata.ramB)
+                  } of the rest in RAM.`}
               </span>
             )
             : (
@@ -408,10 +421,24 @@ function RunStrip() {
             range, and a label wrapping them all sends every click to focus
             the number input. The input carries its own aria-label. */
         }
+        {strata?.name === "Basalt"
+          ? (
+            <div class="run-row">
+              <span class="run-label">Cache</span>
+              <BasaltCache locked={locked} />
+            </div>
+          )
+          : null}
         <div class="run-row">
           <span class="run-label">Context</span>
           {strata
-            ? <StrataCtx ctx={strata.ctx} locked={locked} />
+            ? (
+              <StrataCtx
+                ctx={strata.ctx}
+                contexts={strata.contexts}
+                locked={locked}
+              />
+            )
             : (
               <CtxControls
                 ctxNow={ctxNow}
@@ -555,11 +582,85 @@ function RunStrip() {
  * The total is an estimate and says so — the movement is what matters.
  */
 /** Strata's contexts are a short list it was tuned at, not a range. */
-function StrataCtx(props: { ctx: number; locked: boolean }) {
+/** Basalt's cards: automatic, one chosen card, or a layer split over both.
+ *  The split takes ONE reserve for every card, so it says what that costs
+ *  the display card instead of quietly not honouring it. */
+function BasaltCards(props: { locked: boolean; split: boolean }) {
+  const connected = bytes(cfg.reserveConnectedVramB);
+  const note = props.split
+    ? `The layers are split between the cards, so the context can be longer than one card holds (1M needs the fp8 cache). Basalt keeps one figure free on every card, so the ${connected} you reserved on the display card cannot be held: measured at 1M, 2.9 GB stayed free there.`
+    : "One card. Experts that do not fit on it are computed on the CPU from RAM.";
+  return (
+    <div class="ctx-controls" t="one-basalt-cards">
+      <div class="ctx-bands">
+        {basaltCardChoices().map((c) => (
+          <button
+            key={c.value}
+            type="button"
+            class={c.value === cfg.basaltCards ? "btn small on" : "btn small"}
+            aria-pressed={c.value === cfg.basaltCards}
+            disabled={props.locked}
+            title={props.locked ? LOCK_REASON : undefined}
+            onClick={() => cfg.setBasaltCards(c.value)}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <span class="dim">{note}</span>
+    </div>
+  );
+}
+
+/** Basalt's cache format. Exact is the default; the smaller two buy context. */
+function BasaltCache(props: { locked: boolean }) {
+  const choices: { kv: BasaltKv; label: string; tip: string }[] = [
+    { kv: "fp16", label: "Exact", tip: "fp16: the context at full precision." },
+    {
+      kv: "int8",
+      label: "int8",
+      tip:
+        "About 60% of the memory, with a precise scale every 64 values: a longer context, nearly exact.",
+    },
+    {
+      kv: "fp8",
+      label: "fp8",
+      tip:
+        "About 55% of the memory, rounded harder: the longest context, at a small cost in precision.",
+    },
+  ];
+  return (
+    <div class="ctx-controls" t="one-basalt-cache">
+      <div class="ctx-bands">
+        {choices.map((c) => (
+          <button
+            key={c.kv}
+            type="button"
+            class={c.kv === cfg.basaltKv ? "btn small on" : "btn small"}
+            aria-pressed={c.kv === cfg.basaltKv}
+            disabled={props.locked}
+            title={props.locked ? LOCK_REASON : c.tip}
+            onClick={() => cfg.setBasaltKv(c.kv)}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StrataCtx(
+  props: {
+    ctx: number;
+    contexts: readonly number[];
+    locked: boolean;
+  },
+) {
   return (
     <div class="ctx-controls" t="one-strata-ctx">
       <div class="ctx-bands">
-        {STRATA_CONTEXTS.map((c) => (
+        {props.contexts.map((c) => (
           <button
             key={c}
             type="button"
@@ -904,6 +1005,12 @@ function ChatActions() {
 function StrataProjection() {
   const s = strataView()!;
   const freeRam = hw.mem?.availableB ?? 0;
+  // Below the file's all-in-RAM figure, Strata keeps a budget and reads the
+  // rest from the SSD. Show what this machine can actually hold, never the
+  // full figure as if the shortfall were already spent.
+  const ramB = s.ramFloorB > 0 && freeRam > 0 && freeRam < s.ramB
+    ? Math.max(s.ramFloorB, freeRam)
+    : s.ramB;
   return (
     <div class="kv-grid" t="mem-strata">
       <KV
@@ -915,14 +1022,18 @@ function StrataProjection() {
       />
       <KV
         k="RAM"
-        v={`about ${bytes(s.ramB)} of ${bytes(freeRam)} free`}
-        tip="The experts that do not fit on the GPU, copied into RAM. Estimated from one measured file."
+        v={`about ${bytes(ramB)} of ${bytes(freeRam)} free`}
+        tip={s.model.ramGB
+          ? "The token embedding and the engine's host buffers, pinned in RAM. Measured on this model."
+          : "The experts that do not fit on the GPU, copied into RAM (or read from the SSD when RAM is short). Estimated from one measured file."}
       />
       <KV k="Context" v={`${s.ctx.toLocaleString()} tokens`} />
       <KV
         k="Load"
-        v="2–3 minutes"
-        tip="The machine can be sluggish while the experts are copied into RAM."
+        v={s.model.load ?? "2–3 minutes"}
+        tip={s.model.load
+          ? "The first start reads the pack from disk; later ones come from the page cache."
+          : "The machine can be sluggish while the experts are copied into RAM."}
       />
     </div>
   );
@@ -942,12 +1053,12 @@ function LiveMemoryDetail(props: { plan: Plan }) {
       <>
         <div class="kv-grid" t="mem-strata-live">
           <KV
-            k="Strata on the GPUs"
+            k={`${strata.name} on the GPUs`}
             v={held > 0 ? bytes(held) : "—"}
             tip="Free VRAM when it started, less free VRAM now. Full cards are the design: the more experts on the GPU, the faster it writes."
           />
           <KV
-            k="Strata in RAM"
+            k={`${strata.name} in RAM`}
             v={srv.rssB > 0 ? bytes(srv.rssB) : "—"}
             tip="Resident memory of the server and its engine. It moves a little as experts are swapped between RAM and the GPUs."
           />

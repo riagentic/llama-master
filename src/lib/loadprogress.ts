@@ -21,6 +21,13 @@ const PHASES: readonly { re: RegExp; label: string }[] = [
   { re: /loading the experts into RAM/, label: "copying experts into RAM" },
   { re: /starting the engine: reading/, label: "reading the weights" },
   { re: /^=== Step \d+:/, label: "checking the Strata setup" },
+  // Basalt (`src/lib/basalt.ts`): its `[server] ready` line comes BEFORE the
+  // load (the page is up at once), so it is not a phase.
+  { re: /^\[server\] loaded\s/, label: "almost ready" },
+  {
+    re: /^\[server\] (planning weight allocation|placed\s)/,
+    label: "loading weights",
+  },
   { re: /warming up|warmup/i, label: "warming up" },
   {
     re: /compute buffer|graph splits|sched_reserve/i,

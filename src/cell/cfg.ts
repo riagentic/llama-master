@@ -15,6 +15,7 @@ import {
   reserveBytes,
 } from "../lib/reserve.ts";
 import type { Placement } from "../lib/tune.ts";
+import { BASALT_KVS, type BasaltKv } from "../lib/basalt.ts";
 import type { ParamValue, Settings } from "../lib/types.ts";
 
 export type CfgState = {
@@ -95,6 +96,12 @@ export type CfgState = {
    * `settings`, for the same reason the reserve is not.
    */
   lowPriority: boolean;
+  /** Basalt's cards: "auto" (the one with most room), a card's nvidia-smi
+   *  number, or "both" (a layer split over every usable card). Not a
+   *  llama.cpp flag, so not in `settings`. */
+  basaltCards: string;
+  /** Basalt's cache format: fp16 (exact, default), int8 or fp8. */
+  basaltKv: BasaltKv;
   /** Show the rarely-needed flags. */
   advanced: boolean;
   /** Settings the user has changed away from the llama.cpp default. */
@@ -131,6 +138,8 @@ export const cfg = cell("cfg", {
     reserveConnectedVramB: DEFAULT_RESERVE_CONNECTED_VRAM_B,
     reserveRamB: DEFAULT_RESERVE_RAM_B,
     lowPriority: true,
+    basaltCards: "auto",
+    basaltKv: "fp16" as BasaltKv,
     advanced: false,
     touched: [] as string[],
     envVars: "",
@@ -383,6 +392,14 @@ export const cfg = cell("cfg", {
     },
     toggleLowPriority(s) {
       s.lowPriority = !s.lowPriority;
+    },
+    /** Anything but "auto", "both" or a card number is ignored. */
+    setBasaltCards(s, cards: string) {
+      if (/^(auto|both|\d+)$/.test(cards)) s.basaltCards = cards;
+    },
+    setBasaltKv(s, kv: string) {
+      const k = BASALT_KVS.find((x) => x === kv);
+      if (k) s.basaltKv = k;
     },
     toggleAdvanced(s) {
       s.advanced = !s.advanced;

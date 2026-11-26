@@ -22,11 +22,13 @@ export function extractErrors(lines: readonly string[]): string[] {
   for (const l of lines) {
     const m = ERROR_LINE.exec(l);
     if (m?.[1]) out.push(m[1].trim());
-    // Some builds and the loader print bare messages with no severity column.
+    // Some builds and the loader print bare messages with no severity column;
+    // Basalt and Strata tag theirs (`[server] error: …`).
     else if (
-      /^(error|fatal|terminate called|Segmentation fault)/i.test(l.trim())
+      /^(?:\[[\w.-]+\]\s*)?(error|fatal|terminate called|Segmentation fault)/i
+        .test(l.trim())
     ) {
-      out.push(l.trim());
+      out.push(l.trim().replace(/^\[[\w.-]+\]\s*/, ""));
     } // A ggml assert prints as `<path>.cpp:1367: GGML_ASSERT(...) failed` —
     // no timestamp, no severity, and it IS the whole diagnosis. Missing it
     // reduced a named hard limit to "exited with code 134".
@@ -132,6 +134,47 @@ export function rejectedFlag(text: string): string | null {
 }
 
 const SIGNATURES: Sig[] = [
+  {
+    // Basalt's own refusal (`src/models/inkling2/spill.cpp`): the cache at
+    // this context does not fit the card beside the dense weights, however
+    // many experts move to RAM. Not a backend fault — a smaller step runs.
+    match:
+      /spill plan: even with every expert in RAM the card is (\d+) MiB short \(--max-context (\d+)\)/,
+    reason: (m) =>
+      `The card cannot hold a ${
+        Number(m[2]).toLocaleString("en-US")
+      }-token context: even with every expert in RAM it is ${
+        Number(m[1]).toLocaleString("en-US")
+      } MiB short. The engine and the model are fine; the context is too long for this card.`,
+    steps: [
+      {
+        text:
+          "Pick a smaller Context step, or the int8 or fp8 cache, and start again — the steps offered are the ones that fit now.",
+      },
+    ],
+  },
+  {
+    // Basalt's layer split, either way it refuses: one card's part (its
+    // layers plus their cache) does not fit, at the cut the shares produced.
+    match:
+      /(?:the layer split at layer \d+: card \d+ needs [\d,]+ MiB beside its weights for --max-context (\d+)|gpu-mode split: GPU \d+ \([^)]*\) takes layers [\d-]+ at share [\d.]+ and needs [\d.]+ GiB, [\d.]+ GiB free)/,
+    reason: (m) =>
+      `Split over the cards, one of them cannot hold its part${
+        m[1]
+          ? ` of a ${Number(m[1]).toLocaleString("en-US")}-token context`
+          : ""
+      }: its layers and their cache need more than it has free. The engine and the model are fine.`,
+    steps: [
+      {
+        text:
+          "Pick a smaller Context step, or the fp8 cache (the smallest), and start again.",
+      },
+      {
+        text:
+          "Free memory on the display card — a browser or game holding VRAM there takes it from the split.",
+      },
+    ],
+  },
   {
     // FIRST, and in particular before "no such file", which is also in this
     // line and would blame the model: `libcudart.so.13: cannot open shared

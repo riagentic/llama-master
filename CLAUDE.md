@@ -723,19 +723,21 @@ Data flow worth knowing:
   `attention.indexer.top_k` DeepSeek-V4 does, so the measured scratch term and
   the fit ladder apply unchanged; the single PLE layer's ~0.35 MB per-sequence
   conv state is deliberately unbilled (`plan.ts:recurrentStateB` says why).
-  Support needs llama.cpp PR #27742, which the app cannot build until it merges
-  — source builds fetch tags and master, never a PR ref. `command.ts` omits a
-  flag whose value equals `def`, on the theory that `def` IS what llama.cpp does
-  without it. Upstream moved: `-ngl` now defaults to **auto**, so "CPU only"
-  emitted no `-ngl` and llama.cpp offloaded to the GPU anyway; `-c` defaults to
-  **0 = take it from the model**, so a plan drawn for 4,096 tokens started a
-  server at this model's declared 1,048,576 and could not allocate — a start
-  that cannot succeed, with an error naming none of it. `Param.llamaDef`
-  (`types.ts`) carries llama.cpp's own default when it differs, and omission is
-  judged against THAT. The three flags that decide the placement — `-ngl`, `-c`,
-  `-np` — are always emitted, because their whole job is to pin what runs.
-  Re-check after any llama.cpp bump: the failure mode is silent, and
-  `llama-server --help` prints every default.
+  Support was llama.cpp PR #27742; `qwen4exp` is in master now (a master build
+  of 2026-10-08 ran it). Unsloth's separate `MTP/mtp-…-shared-Q8_0.gguf` is NOT
+  a llama.cpp drafter: it borrows the main model's embeddings and master refuses
+  it (`tensor 'token_embd.weight' not found`), so `mtp.ts` must keep not pairing
+  it — only Strata uses it. `command.ts` omits a flag whose value equals `def`,
+  on the theory that `def` IS what llama.cpp does without it. Upstream moved:
+  `-ngl` now defaults to **auto**, so "CPU only" emitted no `-ngl` and llama.cpp
+  offloaded to the GPU anyway; `-c` defaults to **0 = take it from the model**,
+  so a plan drawn for 4,096 tokens started a server at this model's declared
+  1,048,576 and could not allocate — a start that cannot succeed, with an error
+  naming none of it. `Param.llamaDef` (`types.ts`) carries llama.cpp's own
+  default when it differs, and omission is judged against THAT. The three flags
+  that decide the placement — `-ngl`, `-c`, `-np` — are always emitted, because
+  their whole job is to pin what runs. Re-check after any llama.cpp bump: the
+  failure mode is silent, and `llama-server --help` prints every default.
 - **One thread per PHYSICAL core, and the priority switch is what protects the
   desktop.** `cpuBudget` used to leave two cores to the OS. Measured on the same
   DeepSeek placement: 16 threads 15.91 tok/s, 32 threads (SMT) **0.94** — two
@@ -1144,14 +1146,16 @@ cannot act on is a bug.
   it. A Hadamard-folded `Q2_0` loads on upstream and answers GARBAGE, which is
   why this is a block and not a warning.
 - **Strata is a second ENGINE behind the same Start button, not a port.**
-  `Niko1221/Strata` runs one model family — Qwen3.8-Flash-Next — with a
+  `Niko1221/Strata` runs the Qwen3.8-Flash-Next family (ISTA-DASLab's GSQ-RCO
+  sizes, Swift 1.5, the Coder, Unsloth's UD-IQ4_XS / UD-Q4 / Q5 / Q6_K_XL /
+  Q8_0, and Gyro-S / Gyro-M), Qwen3.6-35B-A3B and Inkling-2-Mini, with a
   per-expert VRAM cache, its own kernels and an MTP draft layer, where llama.cpp
   streams every routed expert from RAM. Measured 2026-10-08, the same UD-Q4_K_XL
   file, two 24 GB Blackwell cards, 4 GB reserved on each, the app's own bench
   prompts, warm: **53-64 tok/s against 11-15, and a 28,863-token prompt read at
-  2,690 tok/s against 159** (41-54 without the draft layer). Built and started
-  THROUGH the app: 80 s to build, ~110 s to load, 51-69 tok/s at a 131,072
-  context.
+  2,690 tok/s against 159** (41-54 without the draft layer). Built or its
+  ready-made engine installed and started THROUGH the app: ~110 s to load, 51-69
+  tok/s at a 131,072 context.
   - **It is a build like any other** (`fork:Niko1221/Strata`,
     `Build.engine ===
     "strata"`), and `src/lib/strata.ts` is everything the
@@ -1170,15 +1174,20 @@ cannot act on is a bug.
   - **Three things its installer would do and must not here.** `sudo apt-get`
     for Python or CUDA: a `sudo` that refuses is first on the launcher's PATH,
     and `STRATA_NVCC` names the app's own toolkit. Download the model:
-    `--gguf-dir` hands it the files on disk — the one fetch is the draft layer,
-    **6.5 GB**, stated on the offer before the button. Fill the display card:
+    `--gguf-dir` hands it the files on disk — the Flash-Next packs' one model
+    fetch is the draft layer, **6.5 GB**, stated on the offer before the button;
+    Qwen3.6 carries its own MTP block. Fill the display card:
     `--vram-reserve-mib` carries the user's reserve (one number for every card,
-    so it is the display card's).
+    so it is the display card's). The image encoder is off (`--vision no`): this
+    app's chat sends text only, and the encoder would take ~1.4 GB of VRAM from
+    the experts.
   - **Packs and the draft layer live in `cache/strata/`, not in the build**, so
     an engine update does not fetch 6.5 GB again. Built IN PLACE, unlike a
     llama.cpp build: a venv bakes absolute paths into every script, so
     stage-then-rename breaks it. Debian's `python3` has no `ensurepip`; the venv
-    falls back to `uv`.
+    falls back to `uv`. Setup may install Strata's ready-made engine instead of
+    compiling; the build verifies the `exe` named in the config it wrote, not a
+    hardcoded `engine/strata` (a CUDA 12 card uses `engine-cuda12/`).
   - **Strata is not llama-server, and three callers had to learn it.** No
     `--help` vocabulary (`builds.probe` skips an `engine` build — its launcher
     would answer by running a setup), no tuner and no fit ladder (`-c` and
@@ -1204,25 +1213,155 @@ cannot act on is a bug.
     records `cardFreeB` so each card's share is measured.
   - **Its footprint is an estimate of a different kind** (`strataNeeds`): VRAM
     is "whatever is free, less the reserve on each card" (predicted 34.7 GB,
-    took 35.6) and RAM is 0.75 of the FILE (111.3 GB on disk, 82.8 GB resident,
-    79.6 of it anonymous). That RAM is not a mapping the kernel can drop, so
+    took 35.6) and RAM is a share of the FILE: 0.75 for the Flash-Next packs
+    (111.3 GB on disk, 82.8 GB resident, 79.6 of it anonymous), 0.9 for
+    Qwen3.6's hybrid path (nearly the whole file is copied; the rest is computed
+    on the CPU). That RAM is not a mapping the kernel can drop, so
     `strataRamShort` BLOCKS Start when less is free — the alternative is the OOM
-    killer picking a neighbour. One file on one machine; every use says "about".
-    Two traps, both shipped in v0.13.0: the VRAM side must sum only the cards
-    the build can use (`usableGpus` — `hw.gpus` lists this machine's AMD iGPU
-    too; a live run reads `srv.runCardFreeB`), and the RAM check must credit a
-    RUNNING engine's own anonymous RSS (`ownB`), or Strata blocks its own
-    restart.
+    killer picking a neighbour. The Unsloth budget files also have a floor
+    (`StrataModel.ramFloorGB`, setup's `ram_gb`): above it they run from a RAM
+    budget and read the rest from the SSD, and `strataRamShort` uses the floor
+    so a 64 GB PC is not refused for a file whose all-in figure is 0.75 of 111
+    GB. One file on one machine; every use says "about". Three traps, all
+    shipped: the VRAM side must sum only the cards the build can use
+    (`usableGpus` — `hw.gpus` lists this machine's AMD iGPU too; a live run
+    reads `srv.runCardFreeB`), the RAM check must credit a RUNNING engine's own
+    anonymous RSS (`ownB`), or Strata blocks its own restart, and Qwen3.6's path
+    uses ONE card (`StrataModel.cards`), so its plan must not spread the reserve
+    over the machine.
   - **On a Strata build the page drops what it cannot honour**: the placement
     picker, the quantisation hint, the tuner's switch, the thinking switch,
-    stability and the llama.cpp catalog. Context is Strata's six sizes as
-    buttons (`STRATA_CONTEXTS`), the reserve boxes stay — they are the one
-    setting both engines share.
-  - **Still open.** The memory MAP's bands inside a card (weights / KV /
-    compute) are apportioned from a llama.cpp plan; only the card totals and the
-    RAM figure are measured. The Tune and Server pages still show llama.cpp's
-    controls. A failed Strata rebuild leaves it unlisted until the next good
-    one.
+    stability and the llama.cpp catalog. Context is Strata's sizes as buttons
+    (`STRATA_CONTEXTS`; Qwen3.6 stops at 256K because its path has no rope
+    scaling), the reserve boxes stay — they are the one setting both engines
+    share.
+  - **0.2.16 moved everything into `terminal/`** (setup.py, its venv, the run
+    configs, `serve/server.py`); the engine sources are `engine/`. The launcher
+    detects the layout (`strata.server.ts:strataWorkDir`), an update carries the
+    old venv along as Strata's own setup.sh does, and setup migrates the old
+    configs itself. Ready-made engines are now COMPONENTS from Strata's signed
+    feed: `STRATA_COMPONENTS_DIR` points them into `cache/strata/components`,
+    and a `component:` exe in a run config is trusted because setup verified the
+    signature and test-started it.
+  - **Inkling-2-Mini (0.2.21) runs on its own engine, `strata-inkling`, on ONE
+    card** — its DSpark drafter does not run across NVIDIA cards yet (#6741),
+    and setup wants `--gpu N` for one card (`--gpus` refuses a single one).
+    Setup pins Unsloth's UD files by SHA-256, so any other quantisation of it
+    (LM Studio's) runs Strata's own SQ-20 pack, a 19.35 GB download stated on
+    the offer — a fine-tune never does: that would be a silent substitution. The
+    card is the one with the most free VRAM after ITS reserve, and a one-card
+    run pays only its own card's reserve: measured SQ-20 on card 0 at 32K, 28.9
+    tok/s with 8 GB reserved, 60.6 with 2 GB, and 48.9 / 43.4 (prose / code)
+    through the app at this machine's 4 GB — against llama.cpp's 35.7 / 27.4 for
+    Q4_K_M on 18.1 GB of the same card.
+  - **Still open.** For Strata the memory MAP's bands inside a card (weights /
+    KV / compute) are apportioned from a llama.cpp plan; only the card totals
+    and the RAM figure are measured. (Basalt itemises its own — see below.) The
+    Tune and Server pages still show llama.cpp's controls. A failed Strata
+    rebuild leaves it unlisted until the next good one. Strata's newer
+    DeepSeek-V4.1-Flash (multi-file, its own engine) and NVFP4 (pack folders, no
+    GGUF) families are not offered yet, and its HIP, Windows and Mac paths are
+    not wired; `--parallel` is left at one request.
+- **Basalt is the third engine, and on Blackwell it is the fastest one for
+  Inkling 2 Mini.** `jesdga95/basalt` (MIT) is a Strata fork rebuilt for sm_120:
+  the official NVFP4 experts on the FP4 tensor cores, a DSpark drafter the
+  target checks (output is plain decoding's), one compiled `bin/basalt` under a
+  Python server. Measured 2026-11-25, one RTX PRO 4000 Blackwell (the headless
+  card), the app's prose / code bench prompts, 512 tokens, median of 3: **126.5
+  / 166.9 tok/s**, against Strata 48.9 / 43.4 and llama.cpp 35.7 / 27.4 on the
+  same machine. Load 25 s cold, 4 s warm; 64K context fits on the card at fp16
+  with 3 GB to spare.
+  - **vLLM was measured against it and lost on this hardware.** The official
+    checkpoint needs a 32 GB card in vLLM: on 24 GB its KV pool has a ~4.4 GiB
+    fixed part, so even 8K at fp8 does not fit. Across BOTH cards (TP=2, which
+    hung in NCCL until `NCCL_P2P_DISABLE=1` — these cards have no P2P) it ran
+    106.7 / 191.1 — faster on code only, by taking the display card, a 10 GB
+    Python install and ~2.5 min to start. Not wired; the numbers are here so the
+    question is not re-asked.
+  - **It shares Strata's vocabulary, so it shares Strata's code.** A Basalt
+    model is a `StrataModel` (`src/lib/basalt.ts:basaltModel`), its run is read
+    back by `strataRunOf` (which accepts `--max-context`), and every view keyed
+    on `strataView()` draws it with the engine's NAME (`view.name`).
+    `derive.ts:engineModel` picks the rule set by `Build.engine`; Basalt wins
+    the offer over Strata on the family both run.
+  - **The weights are the official release, and the app checked.** Basalt's pack
+    (`Inkling-2-Mini-NVFP4-MX8.basalt`) keeps the routed experts bit for bit and
+    stores dense projections as Q8_0 (author: PPL 7.0695 against the reference's
+    7.0633, top-1 97.8%). The pack here was converted locally from the official
+    checkpoint with Basalt's own `convert.py` and is identical to the published
+    one in every weight section (compared header SHA-256s, all sections
+    re-hashed); only the `meta` block differs by 26 bytes. The build downloads
+    the PUBLISHED pack (pinned revision, whole-file SHA-256) when
+    `cache/basalt/packs/<pack>.ok` is absent — 19.6 GB, stated on the offer.
+  - **A pack is a model in the list, not only a thing a GGUF stands for.**
+    `src/lib/packs.ts`: the scan lists `.basalt` files from every root (Basalt
+    runs a pack from its path, and the argv names that path) and `.strata` only
+    from `cache/strata/models` (Strata's setup runs the copy it fetched there),
+    plus `cache/basalt/packs`. No header is read — `meta` and `metaError` are
+    both null — and `packMismatch` blocks every build but the pack's own engine,
+    first in `modelRuntimeFor`. Before, the fastest model on the machine
+    appeared nowhere, and a Basalt run needed an Inkling GGUF on disk only as a
+    name tag. The official `.safetensors` checkpoint is not listed: nothing
+    wired here runs it.
+  - **Only official quantisations stand for it.** `basaltModel` matches
+    `Inkling-2-Mini-<quant>.gguf` and nothing else: a fine-tune (`-Uncensored-`,
+    `-Heretic-`) is other weights, and running the original in its place would
+    be a silent substitution.
+  - **The context is capped to the CARD, because past it Basalt refuses.**
+    Experts spill to RAM as the cache grows, but the fp16 cache itself (36 KiB a
+    token) and ~5,970 MiB of dense weights must stay on the card:
+    `basaltMaxContext` (measured: 1,048,576 refused 19,084 MiB short, 524,288
+    652 short, 262,144 ran, on 24,450 MiB free). A 1M `ctxSize` left over from
+    another model shipped as "exited with code 1 and printed nothing useful" —
+    Basalt tags its lines `[server] error: …`, which `extractErrors` now reads.
+    The run records the context its ARGV carries
+    (`strataSettings(settings, argv)`), or the bench keys on the wrong one.
+  - **1M needs both cards, split, with an fp8 cache — measured 2026-11-25.**
+    Inkling's 12-layer core runs 3x, so it owns 36 of the 48 caches and the cut
+    must land INSIDE it:
+    `--gpu 1,0 --gpu-mode split --gpu-share 1,1 --kv
+    fp8 --max-context 1048576 --vram-reserve-mib 700`
+    loads (cut at 14) and runs 123.5 / 170.7 tok/s against one card's 127.0 /
+    173.4 at 262K, with 2.9 GB free on the display card and 1.4 on the other.
+    Basalt takes ONE reserve for every card, so the user's 4 GB display reserve
+    cannot be honoured there; the default share cut at 15 (main card 1.1 GB
+    short), 2:3 at 11 (other card 5.8 short); int8 at 1M split is 1 GB short. In
+    split mode no expert may go to RAM. One card: fp16 36 KiB/token (~505K max),
+    int8 ~22 (~830K), fp8 ~20 (~910K); Inkling takes no 4-bit cache. A bigger
+    `--max-context` costs no speed on a short chat (fp16 448K 127.0 / 172.2,
+    int8 768K 120.5 / 182.6). `peer` died on its first request.
+  - **So the page has two Basalt switches** (`cfg.basaltCards`: auto / a card /
+    both; `cfg.basaltKv`: fp16 / int8 / fp8; defaults auto + fp16), and the
+    Context steps are only those `basalt.ts:basaltCap` says fit the chosen cards
+    and cache — one card by its measured bytes per token, a split by the total
+    less one core layer of imbalance. "Both" leads with the roomier card, passes
+    `--gpu-share 1,1`, charges only the per-GPU reserve (Basalt has one number)
+    and SAYS the display reserve cannot be held. Verified from the app's own
+    buttons: 1M split fp8 started, 125.6 / 143.4 tok/s (128-token bench), 3.0 GB
+    left on the display card.
+  - **The live map is Basalt's own figures.** A pack has no header, so the
+    llama.cpp plan of it was empty and the run's ~20 GB drew as "in use
+    elsewhere" on one pooled bar. Basalt's `/metrics` is JSON with
+    `hardware.gpus[].vram_parts {experts, kv, other}` per nvidia-smi index
+    (summing to the card's used bytes exactly) and `ram_parts.experts`;
+    `srv.poll` reads it (`basalt.ts:basaltParts`) and `plan.ts:enginePlan` draws
+    it, with an experts band per card.
+  - **Nothing lossy is emitted.** `--kv fp16` (fp8 rounds the cache), and never
+    `--route-prior` or the expert-dropping flags (Basalt's
+    `docs/precision/quality.md` calls them less accurate than the model).
+    `--vram-reserve-mib` is Basalt's own 700 MiB scratch plus the user's reserve
+    for that card; `--ram-reserve-mib` is at least Basalt's 2,048.
+  - Built in place (venv paths), compiled with the app's CUDA toolkit (≥ 13,
+    refused before compiling otherwise) and CMake — pinned by
+    `-DCUDAToolkit_ROOT` as well as the compiler: with `CUDACXX` alone the app's
+    newer CMake linked this machine's system CUDA 12.0 `libcudart` and the link
+    failed at 40%
+    (`undefined reference to
+    cudaGetDriverEntryPointByVersion`), and a stale
+    `CMakeCache.txt` keeps that choice, so it is deleted before every configure.
+    Offered only when a card is compute capability 12.x. Basalt writes its
+    engine log and conversation cache to `~/.cache/basalt/<id>/`, outside the
+    app home.
 - **Upstream ships Linux CUDA again (b11039+), in two archives.** The binary
   (`llama-bNNN-bin-ubuntu-cuda-13.3-x64.tar.gz`) and its runtime
   (`cudart-<same name>`; Windows: `cudart-llama-bin-win-cuda-X.Y-x64.zip`, no

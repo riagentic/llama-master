@@ -14,6 +14,8 @@ import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
 import { exec, paths, PLATFORM } from "./host.server.ts";
 import type { EnvVar } from "../lib/envvars.ts";
+import type { EngineParts } from "../lib/plan.ts";
+import { basaltParts } from "../lib/basalt.ts";
 import { envPrefix, spawnEnv } from "../lib/envvars.ts";
 
 /** Trailing separator so `/builds-evil` cannot pass a `/builds` prefix test. */
@@ -89,10 +91,14 @@ export async function findOrphans(): Promise<Orphan[]> {
   const out: Orphan[] = [];
   const root = buildsRoot();
   const mine = slot?.pid ?? 0;
+  // The running server's whole tree is ours, not an orphan: Basalt's server
+  // starts `bin/basalt` as its engine, and that child was reported as "a
+  // llama-server from an earlier session" beside the run that owned it.
+  const family = new Set(mine ? await processTree(mine) : []);
   try {
     for await (const e of Deno.readDir("/proc")) {
       const pid = Number(e.name);
-      if (!pid || pid === mine || pid === Deno.pid) continue;
+      if (!pid || family.has(pid) || pid === Deno.pid) continue;
       let cmd: string;
       try {
         cmd = await Deno.readTextFile(`/proc/${pid}/cmdline`);
@@ -116,10 +122,13 @@ export async function findOrphans(): Promise<Orphan[]> {
         // Not permitted or already gone — argv still decides.
       }
       // Strata's server is a Python script, so its `exe` is an interpreter
-      // outside the builds root; its argv names the script inside it.
+      // outside the builds root; its argv names the script inside it. Basalt's
+      // server names its engine (`--engine-bin <build>/bin/basalt`), and the
+      // engine itself is that binary.
       const isOurs = (path: string) =>
         path.startsWith(root) &&
-        (path.endsWith(BIN_NAME) || path.endsWith("/serve/server.py"));
+        (path.endsWith(BIN_NAME) || path.endsWith("/serve/server.py") ||
+          path.endsWith("/bin/basalt"));
       if (isOurs(exe) || argv.some(isOurs)) {
         out.push({ pid, argv: argv.join(" ") });
       }
@@ -418,6 +427,10 @@ export async function stop(graceMs = 5000): Promise<void> {
   stopGeneration++;
   const s = slot;
   if (!s) return;
+  // Read before the SIGTERM: an engine's own children (Basalt's server →
+  // `bin/basalt`) hold the VRAM, and a SIGKILL to the parent alone leaves
+  // them running, reparented, once the tree can no longer be walked.
+  const tree = await processTree(s.pid).catch(() => [s.pid]);
   try {
     s.child.kill("SIGTERM");
   } catch {
@@ -429,10 +442,12 @@ export async function stop(graceMs = 5000): Promise<void> {
   const done = s.child.status.then(() => "exited" as const);
   if (await Promise.race([done, timeout]) === "timeout") {
     push(`[llama.master] no exit after ${graceMs}ms — sending SIGKILL`);
-    try {
-      s.child.kill("SIGKILL");
-    } catch {
-      // Nothing left to kill.
+    for (const pid of tree.slice().reverse()) {
+      try {
+        Deno.kill(pid, "SIGKILL");
+      } catch {
+        // Nothing left to kill.
+      }
     }
     await s.child.status;
   }
@@ -628,6 +643,27 @@ export async function props(
       return null;
     }
     return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** What an engine run holds, per card, from its own `/metrics` — Basalt's
+ *  JSON (`basalt.ts:basaltParts`). Null for anything else: llama-server's
+ *  Prometheus text, an old engine, a timeout. */
+export async function engineParts(
+  baseUrl: string,
+  timeoutMs = 1000,
+): Promise<EngineParts | null> {
+  try {
+    const res = await fetch(`${baseUrl}/metrics`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      await res.body?.cancel();
+      return null;
+    }
+    return basaltParts(await res.json());
   } catch {
     return null;
   }

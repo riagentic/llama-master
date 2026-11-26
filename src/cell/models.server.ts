@@ -23,7 +23,8 @@ import {
   shardKey,
   shardPaths,
 } from "../lib/shards.ts";
-import { exists, PLATFORM } from "./host.server.ts";
+import { packEngine } from "../lib/packs.ts";
+import { exists, paths, PLATFORM } from "./host.server.ts";
 import { gguf } from "./wasm.server.ts";
 import { DEMO_ENV, demoModels } from "../lib/demo.ts";
 
@@ -98,17 +99,34 @@ async function listDir(dir: string): Promise<Deno.DirEntry[]> {
   return out;
 }
 
+/** What a model library holds: GGUFs, and Basalt packs (Basalt runs a pack
+ *  from wherever it is). A `.strata` pack is listed only from Strata's own
+ *  folder (`packDirs`) — Strata's setup runs the copy it downloaded there. */
+const MODEL_EXTS = [".gguf", ".basalt"];
+
+/** The engines' own downloads, which are models too. Under the app home, so
+ *  never one of the user's roots; scanned beside them. */
+function packDirs(): { dir: string; exts: string[] }[] {
+  return [
+    { dir: join(paths().cache, "basalt", "packs"), exts: [".basalt"] },
+    { dir: join(paths().cache, "strata", "models"), exts: [".strata"] },
+  ];
+}
+
 async function* walk(
   dir: string,
   depth: number,
+  exts: readonly string[] = MODEL_EXTS,
 ): AsyncGenerator<{ path: string; size: number; mtime: number }> {
   if (depth < 0) return;
   for (const e of await listDir(dir)) {
     if (e.name.startsWith(".")) continue;
     const p = join(dir, e.name);
     if (e.isDirectory) {
-      yield* walk(p, depth - 1);
-    } else if (e.isFile && e.name.toLowerCase().endsWith(".gguf")) {
+      yield* walk(p, depth - 1, exts);
+    } else if (
+      e.isFile && exts.some((x) => e.name.toLowerCase().endsWith(x))
+    ) {
       try {
         const st = await Deno.stat(p);
         yield { path: p, size: st.size, mtime: st.mtime?.getTime() ?? 0 };
@@ -375,6 +393,13 @@ export async function scan(
       found.push(f);
     }
   }
+  for (const { dir, exts } of packDirs()) {
+    for await (const f of walk(dir, 2, exts)) {
+      if (seen.has(f.path)) continue;
+      seen.add(f.path);
+      found.push(f);
+    }
+  }
 
   // Collapse shard sets onto their first part, summing the size. A multi-part
   // GGUF is loaded by pointing `-m` at part 1, so listing all four parts would
@@ -403,8 +428,12 @@ export async function scan(
     const sizeB = shardTotals.get(key) ?? f.size;
     // The whole set, not part 1 of it — and `sizeB` so the merge can check
     // itself against what is actually on disk.
+    // A pack has no GGUF header: only its engine reads it, and it is listed
+    // with no header rather than as an unreadable one.
     const { meta, error } = broken
       ? { meta: null, error: broken }
+      : packEngine(f.path)
+      ? { meta: null, error: null }
       : await readModel(f.path, sizeB);
     const ollamaName = named.get(f.path);
     models.push({

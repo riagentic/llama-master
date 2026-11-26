@@ -44,7 +44,12 @@ import {
   speedIsMeasured,
 } from "../lib/speed.ts";
 import type { Drift } from "../lib/adapt.ts";
-import { NO_MODEL, plan as computePlan, withoutOurUsage } from "../lib/plan.ts";
+import {
+  enginePlan,
+  NO_MODEL,
+  plan as computePlan,
+  withoutOurUsage,
+} from "../lib/plan.ts";
 import type { Plan } from "../lib/plan.ts";
 import { setupRows } from "../lib/setup.ts";
 import {
@@ -54,6 +59,7 @@ import {
   specVerdict,
 } from "../lib/bench.ts";
 import type { BandwidthNote, BenchResult, SpecVerdict } from "../lib/bench.ts";
+import { packEngine, packInfo, packMismatch } from "../lib/packs.ts";
 import { findMtpSibling } from "../lib/mtp.ts";
 import type { MtpSibling } from "../lib/mtp.ts";
 import { parseEnvVars } from "../lib/envvars.ts";
@@ -68,6 +74,8 @@ import { updateFor } from "../lib/update.ts";
 import { runtimeMismatch } from "../lib/runtime.ts";
 import {
   strataArgs,
+  strataCard,
+  strataContexts,
   strataMismatch,
   strataModel,
   strataNeeds,
@@ -76,7 +84,17 @@ import {
   strataRunOf,
   strataSetupRows,
 } from "../lib/strata.ts";
+import { displayGpus } from "../lib/reserve.ts";
 import type { StrataModel } from "../lib/strata.ts";
+import {
+  BASALT_KVS,
+  basaltArgs,
+  basaltCap,
+  type BasaltKv,
+  basaltMismatch,
+  basaltModel,
+  basaltOffer,
+} from "../lib/basalt.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { UpdateCheck } from "../lib/update.ts";
 import type { FixPlan } from "../lib/fixplan.ts";
@@ -101,7 +119,7 @@ export function visibleModels(): Model[] {
   return models.items.filter((m) =>
     m.file.toLowerCase().includes(q) ||
     (m.meta?.arch ?? "").toLowerCase().includes(q) ||
-    (m.meta?.quant ?? "").toLowerCase().includes(q)
+    (m.meta?.quant ?? packInfo(m.file)?.quant ?? "").toLowerCase().includes(q)
   );
 }
 
@@ -152,18 +170,57 @@ export function modelRuntimeFor(path: string): Diagnosis | null {
   const m = models.items.find((x) => x.path === path);
   const b = activeBuild();
   if (!m || !b) return null;
-  return runtimeMismatch(m.meta?.vendor, b.ref, builds.installed) ??
-    strataMismatch(m.file, b.ref, builds.installed);
+  return packMismatch(
+    m.file,
+    b.ref,
+    builds.installed,
+    hw.gpus.map((g) => g.computeCap),
+  ) ??
+    runtimeMismatch(m.meta?.vendor, b.ref, builds.installed) ??
+    strataMismatch(m.file, b.ref, builds.installed) ??
+    basaltMismatch(m.file, b.ref, builds.installed);
+}
+
+/** The model the active engine build runs for `file`, or null. */
+export function engineModel(file: string): StrataModel | null {
+  const engine = activeBuild()?.engine;
+  return engine === "basalt"
+    ? basaltModel(file)
+    : engine === "strata"
+    ? strataModel(file)
+    : null;
 }
 
 /**
- * The Strata run this page is about, or null on a llama.cpp build: the
+ * The Strata-kind run this page is about (Strata or Basalt — the same
+ * vocabulary), or null on a llama.cpp build: the
  * RUNNING one read back from its own argv, else what Start would spawn. The
  * one source for every Strata-specific line on screen — setup rows, the load
  * bar's total, the memory note, the Start check.
  */
+/** The card choices Basalt's switch offers: automatic, each usable card,
+ *  and a split over all of them when there are two or more. */
+export function basaltCardChoices(): { value: string; label: string }[] {
+  const gpus = usableGpus(activeBuild()?.backend, hw.gpus);
+  return [
+    { value: "auto", label: "Auto" },
+    ...gpus.map((g, i) => ({
+      value: String(i),
+      label: `GPU ${i}${g.display ? " (display)" : ""}`,
+    })),
+    ...(gpus.length > 1 ? [{ value: "both", label: "Both" }] : []),
+  ];
+}
+
+/** A run's `--kv` as a format the fit check knows; fp16 when absent. */
+function basaltKvOf(kv: string | null): BasaltKv {
+  return BASALT_KVS.find((k) => k === kv) ?? "fp16";
+}
+
 export function strataView():
   | {
+    /** The engine's name, for every sentence that says who decides. */
+    name: string;
     model: StrataModel;
     ctx: number;
     reserveMib: number;
@@ -171,13 +228,18 @@ export function strataView():
     /** Estimates, both (`strata.ts:strataNeeds`). */
     vramB: number;
     ramB: number;
+    /** Lowest free RAM this file can run in (low-RAM budget); 0 = unknown. */
+    ramFloorB: number;
+    /** The context steps this card can take (Basalt: those that fit it). */
+    contexts: readonly number[];
     running: boolean;
   }
   | null {
-  if (activeBuild()?.engine !== "strata") return null;
+  const engine = activeBuild()?.engine;
+  if (!engine) return null;
   const running = srv.runModel !== "" && srv.argv.length > 0;
   const m = running ? shownModel() : currentModel();
-  const model = m ? strataModel(m.file) : null;
+  const model = m ? engineModel(m.file) : null;
   if (!m || !model) return null;
   const run = strataRunOf(
     running
@@ -187,24 +249,52 @@ export function strataView():
   if (!run) return null;
   // The cards a CUDA build can use — `hw.gpus` also lists this machine's AMD
   // iGPU, whose free memory Strata will never fill. All of them, whatever
-  // `-dev` says: Strata is spawned with `--gpus all`.
+  // `-dev` says: Strata is spawned with `--gpus all`. Qwen3.6's own path uses
+  // one card, so it is described against one.
   const gpus = usableGpus(activeBuild()?.backend, hw.gpus);
-  const cards = gpus.length;
-  const atStartB = srv.runCardFreeB.reduce((a, b) => a + b, 0);
+  // A one-card path handed several cards is Basalt's layer split.
+  const split = run.gpus.length > 1;
+  const one = model.cards === "one" && !split;
+  const cards = split
+    ? run.gpus.length
+    : one
+    ? Math.min(1, gpus.length)
+    : gpus.length;
+  const freeNowB = gpus.map((g) => Math.max(0, g.vramTotalB - g.vramUsedB));
+  const atStart = srv.runCardFreeB;
+  // A live run is sized against the machine it was started on: its own bytes
+  // are gone from "free now". A one-card path is sized against one card, not
+  // the sum of the machine.
+  const freeAt = running && atStart.length > 0 ? atStart : freeNowB;
+  const runFreeB = run.gpus.map((i) => freeAt[i] ?? 0);
+  const freeVramB = split
+    ? runFreeB.reduce((a, b) => a + b, 0)
+    : one
+    ? (runFreeB[0] ?? (freeAt.length > 0 ? Math.max(0, ...freeAt) : 0))
+    : freeAt.reduce((a, b) => a + b, 0);
+  const steps = strataContexts(model);
+  // Basalt: only the steps that fit the cards and cache this run is given.
+  const contexts = engine === "basalt" && runFreeB.length > 0
+    ? steps.filter((c) =>
+      c <= basaltCap(runFreeB, run.reserveMib, basaltKvOf(run.kv))
+    )
+    : steps;
   return {
+    name: engine === "basalt" ? "Basalt" : "Strata",
+    contexts,
     model,
     ...run,
     cards,
     ...strataNeeds({
       fileB: m.sizeB,
-      // A live run is sized against the machine it was started on: its own
-      // bytes are gone from "free now".
-      freeVramB: running && atStartB > 0
-        ? atStartB
-        : gpus.reduce((a, g) => a + Math.max(0, g.vramTotalB - g.vramUsedB), 0),
+      freeVramB,
       cards,
       reserveMib: run.reserveMib,
+      ramShare: model.ramShare,
+      memTotalB: model.memTotalGB ? model.memTotalGB * 1e9 : undefined,
+      fixedRamB: model.ramGB ? model.ramGB * 1e9 : undefined,
     }),
+    ramFloorB: model.ramFloorGB ? model.ramFloorGB * 1e9 : 0,
     running,
   };
 }
@@ -214,7 +304,18 @@ export function strataView():
 export function engineOffer(): Diagnosis | null {
   const m = models.items.find((x) => x.path === models.selected);
   const b = activeBuild();
-  if (!m || !b) return null;
+  // A pack is not offered an engine: only its own reads it, and
+  // `packMismatch` already says which.
+  if (!m || !b || packEngine(m.file)) return null;
+  const basalt = basaltOffer(
+    m.file,
+    b.ref,
+    builds.installed,
+    hw.gpus.map((g) => g.computeCap),
+  );
+  // Basalt outruns Strata on the one family both run, so it is the offer;
+  // and a Basalt build is not offered the slower engine.
+  if (basalt || b.engine === "basalt") return basalt;
   return strataOffer(
     m.file,
     b.ref,
@@ -234,9 +335,60 @@ export function strataCommand(
   pin = 0,
 ): string[] | null {
   const b = activeBuild();
-  if (b?.engine !== "strata") return null;
-  const model = strataModel(path);
+  if (!b?.engine) return null;
+  const model = b.engine === "basalt" ? basaltModel(path) : strataModel(path);
   if (!model) return null;
+  // Strata takes one reserve for every card, so a multi-card run pays the
+  // display card's. A one-card path pays only its OWN card's — the connected
+  // reserve defends a desktop, and a headless card has none (measured on
+  // Inkling SQ-20: 28.9 tok/s at 8 GB reserved, 60.6 at 2 GB).
+  const gpus = usableGpus(b.backend, hw.gpus);
+  const display = displayGpus(gpus);
+  const connected = (i: number) => display[i] ? cfg.reserveConnectedVramB : 0;
+  const gpu = strataCard(
+    gpus.map((g, i) =>
+      g.vramTotalB - g.vramUsedB - cfg.reservePerGpuVramB - connected(i)
+    ),
+  );
+  if (b.engine === "basalt") {
+    // Positions in `usableGpus`, which a CUDA build numbers as nvidia-smi
+    // does — the same `--gpu` Strata is handed. A chosen card that is not
+    // there (unplugged since) falls back to the automatic pick.
+    const pick = cfg.basaltCards;
+    const chosen = /^\d+$/.test(pick) && Number(pick) < gpus.length
+      ? Number(pick)
+      : gpu;
+    // Both: the card with the most room leads (it runs the first layers and
+    // the engine's own head), the rest follow in order.
+    const list = pick === "both" && gpus.length > 1
+      ? [chosen, ...gpus.map((_, i) => i).filter((i) => i !== chosen)]
+      : [chosen];
+    return [
+      b.serverBin,
+      ...basaltArgs({
+        buildDir: b.dir,
+        modelPath: path,
+        model,
+        ctx: pin || Number(settings.ctxSize) || 0,
+        // A split takes ONE reserve for every card, so it can only be the
+        // per-GPU figure: the display card's extra cannot be honoured there,
+        // and charging it to every card wasted it on the headless one.
+        reserveB: cfg.reservePerGpuVramB +
+          (list.length > 1 ? 0 : connected(chosen)),
+        ramReserveB: cfg.reserveRamB,
+        host: String(settings.host ?? "127.0.0.1"),
+        port: Number(settings.port ?? 8080),
+        gpus: list,
+        // No card listed yet (before the first hardware poll): no cap.
+        freeB: gpus.length > 0
+          ? list.map((i) =>
+            (gpus[i]?.vramTotalB ?? 0) - (gpus[i]?.vramUsedB ?? 0)
+          )
+          : undefined,
+        kv: cfg.basaltKv,
+      }),
+    ];
+  }
   return [
     b.serverBin,
     ...strataArgs({
@@ -245,10 +397,11 @@ export function strataCommand(
       ctx: pin || Number(settings.ctxSize) || 0,
       reserveMib: strataReserveMib(
         cfg.reservePerGpuVramB,
-        cfg.reserveConnectedVramB,
+        model.cards === "one" ? connected(gpu) : cfg.reserveConnectedVramB,
       ),
       host: String(settings.host ?? "127.0.0.1"),
       port: Number(settings.port ?? 8080),
+      gpu,
     }),
   ];
 }
@@ -304,7 +457,11 @@ export function hwSnapshot(): Hw {
     // The RUN's `-dev` while one is up, like every other "what is running"
     // reading: filtering a live run's cards by a value typed since would
     // describe a process that does not exist (`shownSettings`).
-    gpus: enabledGpus(backend, hw.gpus, str(shownSettings(), "device")),
+    // An engine build is not handed `-dev` (Strata and Basalt take their own
+    // cards), so a leftover llama.cpp value must not drop a card here.
+    gpus: activeBuild()?.engine
+      ? usableGpus(backend, hw.gpus)
+      : enabledGpus(backend, hw.gpus, str(shownSettings(), "device")),
     os: hw.os,
     arch: hw.arch,
     // The tuner needs it too: which flags are even loadable depends on the
@@ -555,6 +712,14 @@ export function memoryIsLive(): boolean {
  * show only what other processes hold and what is free. Same `plan` either way.
  */
 const currentStatePlanC = computed(() => {
+  // An engine run that itemises its own memory is drawn from that — a
+  // `.basalt` pack has no header, so the llama.cpp plan below was empty and
+  // the run's ~20 GB read as somebody else's.
+  const parts = srv.engineParts;
+  const engineRun = parts && memoryIsLive() ? strataRunOf(srv.argv) : null;
+  if (parts && engineRun) {
+    return enginePlan(hwSnapshot(), parts, engineRun.ctx, srv.rssB);
+  }
   const m = shownModel()?.meta;
   if (memoryIsLive() && m && srv.runSettings) {
     // `plan` reads "in use" from device-wide telemetry — the driver's VRAM

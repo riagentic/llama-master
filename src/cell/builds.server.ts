@@ -56,6 +56,7 @@ import {
 import { resolveCmake } from "./prereq.server.ts";
 import { DEMO_ENV, demoBuilds } from "../lib/demo.ts";
 import { isStrataRef, STRATA_LAUNCHER } from "../lib/strata.ts";
+import { BASALT_BIN, isBasaltRef } from "../lib/basalt.ts";
 
 const REPO = "ggml-org/llama.cpp";
 const API = `https://api.github.com/repos/${REPO}`;
@@ -290,10 +291,15 @@ export async function listBuilds(): Promise<Build[]> {
         // Trust the directory over the metadata: a moved app home must not
         // leave every build pointing at paths that no longer exist.
         // Another engine's build has no llama-server: what the app spawns is
-        // the launcher it wrote there (`strata.server.ts`).
-        const launcher = join(dir, STRATA_LAUNCHER);
-        const serverBin = meta.engine === "strata"
-          ? (await exists(launcher) ? launcher : null)
+        // the launcher it wrote there (`strata.server.ts`) or Basalt's own
+        // binary (`basalt.server.ts`).
+        const engineBin = meta.engine === "strata"
+          ? join(dir, STRATA_LAUNCHER)
+          : meta.engine === "basalt"
+          ? join(dir, BASALT_BIN)
+          : null;
+        const serverBin = engineBin
+          ? (await exists(engineBin) ? engineBin : null)
           : await findBinary(dir, BIN_SERVER);
         const cliBin = meta.engine ? null : await findBinary(dir, BIN_CLI);
         if (!serverBin) continue;
@@ -805,6 +811,10 @@ export async function buildFromSource(
   if (isStrataRef(opts.ref)) {
     const { buildStrata } = await import("./strata.server.ts");
     return await buildStrata(opts, onProgress);
+  }
+  if (isBasaltRef(opts.ref)) {
+    const { buildBasalt } = await import("./basalt.server.ts");
+    return await buildBasalt(opts, onProgress);
   }
   const steps = ["Fetch source", "Configure", "Compile", "Install"];
   const p = (step: number, progress: number | null, lines?: string[]) =>

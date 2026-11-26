@@ -315,6 +315,65 @@ export async function download(
   return out;
 }
 
+/** Download straight to a file — for what does not fit in memory (a 20 GB
+ *  model pack). Writes `<dest>.part` and resumes it with a Range request, so
+ *  a dropped connection or a Cancel costs only what was not yet fetched; the
+ *  caller verifies the bytes and renames. */
+export async function downloadToFile(
+  url: string,
+  part: string,
+  onProgress: (received: number, total: number | null) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const have = await Deno.stat(part).then((s) => s.size, () => 0);
+  const res = await fetch(url, {
+    headers: {
+      "user-agent": UA,
+      ...(have > 0 ? { range: `bytes=${have}-` } : {}),
+    },
+    signal,
+  });
+  // 416: the part is already whole (a run stopped between the last byte and
+  // the caller's rename). The caller's checksum decides.
+  if (res.status === 416 && have > 0) {
+    await res.body?.cancel();
+    onProgress(have, have);
+    return;
+  }
+  if (!res.ok || !res.body) {
+    throw new Error(`GET ${url} → ${res.status} ${res.statusText}`);
+  }
+  // 206 continues the part; a 200 is the whole file again.
+  const resumed = res.status === 206;
+  const len = Number(res.headers.get("content-length") ?? NaN);
+  const total = Number.isFinite(len) ? len + (resumed ? have : 0) : null;
+  const file = await Deno.open(part, {
+    write: true,
+    create: true,
+    append: resumed,
+    truncate: !resumed,
+  });
+  let received = resumed ? have : 0;
+  let lastTick = 0;
+  try {
+    for await (const chunk of res.body) {
+      // `write` may take fewer bytes than it is given.
+      for (let off = 0; off < chunk.length;) {
+        off += await file.write(chunk.subarray(off));
+      }
+      received += chunk.length;
+      const now = performance.now();
+      if (now - lastTick > 500) {
+        lastTick = now;
+        onProgress(received, total);
+      }
+    }
+  } finally {
+    file.close();
+  }
+  onProgress(received, total);
+}
+
 // ── archives ───────────────────────────────────────────────────────────────
 
 /** Extract a `.tar.gz` or `.zip` into `dest`, dropping the wrapper directory

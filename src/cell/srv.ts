@@ -22,6 +22,8 @@ import {
 } from "../lib/fitladder.ts";
 import type { Diagnosis } from "../lib/diagnose.ts";
 import type { Settings } from "../lib/types.ts";
+import type { EngineParts } from "../lib/plan.ts";
+import { strataRunOf } from "../lib/strata.ts";
 import {
   BENCH_TOKENS,
   benchRequest,
@@ -145,6 +147,9 @@ export type SrvState = {
   /** VRAM each card had free when this run was spawned — the denominator that
    *  turns "asked for 34.7 GB" into "short by 12.7 GB". */
   runCardFreeB: number[];
+  /** What an engine run (Basalt) says it holds, per card — measured by the
+   *  engine, read on the poll. Null for llama-server, which the map plans. */
+  engineParts: EngineParts | null;
   /** The last speed measurement, and whether one is running.
    *
    *  A measurement rather than an estimate is the point: everything the app
@@ -327,6 +332,7 @@ export const srv = cell("srv", {
     probeSlow: 0,
     runShape: null as { nLayer: number; expertPerLayerB: number } | null,
     runCardFreeB: [] as number[],
+    engineParts: null as EngineParts | null,
     autoFit: false,
     autoUbatch: false,
     fitNote: "",
@@ -473,6 +479,7 @@ export const srv = cell("srv", {
       s.startFreeVramB = run?.freeAtStart?.vramB ?? 0;
       s.startFreeRamB = run?.freeAtStart?.ramB ?? 0;
       s.rssB = 0;
+      s.engineParts = null;
       s.rssFileB = 0;
       try {
         const io = await import("./srv.server.ts");
@@ -557,6 +564,7 @@ export const srv = cell("srv", {
         s.startFreeVramB = 0;
         s.startFreeRamB = 0;
         s.rssB = 0;
+        s.engineParts = null;
         s.rssFileB = 0;
         s.$do(own.dispose(slotId(stopping)));
       } catch (e) {
@@ -698,6 +706,7 @@ export const srv = cell("srv", {
             // let a single slow probe declare the next one ready-unproven.
             s.probeSlow = 0;
             s.rssB = 0;
+            s.engineParts = null;
             s.rssFileB = 0;
             try {
               const dead = s.pid;
@@ -726,6 +735,7 @@ export const srv = cell("srv", {
         s.healthy = false;
         s.proven = false;
         s.rssB = 0;
+        s.engineParts = null;
         s.rssFileB = 0;
         return;
       }
@@ -808,6 +818,15 @@ export const srv = cell("srv", {
       } else if (s.status === "ready") { // aiol-ok — see the note above
         // Was ready, now is not: the model is reloading or the server is wedged.
         s.status = "starting";
+      }
+      // An engine run itemises its own memory per card; the map draws that
+      // instead of a llama.cpp plan of a pack that has no header. Written
+      // only when it changed, so an idle run broadcasts nothing.
+      if (s.status === "ready" && strataRunOf(s.argv)) { // aiol-ok — see the note above
+        const parts = await io.engineParts(s.url);
+        if (JSON.stringify(parts) !== JSON.stringify(s.engineParts)) {
+          s.engineParts = parts;
+        }
       }
     },
 

@@ -529,6 +529,49 @@ Deno.test({
 });
 
 Deno.test({
+  name: "srv: the running server's own engine child is not an orphan",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // Basalt's server starts `bin/basalt` as its engine: a binary from the
+    // builds directory that is not the pid the app spawned. It was reported as
+    // "a llama-server from an earlier session" beside the run that owned it.
+    const bin = await installStub();
+    const parent = join(paths().builds, "test-build", "engine-parent");
+    await Deno.writeTextFile(parent, `#!/bin/sh\n"${bin}" "$@" &\nwait\n`);
+    await Deno.chmod(parent, 0o755);
+    const { pid } = io.start([parent, "--port", String(freePort())]);
+    let child = 0;
+    try {
+      await waitFor(async () => {
+        const kids = await Deno.readTextFile(
+          `/proc/${pid}/task/${pid}/children`,
+        ).catch(() => "");
+        child = Number(kids.trim().split(/\s+/)[0] ?? 0);
+        // The child's argv names the stub once it is running it.
+        const cmd = child
+          ? await Deno.readTextFile(`/proc/${child}/cmdline`).catch(() => "")
+          : "";
+        return cmd.includes(bin);
+      }, "the engine child to start");
+      const orphans = await io.findOrphans();
+      assertEquals(
+        orphans.some((o) => o.pid === child || o.pid === pid),
+        false,
+      );
+    } finally {
+      await io.stopOwned(pid);
+      // The shell's child outlives a SIGTERM to the shell.
+      try {
+        if (child) Deno.kill(child, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  },
+});
+
+Deno.test({
   name: "srv: a process outside the builds directory is never touched",
   sanitizeOps: false,
   sanitizeResources: false,
@@ -876,4 +919,30 @@ Deno.test({
     assertStringIncludes(srv.benchError, "too old");
     await srv.stop();
   },
+});
+
+Deno.test("download: a whole .part answered 416 is left for the checksum", async () => {
+  const { downloadToFile } = await import("../src/cell/host.server.ts");
+  const dir = await Deno.makeTempDir();
+  const part = join(dir, "pack.part");
+  await Deno.writeFile(part, new Uint8Array(10));
+  const ac = new AbortController();
+  // A Range past the end of a finished file: what a run stopped between the
+  // last byte and the rename asks for next time.
+  const http = Deno.serve(
+    { port: 0, hostname: "127.0.0.1", signal: ac.signal, onListen() {} },
+    () => new Response(null, { status: 416 }),
+  );
+  try {
+    await downloadToFile(
+      `http://127.0.0.1:${http.addr.port}/p`,
+      part,
+      () => {},
+    );
+    assertEquals((await Deno.stat(part)).size, 10);
+  } finally {
+    ac.abort();
+    await http.finished;
+    await Deno.remove(dir, { recursive: true });
+  }
 });

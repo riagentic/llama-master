@@ -10,6 +10,19 @@ import { assert, assertEquals } from "@std/assert";
 import { bootCells, testCell } from "aio/testing";
 import { join } from "@std/path";
 
+// A throwaway app home, set before anything calls `paths()`: a model scan also
+// reads the engines' pack folders under it, and the developer's real ones
+// would land in every listing below.
+const HOME = await Deno.makeTempDir({ prefix: "llama-master-cells-" });
+Deno.env.set("LLAMA_MASTER_HOME", HOME);
+globalThis.addEventListener("unload", () => {
+  try {
+    Deno.removeSync(HOME, { recursive: true });
+  } catch {
+    // Already gone.
+  }
+});
+
 import { cfg } from "../src/cell/cfg.ts";
 import { ui } from "../src/cell/ui.ts";
 import { hw } from "../src/cell/hw.ts";
@@ -229,6 +242,46 @@ Deno.test("models: the filter narrows the visible list", async () => {
     assert(models.totalSizeB() > 0);
   } finally {
     await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("models: a scan lists the engines' packs beside the GGUFs", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "llama-master-packs-" });
+  const basalt = join(HOME, "cache", "basalt", "packs");
+  const strata = join(HOME, "cache", "strata", "models", "inkling-2-mini");
+  using _boot = await bootCells([models]);
+  try {
+    await Deno.mkdir(basalt, { recursive: true });
+    await Deno.mkdir(strata, { recursive: true });
+    const bytes = new Uint8Array([1, 2, 3]);
+    await Deno.writeFile(
+      join(basalt, "Inkling-2-Mini-NVFP4-MX8.basalt"),
+      bytes,
+    );
+    await Deno.writeFile(
+      join(basalt, "Inkling-2-Mini-NVFP4-MX8.basalt.part"),
+      bytes,
+    );
+    await Deno.writeFile(join(strata, "Inkling-2-Mini-SQ-20.strata"), bytes);
+    // Basalt runs a pack from anywhere; Strata only the one its setup fetched.
+    await Deno.writeFile(join(dir, "Mine.basalt"), bytes);
+    await Deno.writeFile(join(dir, "Mine.strata"), bytes);
+    await Deno.writeFile(join(dir, "Mine.gguf"), bytes);
+    await models.addDir(dir);
+    await models.scan();
+    assertEquals(models.items.map((m) => m.file), [
+      "Inkling-2-Mini-NVFP4-MX8.basalt",
+      "Inkling-2-Mini-SQ-20.strata",
+      "Mine.basalt",
+      "Mine.gguf",
+    ]);
+    for (const m of models.items.filter((m) => !m.file.endsWith(".gguf"))) {
+      assertEquals([m.meta, m.metaError], [null, null], "a pack has no header");
+    }
+    assert(models.items.find((m) => m.file === "Mine.gguf")!.metaError);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+    await Deno.remove(join(HOME, "cache"), { recursive: true });
   }
 });
 

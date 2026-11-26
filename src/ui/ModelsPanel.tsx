@@ -1,6 +1,7 @@
 // src/ui/ModelsPanel.tsx — the model library.
 //
-// One button finds every GGUF on the machine; the table shows what each one
+// One button finds every model on the machine — every GGUF, and the packs
+// Basalt and Strata run (`src/lib/packs.ts`); the table shows what each one
 // actually is (architecture, quantisation, layers, trained context, MoE width)
 // because those are the facts that decide whether it will run here — the file
 // name is only a rumour about them.
@@ -9,6 +10,7 @@ import { models } from "../cell/models.ts";
 import { QuantAdvice } from "./QuantAdvice.tsx";
 import { cfg } from "../cell/cfg.ts";
 import { plan as computePlan } from "../lib/plan.ts";
+import { packInfo } from "../lib/packs.ts";
 import { bytes, shortPath, stamp } from "../lib/format.ts";
 import { LOCK_REASON, runLocked, runModel, selectModel } from "./actions.ts";
 import { Bar, Empty, ErrorNote, KV, Panel, Pill } from "./kit.tsx";
@@ -78,15 +80,39 @@ function Details() {
     );
   }
   const meta = m.meta;
+  const pack = packInfo(m.file);
   return (
     <Panel
       title="Model"
       icon="◈"
       right={meta
         ? <Pill tone="accent">{meta.quant}</Pill>
+        : pack
+        ? <Pill tone="accent">{pack.quant}</Pill>
         : <Pill tone="bad">unreadable</Pill>}
     >
       <div class="model-name" title={m.path}>{m.file}</div>
+      {pack
+        ? (
+          <>
+            <div class="kv-grid">
+              <KV k="Model" v={pack.title} />
+              <KV k="Format" v={`${pack.engine} pack`} />
+              <KV k="Runs on" v={`the ${pack.engine} build`} />
+              <KV
+                k="Max context"
+                v={pack.maxContext ? pack.maxContext.toLocaleString() : "—"}
+              />
+              <KV k="File" v={bytes(m.sizeB)} mono />
+            </div>
+            <div class="dim">
+              Not a GGUF: only {pack.engine}{" "}
+              reads it, and it places the model on the card itself — so there is
+              no header to show and no memory plan to draw here.
+            </div>
+          </>
+        )
+        : null}
       {m.metaError
         ? <ErrorNote message={`Header could not be read: ${m.metaError}`} />
         : null}
@@ -211,64 +237,73 @@ export function ModelsPanel() {
                   </tr>
                 </thead>
                 <tbody>
-                  {list.map((m) => (
-                    <tr
-                      key={m.path}
-                      class={m.path === models.selected ? "row-active" : ""}
-                      title={locked ? LOCK_REASON : undefined}
-                      onClick={() => {
-                        if (!locked) selectModel(m.path);
-                      }}
-                    >
-                      <td class="c-icon">
-                        <input
-                          type="radio"
-                          aria-label={`Select ${m.file}`}
-                          checked={m.path === models.selected}
-                          disabled={locked}
-                          onChange={() => selectModel(m.path)}
-                        />
-                      </td>
-                      <td class="c-file" title={m.path}>{m.file}</td>
-                      <td>
-                        <Pill
-                          tone={m.source === "file" ? "idle" : "accent"}
-                          title={m.dir}
-                        >
-                          {m.source === "file" ? "disk" : m.source}
-                        </Pill>
-                      </td>
-                      <td>{m.meta?.arch ?? "—"}</td>
-                      <td>
-                        {m.meta
-                          ? <Pill tone="accent">{m.meta.quant}</Pill>
-                          : <Pill tone="bad">?</Pill>}
-                      </td>
-                      <td class="mono">{m.meta?.nLayer ?? "—"}</td>
-                      <td class="mono">
-                        {m.meta?.nCtxTrain?.toLocaleString() ?? "—"}
-                      </td>
-                      <td class="mono">{bytes(m.sizeB)}</td>
-                      <td class="dim">{stamp(m.mtime)}</td>
-                      <td class="c-act">
-                        <button
-                          type="button"
-                          class="btn tiny primary"
-                          t={`run-${m.file}`}
-                          disabled={locked}
-                          title={locked
-                            ? LOCK_REASON
-                            : "Select, tune for this machine, and start the server"}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void runModel(m.path);
-                          }}
-                        >
-                          Run
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {list.map((m) => {
+                    const pk = packInfo(m.file);
+                    return (
+                      <tr
+                        key={m.path}
+                        class={m.path === models.selected ? "row-active" : ""}
+                        title={locked ? LOCK_REASON : undefined}
+                        onClick={() => {
+                          if (!locked) selectModel(m.path);
+                        }}
+                      >
+                        <td class="c-icon">
+                          <input
+                            type="radio"
+                            aria-label={`Select ${m.file}`}
+                            checked={m.path === models.selected}
+                            disabled={locked}
+                            onChange={() => selectModel(m.path)}
+                          />
+                        </td>
+                        <td class="c-file" title={m.path}>{m.file}</td>
+                        <td>
+                          <Pill
+                            tone={m.source === "file" && !pk
+                              ? "idle"
+                              : "accent"}
+                            title={m.dir}
+                          >
+                            {pk?.engine ??
+                              (m.source === "file" ? "disk" : m.source)}
+                          </Pill>
+                        </td>
+                        <td>{m.meta?.arch ?? (pk ? "pack" : "—")}</td>
+                        <td>
+                          {m.meta
+                            ? <Pill tone="accent">{m.meta.quant}</Pill>
+                            : pk
+                            ? <Pill tone="accent">{pk.quant}</Pill>
+                            : <Pill tone="bad">?</Pill>}
+                        </td>
+                        <td class="mono">{m.meta?.nLayer ?? "—"}</td>
+                        <td class="mono">
+                          {(m.meta?.nCtxTrain ?? pk?.maxContext)
+                            ?.toLocaleString() ?? "—"}
+                        </td>
+                        <td class="mono">{bytes(m.sizeB)}</td>
+                        <td class="dim">{stamp(m.mtime)}</td>
+                        <td class="c-act">
+                          <button
+                            type="button"
+                            class="btn tiny primary"
+                            t={`run-${m.file}`}
+                            disabled={locked}
+                            title={locked
+                              ? LOCK_REASON
+                              : "Select, tune for this machine, and start the server"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void runModel(m.path);
+                            }}
+                          >
+                            Run
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}

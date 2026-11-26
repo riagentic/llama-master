@@ -249,6 +249,8 @@ export function startBlocker(
       st.ramB,
       hw.mem?.availableB ?? 0,
       st.running ? srv.rssB - srv.rssFileB : 0,
+      st.ramFloorB,
+      st.name,
     );
     if (short) return short;
   }
@@ -467,9 +469,7 @@ function launch(
   if (strata) {
     return srv.start(strata, serverUrl(settings), {
       model: t.path,
-      settings: strataSettings(
-        t.pin ? { ...settings, ctxSize: t.pin } : settings,
-      ),
+      settings: strataSettings(settings, strata),
       env: shownEnv(),
       freeAtStart: freeNowB(),
       lowPriority: cfg.lowPriority,
