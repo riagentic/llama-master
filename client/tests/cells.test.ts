@@ -486,3 +486,60 @@ Deno.test("conn: a server with an API key says so, and connects and chats once g
     await stub.close();
   }
 });
+
+/** A chat server that refuses its first request and answers the rest,
+ *  keeping every request body. */
+function flakyChat() {
+  const bodies: { role: string; content: string }[][] = [];
+  const ac = new AbortController();
+  const l = Deno.listen({ port: 0 });
+  const port = (l.addr as Deno.NetAddr).port;
+  l.close();
+  const server = Deno.serve(
+    { port, hostname: "127.0.0.1", signal: ac.signal, onListen: () => {} },
+    async (req) => {
+      bodies.push((await req.json()).messages);
+      if (bodies.length === 1) {
+        return new Response("model crashed", { status: 500 });
+      }
+      const sse = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
+      return new Response(
+        sse({ choices: [{ delta: { content: "fine" } }] }) + "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  );
+  return {
+    url: `http://127.0.0.1:${port}`,
+    bodies,
+    close: async () => {
+      ac.abort();
+      await server.finished;
+    },
+  };
+}
+
+Deno.test("chat: an unanswered question is never sent as a second user turn in a row", async () => {
+  const srv = flakyChat();
+  using _boot = await bootCells([chat]);
+  try {
+    await chat.clear();
+    await chat.send(srv.url, "first");
+    assert(chat.lastError.length > 0);
+    // Still on screen for the reader…
+    assertEquals(chat.messages.map((m) => m.role), ["user"]);
+    await chat.send(srv.url, "second");
+    // …but the model is shown a conversation that alternates.
+    const roles = srv.bodies[1]?.map((m) => m.role) ?? [];
+    assertEquals(roles.filter((r) => r !== "system"), ["user"]);
+    assertEquals(srv.bodies[1]?.at(-1)?.content, "second");
+    assertEquals(chat.messages.at(-1)?.content, "fine");
+    await chat.send(srv.url, "third");
+    assertEquals(
+      srv.bodies[2]?.map((m) => m.role).filter((r) => r !== "system"),
+      ["user", "assistant", "user"],
+    );
+  } finally {
+    await srv.close();
+  }
+});

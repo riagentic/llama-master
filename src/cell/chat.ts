@@ -224,6 +224,20 @@ async function drain(
   }
 }
 
+/**
+ * The conversation as the model is shown it: every user message that never
+ * got an answer left out. A failed request, or a Stop before the first token,
+ * leaves the question on screen with nothing under it — which is right for the
+ * person reading — but sent as is, the next message made two user turns in a
+ * row, and strict-alternation templates (Gemma, Mistral) answer that with a
+ * 500 for this message and every one after it.
+ */
+export function answered(messages: readonly ChatMessage[]): ChatMessage[] {
+  return messages.filter((m, i) =>
+    m.role !== "user" || messages[i + 1]?.role === "assistant"
+  );
+}
+
 /** One question and one answer. Returns how it ended, which is the only thing
  *  the drain needs to know. */
 async function turn(
@@ -246,7 +260,10 @@ async function turn(
       ...(s.system.trim()
         ? [{ role: "system" as const, content: s.system.trim() }]
         : []),
-      ...s.messages.map((m) => ({ role: m.role, content: m.content })),
+      ...answered(s.messages).map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
       { role: "user" as const, content: text },
     ];
 
