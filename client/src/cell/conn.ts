@@ -57,6 +57,9 @@ export type ConnState = {
   scanning: boolean;
   progress: { done: number; total: number } | null;
   lastError: string;
+  /** Whether an API key is set. The key itself lives only in
+   *  conn.server.ts — never in state, which the page and checkpoints see. */
+  hasKey: boolean;
 };
 
 export const conn = cell("conn", {
@@ -80,6 +83,7 @@ export const conn = cell("conn", {
     scanning: false,
     progress: null as { done: number; total: number } | null,
     lastError: "",
+    hasKey: false,
   } as ConnState,
   // No `cancelOn` for `discover`: a second one while a sweep runs is refused
   // by the `scanning` guard (and the button is disabled), and the sweep reads
@@ -101,6 +105,15 @@ export const conn = cell("conn", {
     setPort(s, port: number) {
       const n = typeof port === "number" ? port : Number(port);
       if (Number.isInteger(n) && n >= 1 && n <= 65535) s.port = n;
+      s.lastError = "";
+    },
+
+    /** The server's API key (`--api-key`), sent as a bearer token on every
+     *  request. Its action is redacted from the logs (app.ts). */
+    async setApiKey(s, key: string) {
+      const io = await import("./conn.server.ts");
+      io.useKey(typeof key === "string" ? key : "");
+      s.hasKey = io.auth().authorization !== undefined;
       s.lastError = "";
     },
 
@@ -129,8 +142,18 @@ export const conn = cell("conn", {
       // connect (or a forget) that moved it while this probe was in the air
       // owns the state now, and a slow answer from the old address must not
       // be written under the new one.
-      const props = await io.probe(target, 2500);
+      const { props, locked } = await io.probeFor(target, 2500);
       if (s.url !== target) return; // aiol-ok: superseded — see above
+      if (!props && locked) {
+        s.status = "unreachable";
+        s.info = null;
+        s.ready = false;
+        // aiol-ok: the write below is the result of the probe above
+        s.lastError = s.hasKey
+          ? `The server at ${target} refused the API key. Check it against the one it was started with (--api-key).`
+          : `The server at ${target} needs an API key (it was started with --api-key). Enter it in the key box and connect again.`;
+        return;
+      }
       if (!props) {
         s.status = "unreachable";
         s.info = null;

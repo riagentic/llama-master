@@ -177,8 +177,26 @@ const sse = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`;
 
 // `async`: the completion branch reads `n_predict` off the body so a bench
 // gets back the number of tokens it asked for, the way llama.cpp does.
+// `--api-key`, the way llama-server enforces it: every endpoint but the public
+// ones answers 401 without `authorization: Bearer <key>`.
+const apiKey = flag("--api-key", "");
+const PUBLIC = new Set(["/health", "/v1/health", "/models", "/v1/models"]);
+
 Deno.serve({ port, hostname: "127.0.0.1", onListen: () => {} }, async (req) => {
   const url = new URL(req.url);
+
+  if (
+    apiKey && !PUBLIC.has(url.pathname) &&
+    req.headers.get("authorization") !== `Bearer ${apiKey}`
+  ) {
+    return Response.json({
+      error: {
+        code: 401,
+        message: "Invalid API Key",
+        type: "authentication_error",
+      },
+    }, { status: 401 });
+  }
 
   if (url.pathname === "/health") {
     return ready()

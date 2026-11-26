@@ -28,6 +28,9 @@ export type StubOptions = {
   /** Hold these paths' answers back (ms), so a test can move the client on
    *  while an old request is still in the air. */
   lag?: Record<string, number>;
+  /** Require this bearer token on everything but `/health` and `/models`,
+   *  the way llama-server does when started with `--api-key`. */
+  apiKey?: string;
 };
 
 export type Stub = {
@@ -61,6 +64,13 @@ export function stubServer(opts: StubOptions = {}): Stub {
     async (req) => {
       const path = new URL(req.url).pathname;
       hits.push(path);
+      if (
+        opts.apiKey && !["/health", "/v1/health", "/models", "/v1/models"]
+          .includes(path) &&
+        req.headers.get("authorization") !== `Bearer ${opts.apiKey}`
+      ) {
+        return Response.json({ error: { code: 401 } }, { status: 401 });
+      }
       const lag = opts.lag?.[path];
       if (lag) await new Promise((r) => setTimeout(r, lag));
       if (path === "/props") {

@@ -158,7 +158,7 @@ export function Waiting() {
  * So `onCommit` returns its dispatch, and `onEnter` waits on it.
  */
 export function DraftInput(props: {
-  type: "text" | "number";
+  type: "text" | "number" | "password";
   value: string;
   onCommit: (value: string) => unknown;
   onEnter?: () => void;

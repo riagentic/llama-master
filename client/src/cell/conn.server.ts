@@ -30,6 +30,56 @@ function cidrBits(cidr: string): number {
   return Number.isInteger(n) ? n : 24;
 }
 
+/** The API key the user gave for the server, held here and only here: in a
+ *  cell's state it would be replicated to the page and written into
+ *  checkpoints. A llama-server started with `--api-key` answers 401 to
+ *  everything but `/health` and `/models` without it. Not persisted. */
+let KEY = "";
+
+/** Use `key` (or none, when empty) on every request from now on. */
+export function useKey(key: string): void {
+  KEY = typeof key === "string" ? key.trim() : "";
+}
+
+/** The `authorization` header for every request, or none. */
+export function auth(): Record<string, string> {
+  return KEY ? { authorization: `Bearer ${KEY}` } : {};
+}
+
+/** `probe`, with the reason it found nothing: `locked` is a server that
+ *  wants an API key this client does not have (or has wrong). */
+export async function probeFor(
+  base: string,
+  timeoutMs = 700,
+): Promise<{ props: Record<string, unknown> | null; locked: boolean }> {
+  try {
+    const res = await fetch(`${base}/props`, {
+      headers: auth(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 401 || res.status === 403) {
+      await res.body?.cancel();
+      return { props: null, locked: true };
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      return { props: null, locked: false };
+    }
+    const body = await res.json();
+    // A llama-server always reports one of these. Without them it is something
+    // else that happens to serve JSON at /props.
+    const ok = body && typeof body === "object" &&
+      ("model_path" in body || "default_generation_settings" in body ||
+        "total_slots" in body);
+    return {
+      props: ok ? body as Record<string, unknown> : null,
+      locked: false,
+    };
+  } catch {
+    return { props: null, locked: false };
+  }
+}
+
 /** One probe: is there a llama-server at this base URL?
  *
  *  `/props` rather than `/health`, because `/props` is the answer that
@@ -39,24 +89,7 @@ export async function probe(
   base: string,
   timeoutMs = 700,
 ): Promise<Record<string, unknown> | null> {
-  try {
-    const res = await fetch(`${base}/props`, {
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      await res.body?.cancel();
-      return null;
-    }
-    const body = await res.json();
-    // A llama-server always reports one of these. Without them it is something
-    // else that happens to serve JSON at /props.
-    const ok = body && typeof body === "object" &&
-      ("model_path" in body || "default_generation_settings" in body ||
-        "total_slots" in body);
-    return ok ? body as Record<string, unknown> : null;
-  } catch {
-    return null;
-  }
+  return (await probeFor(base, timeoutMs)).props;
 }
 
 /** GET a text endpoint (`/metrics`), or null when it is not enabled. */
@@ -67,6 +100,7 @@ export async function text(
 ): Promise<string | null> {
   try {
     const res = await fetch(`${base}${path}`, {
+      headers: auth(),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
@@ -87,6 +121,7 @@ export async function json(
 ): Promise<unknown> {
   try {
     const res = await fetch(`${base}${path}`, {
+      headers: auth(),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {

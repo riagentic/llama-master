@@ -8344,3 +8344,16 @@ Deno.test("ollama: a model pulled from hf.co keeps its registry in the name", ()
     "someone/model:latest",
   );
 });
+
+Deno.test("auth: the key is read off the argv the server runs with", async () => {
+  const { apiKeyOf, authHeaders } = await import("../src/lib/auth.ts");
+  assertEquals(apiKeyOf(["llama-server", "--api-key", "k1", "-c", "8"]), "k1");
+  assertEquals(apiKeyOf(["llama-server", "--api-key=k2"]), "k2");
+  assertEquals(
+    apiKeyOf(["llama-server"], [{ name: "LLAMA_API_KEY", value: "k3" }]),
+    "k3",
+  );
+  assertEquals(apiKeyOf(["llama-server"]), "");
+  assertEquals(authHeaders(""), {});
+  assertEquals(authHeaders("a,b"), { authorization: "Bearer a" });
+});

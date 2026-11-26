@@ -460,3 +460,29 @@ Deno.test("cells: no method parameter is optional by `?` alone", async () => {
   }
   assertEquals(offenders, []);
 });
+
+Deno.test("conn: a server with an API key says so, and connects and chats once given it", async () => {
+  const stub = stubServer({ apiKey: "sekret" });
+  using _boot = await bootCells([conn, chat]);
+  try {
+    await conn.setApiKey("");
+    await conn.setHost(stub.url);
+    await conn.connect();
+    assertEquals(conn.status, "unreachable");
+    assertStringIncludes(conn.lastError, "needs an API key");
+    await conn.setApiKey("wrong");
+    await conn.connect();
+    assertStringIncludes(conn.lastError, "refused the API key");
+    await conn.setApiKey("sekret");
+    assertEquals(conn.hasKey, true);
+    await conn.connect();
+    assertEquals(conn.status, "connected");
+    assertEquals(conn.info?.model, "stub-7B-Q4_K_M.gguf");
+    await chat.send(stub.url, "hi");
+    assertEquals(chat.lastError, "");
+    assertEquals(chat.messages.at(-1)?.role, "assistant");
+  } finally {
+    await conn.setApiKey("");
+    await stub.close();
+  }
+});

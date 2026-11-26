@@ -17,6 +17,9 @@ await aio.run({
   // Boot fails loudly if a cell was defined but not listed — a cell that is
   // imported and unregistered dispatches into the void.
   strictCells: true,
+  // The API key is typed into an action; it must not be kept in the action
+  // log, the timeline or a checkpoint.
+  redactActions: ["conn:setApiKey"],
   perfBudget: {
     reduce: 100,
     methods: {

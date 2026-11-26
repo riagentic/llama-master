@@ -263,9 +263,11 @@ async function turn(
     let outcome: SendOutcome = "error";
 
     try {
+      // The server's API key, if the user gave one (conn.server.ts).
+      const { auth } = await import("./conn.server.ts");
       const res = await fetch(`${url}/v1/chat/completions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...auth() },
         body: JSON.stringify({
           messages: history,
           stream: true,

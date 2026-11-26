@@ -10,6 +10,7 @@
 // One server at a time, by design: two llama-servers on one GPU is a
 // configuration mistake, not a feature.
 
+import { apiKeyOf, authHeaders } from "../lib/auth.ts";
 import { resolve, SEPARATOR as SEP } from "@std/path";
 import type { Exec } from "./host.server.ts";
 import { exec, paths, PLATFORM } from "./host.server.ts";
@@ -38,6 +39,8 @@ type Slot = {
   pid: number;
   startedAt: number;
   argv: string[];
+  /** The `--api-key` it was started with: see `auth`. */
+  key: string;
 };
 
 /** The env prefix for the log's `$` line, or "". */
@@ -371,7 +374,13 @@ export function start(
     throw new Error("start cancelled by stop");
   }
 
-  const s: Slot = { child, pid: child.pid, startedAt: Date.now(), argv };
+  const s: Slot = {
+    child,
+    pid: child.pid,
+    startedAt: Date.now(),
+    argv,
+    key: apiKeyOf(argv, env),
+  };
   slot = s;
 
   // The pumps must FINISH before the exit becomes visible. `child.status`
@@ -459,6 +468,14 @@ export async function stop(graceMs = 5000): Promise<void> {
   if (slot === s) slot = null;
 }
 
+/** The `authorization` header every request to the running server carries.
+ *  With an API key set, llama-server refuses everything but `/health` and
+ *  `/models` without it — the app's own probe, bench, `/props` and chat
+ *  included. Empty when no key is set, or nothing is running. */
+export function auth(): Record<string, string> {
+  return authHeaders(slot?.key ?? "");
+}
+
 /** Ask the running server whether it is ready to serve. */
 export async function health(
   baseUrl: string,
@@ -466,6 +483,7 @@ export async function health(
 ): Promise<{ ok: boolean; detail: string }> {
   try {
     const res = await fetch(`${baseUrl}/health`, {
+      headers: auth(),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (res.ok) {
@@ -522,7 +540,7 @@ export async function probe(
     const post = (path: string, json: Record<string, unknown>) =>
       fetch(`${baseUrl}${path}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...auth() },
         body: JSON.stringify(json),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -584,7 +602,7 @@ export async function bench(
     const post = (path: string, json: Record<string, unknown>) =>
       fetch(`${baseUrl}${path}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...auth() },
         body: JSON.stringify(json),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -636,6 +654,7 @@ export async function props(
 ): Promise<Record<string, unknown> | null> {
   try {
     const res = await fetch(`${baseUrl}/props`, {
+      headers: auth(),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {

@@ -270,9 +270,12 @@ async function turn(
     let outcome: SendOutcome = "error";
 
     try {
+      // The running server's API key, if it was started with one: without it
+      // every message is a 401 (srv.server.ts `auth`).
+      const { auth } = await import("./srv.server.ts");
       const res = await fetch(`${url}/v1/chat/completions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...auth() },
         body: JSON.stringify({
           messages: history,
           stream: true,

@@ -946,3 +946,48 @@ Deno.test("download: a whole .part answered 416 is left for the checksum", async
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test({
+  name:
+    "srv: with an API key set, the app's own probe, /props and chat carry it",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const bin = await installStub();
+    const port = freePort();
+    const url = `http://127.0.0.1:${port}`;
+    using _boot = await bootCells([srv, chat]);
+    await srv.start(
+      [
+        bin,
+        "-m",
+        "/models/fixture.gguf",
+        "--port",
+        String(port),
+        "--api-key",
+        "sekret",
+      ],
+      url,
+    );
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.status === "ready";
+    }, "the keyed server to report ready");
+    // Proven by a real generation, not waved through as `refused` by a 401.
+    assertEquals(srv.proven, true);
+    assertEquals(
+      srv.props?.n_ctx !== undefined,
+      true,
+      JSON.stringify(srv.props),
+    );
+    await chat.send(url, "hi");
+    assertEquals(chat.lastError, "");
+    assertEquals(chat.messages[1]?.content, "Hello from the stub");
+    // And the stub really does refuse a request without it.
+    const bare = await fetch(`${url}/props`);
+    await bare.body?.cancel();
+    assertEquals(bare.status, 401);
+    await srv.stop();
+    await srv.poll();
+  },
+});

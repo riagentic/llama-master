@@ -86,6 +86,18 @@ function ConnectBar() {
         onCommit={(v) => v.trim() ? conn.setPort(Number(v)) : undefined}
         onEnter={() => void conn.connect()}
       />
+      <DraftInput
+        type="password"
+        class="key"
+        t="api-key"
+        ariaLabel="API key"
+        placeholder={conn.hasKey
+          ? "API key set — type to replace"
+          : "API key, if the server has one"}
+        value=""
+        onCommit={(v) => void conn.setApiKey(v)}
+        onEnter={() => void conn.connect()}
+      />
       <button
         type="button"
         class="btn primary"
