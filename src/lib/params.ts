@@ -985,7 +985,7 @@ export const PARAMS: readonly Param[] = [
     advanced: true,
     unit: "e.g. --lora adapter.gguf",
     tip:
-      "Anything else to append to the command, exactly as typed. For llama.cpp flags this app has no control for. It appears in the command preview above, so what you see is still what runs.",
+      'Anything else to append to the command, read the way a shell would: quote a value with spaces (\'{"a": 1}\' or "C:\\My Models\\a.gguf"). For llama.cpp flags this app has no control for. It appears in the command preview above, so what you see is still what runs.',
   },
 ] as const;
 

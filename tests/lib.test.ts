@@ -34,7 +34,12 @@ import {
   quote,
   serverUrl,
 } from "../src/lib/command.ts";
-import { envPrefix, envRecord, parseEnvVars } from "../src/lib/envvars.ts";
+import {
+  envPrefix,
+  envRecord,
+  parseEnvVars,
+  splitArgs,
+} from "../src/lib/envvars.ts";
 import {
   coerce,
   defaults,
@@ -8373,4 +8378,54 @@ Deno.test("stability: a concrete LAN address or hostname with no key is as open 
     const st = stability(meta(), hw(), { ...defaults(), host, apiKey: "" });
     assertEquals(st.warnings.some((w) => w.key === "host"), false, host);
   }
+});
+
+Deno.test("command: extra arguments are read the way a shell would — quotes honoured and stripped", () => {
+  const extraArgs =
+    `--chat-template-kwargs '{"enable_thinking": false}' --lora "/home/u/My Models/a.gguf" --alias C:\\Models\\a.gguf`;
+  const want = [
+    "--chat-template-kwargs",
+    '{"enable_thinking": false}',
+    "--lora",
+    "/home/u/My Models/a.gguf",
+    "--alias",
+    "C:\\Models\\a.gguf",
+  ];
+  const cmd = argv("server", {
+    bin: "llama-server",
+    model: "/m.gguf",
+    settings: { ...defaults(), extraArgs },
+  });
+  assertEquals(cmd.slice(-want.length), want);
+  // What the preview shows is what runs: its quoting reads back to the argv.
+  const line = commandLine("server", {
+    bin: "llama-server",
+    model: "/m.gguf",
+    settings: { ...defaults(), extraArgs },
+  });
+  assertEquals(splitArgs(line).args.slice(-want.length), want);
+  assertEquals(splitArgs(want.map(quote).join(" ")).args, want);
+});
+
+Deno.test("command: an unclosed quote in extra arguments passes nothing and is named", () => {
+  const extraArgs = `--lora "/home/u/My Models/a.gguf`;
+  assertEquals(splitArgs(extraArgs), {
+    args: [],
+    unclosed: `"/home/u/My Models/a.gguf`,
+  });
+  const cmd = argv("server", {
+    bin: "llama-server",
+    model: "/m.gguf",
+    settings: { ...defaults(), extraArgs },
+  });
+  assertEquals(cmd.includes("--lora"), false);
+  const st = stability(meta(), hw(), { ...defaults(), extraArgs });
+  assert(
+    st.warnings.some((w) => w.key === "extraArgs" && w.severity === "risk"),
+  );
+  const ok = stability(meta(), hw(), {
+    ...defaults(),
+    extraArgs: "--foo 'a b'",
+  });
+  assertEquals(ok.warnings.some((w) => w.key === "extraArgs"), false);
 });

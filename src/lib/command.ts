@@ -11,7 +11,7 @@
 import { PARAMS } from "./params.ts";
 import type { Param, Settings } from "./types.ts";
 import type { EnvVar } from "./envvars.ts";
-import { envPrefix } from "./envvars.ts";
+import { envPrefix, splitArgs } from "./envvars.ts";
 
 export type Target = "server" | "cli";
 
@@ -42,8 +42,10 @@ function emit(p: Param, value: unknown): string[] {
   // An empty text/enum means "not set" — never emit a bare flag with no value.
   if (s === "") return [];
   // A catalog entry with no flag of its own IS its value: the extra-arguments
-  // escape hatch, split on whitespace so it reads as ordinary argv.
-  if (p.flag === "") return s.trim().split(/\s+/).filter(Boolean);
+  // escape hatch, split the way a shell would (quotes honoured and stripped)
+  // so it reads as ordinary argv and the preview's quoting round-trips. An
+  // unclosed quote emits nothing; stability names it.
+  if (p.flag === "") return splitArgs(s).args;
   return [p.flag, s];
 }
 

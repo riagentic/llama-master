@@ -12,6 +12,7 @@ import { effectiveCtx, plan } from "./plan.ts";
 import { bool, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
 import { isLanExposed } from "./lan.ts";
+import { splitArgs } from "./envvars.ts";
 
 export type Severity = "risk" | "caution";
 
@@ -257,6 +258,16 @@ export function stability(
       key: "backendSampling",
       message:
         "Sample on the GPU is on together with forced reasoning. A reasoning budget builds a sampler that llama.cpp cannot run on the backend, so it logs a warning and falls back to CPU sampling for those requests.",
+    });
+  }
+
+  const unclosed = splitArgs(String(s.extraArgs ?? "")).unclosed;
+  if (unclosed !== null) {
+    warnings.push({
+      severity: "risk",
+      key: "extraArgs",
+      message:
+        `Extra arguments has a quote that is never closed (${unclosed}), so none of them are passed. Close the quote, or remove it.`,
     });
   }
 

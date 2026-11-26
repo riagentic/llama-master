@@ -22,7 +22,13 @@ export type EnvVar = { name: string; value: string };
 
 /** One token: its value with the quotes taken out, and as it was typed — which
  *  is what a refusal has to show, because that is what the user can find. */
-type Token = { value: string; raw: string; broken: boolean };
+type Token = {
+  value: string;
+  raw: string;
+  broken: boolean;
+  /** The quote this token opened was never closed. */
+  unclosed: boolean;
+};
 
 /**
  * Tokenize the way a shell would: whitespace separates, except inside quotes.
@@ -49,7 +55,7 @@ function tokenize(text: string): Token[] {
   let started = false;
   let broken = false;
   const end = () => {
-    if (started) tokens.push({ value: cur, raw, broken });
+    if (started) tokens.push({ value: cur, raw, broken, unclosed: !!quote });
     cur = "";
     raw = "";
     started = false;
@@ -83,6 +89,31 @@ function tokenize(text: string): Token[] {
   if (quote) broken = true;
   end();
   return tokens;
+}
+
+/**
+ * Split the "Extra arguments" line into argv the way a shell would.
+ *
+ * Splitting on whitespace alone kept the quotes as bytes and cut quoted
+ * values apart: `--chat-template-kwargs '{"enable_thinking": false}'` reached
+ * llama-server as two broken words with literal quotes, and a path with a
+ * space was a file not found. Same scanner as the env box, with one
+ * difference: a backslash outside quotes is kept as a byte rather than
+ * refused, because this line routinely carries a Windows path
+ * (`C:\Models\a.gguf`) and the old split passed those through untouched.
+ *
+ * An unclosed quote is the one thing refused: `unclosed` carries the token as
+ * typed and `args` is empty — "the rest of the line" silently becoming one
+ * argument is a command nobody typed.
+ */
+export function splitArgs(text: string): {
+  args: string[];
+  unclosed: string | null;
+} {
+  const tokens = tokenize(text);
+  const open = tokens.find((t) => t.unclosed);
+  if (open) return { args: [], unclosed: open.raw };
+  return { args: tokens.map((t) => t.value), unclosed: null };
 }
 
 /**
