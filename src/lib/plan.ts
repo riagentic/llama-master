@@ -349,8 +349,48 @@ type LayerKv =
   /** A recurrent layer's constant state, or a layer sharing another's cache. */
   | { kind: "state"; heads: 0; kLen: 0; vLen: 0 };
 
-/** Each layer's cache SHAPE — llama.cpp's `n_head_kv(il)` × `n_embd_head_k(il)`,
- *  `is_swa(il)`, `is_recurrent(il)` and `n_layer_kv_from_start`, per layer. */
+/** The looped core, or `null` — clamped the way llama.cpp validates it. */
+function loopOf(
+  meta: ModelMeta,
+): { start: number; end: number; count: number } | null {
+  const n = whole(meta.nLayer);
+  const start = whole(meta.loopStart ?? 0);
+  const end = whole(meta.loopEnd ?? 0);
+  const count = whole(meta.loopCount ?? 0);
+  return start < end && end <= n && count >= 2 ? { start, end, count } : null;
+}
+
+/**
+ * llama.cpp's `n_layer()` — the CACHE SLOTS, which is what `-ngl` and `-ts`
+ * count. Equal to `nLayer` except on a looped model: Inkling-2 runs layers
+ * 6..17 three times on shared weights, and `inkling2-loop.cpp` expands its 24
+ * layers to 24 + 2 × 12 = 48 slots at load, each with its own KV and conv
+ * state. Billing 24 put half the cache nowhere, and `-ngl 25` would have
+ * offloaded only the copies — none of the weights.
+ */
+export function cacheSlots(meta: ModelMeta): number {
+  const n = whole(meta.nLayer);
+  const l = loopOf(meta);
+  return l ? n + (l.count - 1) * (l.end - l.start) : n;
+}
+
+/** The physical layer behind cache slot `i` (`layer_phys`, verbatim). */
+export function physLayer(meta: ModelMeta, i: number): number {
+  const n = whole(meta.nLayer);
+  const l = loopOf(meta);
+  return !l || i < n ? i : l.start + (i - n) % (l.end - l.start);
+}
+
+/** How many times per token layer `i`'s weights are read. */
+export function layerPasses(meta: ModelMeta, i: number): number {
+  const l = loopOf(meta);
+  return l && i >= l.start && i < l.end ? l.count : 1;
+}
+
+/** Each slot's cache SHAPE — llama.cpp's `n_head_kv(il)` × `n_embd_head_k(il)`,
+ *  `is_swa(il)`, `is_recurrent(il)` and `n_layer_kv_from_start`, per slot. A
+ *  loop slot has its physical layer's shape (`cacheSlots`). Inkling's per-slot
+ *  conv state (~0.1 MB) is under the rounding of every figure and unbilled. */
 export function layerKv(meta: ModelMeta): LayerKv[] {
   const nLayer = whole(meta.nLayer);
   const headDim = meta.nHead > 0 ? whole(meta.nEmbd) / meta.nHead : 0;
@@ -367,7 +407,8 @@ export function layerKv(meta: ModelMeta): LayerKv[] {
   const trunk = nLayer - nextn;
   const sharedFrom = nLayer - Math.min(whole(meta.sharedKvLayers ?? 0), nLayer);
   const STATE = { kind: "state", heads: 0, kLen: 0, vLen: 0 } as const;
-  return Array.from({ length: nLayer }, (_, i): LayerKv => {
+  return Array.from({ length: cacheSlots(meta) }, (_, slot): LayerKv => {
+    const i = physLayer(meta, slot);
     // Hybrid: trunk layer i is full attention iff (i + 1) % interval == 0;
     // the MTP block(s) at the end hold a cache; the rest are recurrent.
     if (interval >= 2 && i < trunk && (i + 1) % interval !== 0) return STATE;
@@ -643,14 +684,16 @@ export function plan(
   const reserveShares = vramReserveShares(hw.gpus, reserve);
   const reservedVramB = reserveShares.reduce((a, b) => a + b, 0);
   const nLayer = meta.nLayer;
-  const off = offloadRange(nLayer, s);
+  // `-ngl` counts cache slots, and the output head is the slot after the last.
+  const nSlot = cacheSlots(meta);
+  const off = offloadRange(nSlot, s);
   const moeOnCpu = Math.max(0, Math.min(num(s, "nCpuMoe"), nLayer));
   const ctx = effectiveCtx(meta, s);
   const kvPerTokenB = kvPerToken(meta, s);
   const kvLayerB = kvByLayer(meta, s, ctx);
   const kvTotalB = sum(kvLayerB);
   const kvOnCpu = bool(s, "noKvOffload");
-  const outputOnGpu = slotOnGpu(nLayer, off);
+  const outputOnGpu = slotOnGpu(nSlot, off);
 
   // Per-slot GPU bytes, in slot order — the shape `devsplit` needs to cut into
   // per-card ranges, and the sums the pools need. Slot `nLayer` is the output.
@@ -669,7 +712,19 @@ export function plan(
   let gpuExperts = 0;
   let cpuWeights = 0;
   let layersOnGpu = 0;
-  for (let i = 0; i < nLayer; i++) {
+  for (let i = 0; i < nSlot; i++) {
+    // A loop slot shares its physical layer's weights: on a card it costs only
+    // its own cache. llama.cpp places weights by the PHYSICAL slot, so with a
+    // plain split every weight of Inkling sits on the first card.
+    if (i >= nLayer) {
+      if (slotOnGpu(i, off)) {
+        slotCostsB.push(kvOfLayer(i));
+        slotWeightsB.push(0);
+        slotKvB.push(kvOfLayer(i));
+        kvOnGpuB += kvOfLayer(i);
+      }
+      continue;
+    }
     const l = meta.layers[i];
     // Same reasoning as `kvPerToken`: these come out of the file, and a layer
     // whose experts are larger than the layer itself would otherwise make the
@@ -733,6 +788,10 @@ export function plan(
   // The attention mask, which is the term that makes a LARGE micro-batch
   // expensive at a LONG context — and the one this file was blind to.
   const maskB = attnMaskB(meta, s, ctx, ubatch);
+  // The per-device graph: the fitted activations plus the mask — or, on a
+  // looped model, its own measured graph (`loopGraphB`), which replaces both.
+  const loopB = loopGraphB(meta, ctx, ubatch, moeOnCpu);
+  const gpuGraphB = loopB > 0 ? loopB : ffActivation + maskB;
   // The hybrid residual (`hybridScratch`) was the mask's growth seen from
   // outside: measured at 2 bytes per pair on an older llama.cpp, the mask is
   // 8 today and the hybrid models' compute buffers grow at exactly the dense
@@ -752,8 +811,8 @@ export function plan(
   // is how a plan came to say "fits" on one line and "nowhere to go" on the
   // next. Per-device costs times the devices, plus the scratch once.
   const gpuCompute = usingGpu
-    ? ((sparse ? activation * 4 : 0) + ffActivation + BACKEND_CONTEXT_B +
-          scratchFloor(meta) + maskB + hybridB + mtp.perDeviceB) *
+    ? ((sparse ? activation * 4 : 0) + gpuGraphB + BACKEND_CONTEXT_B +
+          scratchFloor(meta) + hybridB + mtp.perDeviceB) *
         Math.max(1, hw.gpus.length) +
       mtp.onceB + computeScratch(meta, ubatch, ctx, slots)
     : 0;
@@ -800,8 +859,8 @@ export function plan(
   // is safe to promise is all of it.
   const scratchB = computeScratch(meta, ubatch, ctx, slots);
   const fixedPerDeviceB = usingGpu
-    ? BACKEND_CONTEXT_B + (sparse ? activation * 4 : 0) + ffActivation +
-      scratchFloor(meta) + maskB + hybridB + mtp.perDeviceB
+    ? BACKEND_CONTEXT_B + (sparse ? activation * 4 : 0) + gpuGraphB +
+      scratchFloor(meta) + hybridB + mtp.perDeviceB
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
 
@@ -1313,6 +1372,54 @@ export function hybridScratch(meta: ModelMeta, ctx: number): number {
   if (whole(meta.indexerTopK) > 0) return 0;
   if (whole(meta.ssmDInner) <= 0 || whole(meta.fullAttnInterval) < 2) return 0;
   return whole(ctx) * HYBRID_SCRATCH_B_PER_CTX;
+}
+
+/**
+ * A looped model's GPU compute buffer (Inkling-2), measured — the fitted graph
+ * under-billed it ~5x. llama.cpp 1.0-dev, Inkling-2-Mini Q4_K_M, one card,
+ * `-fa on`, the `CUDA0 compute buffer size` line:
+ *
+ *   experts in RAM   ctx     ub     measured    this
+ *   layers 0-5       32768   512     3545 MiB   3548
+ *   layers 0-11      32768   512     7137       7238
+ *   layers 0-17      32768   512    10903      10928
+ *   layers 0-23      32768   512    10903      10928
+ *   layers 0-23       8192   512     8527       8528
+ *   layers 0-23      32768  1024    14287      14476
+ *
+ * Two terms. Per micro-batch token, ~200 B per context token plus 0.68 MiB:
+ * the relative-position attention is materialised, where the fitted mask is 8
+ * B per pair. And each LOOPED layer whose experts are in RAM adds ~615 MiB,
+ * while a prelude or tail layer adds nothing (0-17 and 0-23 are identical) —
+ * every pass uploads its own copy. Ornith-35B with every expert in RAM: 476
+ * MiB, so this is the loop's, not llama.cpp's.
+ *
+ * Plus a flat 768 MiB outside every reported buffer: nvidia-smi read 18,130
+ * MiB for the first row's run, 742 more than its buffers and the 420 every
+ * card is already billed (`BACKEND_CONTEXT_B`) — CUDA graphs of an 11,161-node
+ * graph, most likely. One measurement, rounded up.
+ */
+const LOOP_GRAPH_B_PER_PAIR = 200;
+const LOOP_GRAPH_B_PER_UB = 0.68 * 1024 * 1024;
+const LOOP_GRAPH_B_PER_HOST_LAYER = 615 * 1024 * 1024;
+const LOOP_GRAPH_FLAT_B = 768 * 1024 * 1024;
+
+export function loopGraphB(
+  meta: ModelMeta,
+  ctx: number,
+  ubatch: number,
+  moeOnCpu: number,
+): number {
+  if (cacheSlots(meta) === whole(meta.nLayer)) return 0;
+  const start = whole(meta.loopStart ?? 0);
+  const end = whole(meta.loopEnd ?? 0);
+  const hostLooped = Math.max(0, Math.min(whole(moeOnCpu), end) - start);
+  return whole(
+    LOOP_GRAPH_FLAT_B +
+      whole(ubatch) *
+        (whole(ctx) * LOOP_GRAPH_B_PER_PAIR + LOOP_GRAPH_B_PER_UB) +
+      hostLooped * LOOP_GRAPH_B_PER_HOST_LAYER,
+  );
 }
 
 /** The flat, per-device part of a sparse-attention model's compute buffer. */

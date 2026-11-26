@@ -438,6 +438,14 @@ pub struct Gguf {
     /// Whether `attention.sliding_window_pattern` was present as a SCALAR —
     /// so "1" from the file and "absent" can be told apart.
     pub swa_pattern_stated: bool,
+    /// A looped core (`<arch>.loop.{start,end,count}`, Inkling-2's
+    /// `inkling2_loop`): layers `[start, end)` run `count` times per token on
+    /// SHARED weights. llama.cpp expands `n_layer` to the cache slots at load
+    /// (`models/inkling2-loop.cpp`), so every pass keeps its own KV — and `-ngl`
+    /// and `-ts` count those slots, not the `block_count` layers. 0 = no loop.
+    pub loop_start: u64,
+    pub loop_end: u64,
+    pub loop_count: u64,
 }
 
 fn kv_num(kv: &[(String, Val)], key: &str) -> Option<f64> {
@@ -671,6 +679,16 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
     let n_ff = a("feed_forward_length").unwrap_or(0.0) as u64;
     let n_ff_exp = a("expert_feed_forward_length").unwrap_or(0.0) as u64;
     let rope_freq_base = a("rope.freq_base").unwrap_or(0.0);
+    // Kept only when llama.cpp would accept the loop (`inkling2-loop.cpp`
+    // throws otherwise): a half-read loop would bill slots that never exist.
+    let (loop_start, loop_end, loop_count) = {
+        let (s, e, c) = (
+            a("loop.start").unwrap_or(0.0).max(0.0) as u64,
+            a("loop.end").unwrap_or(0.0).max(0.0) as u64,
+            a("loop.count").unwrap_or(0.0).max(0.0) as u64,
+        );
+        if s < e && e as usize <= n_layer && c >= 2 && c <= 64 { (s, e, c) } else { (0, 0, 0) }
+    };
 
     Ok(Gguf {
         version,
@@ -717,6 +735,9 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, usize> {
         value_length_swa,
         shared_kv_layers,
         swa_pattern_stated,
+        loop_start,
+        loop_end,
+        loop_count,
         vendor: if prism_keys || type_hist.iter().any(|(t, _)| *t == 142 || *t == 143) {
             "prism"
         } else {
@@ -744,6 +765,7 @@ pub fn to_json(g: &Gguf) -> String {
             "\"ropeFreqBase\":{},\"nTensors\":{},\"tensorBytes\":{},\"params\":{},\"embdBytes\":{},\"outputBytes\":{},",
             "\"unknownTypes\":{},\"nCtxOrig\":{},\"indexerTopK\":{},\"splitNo\":{},\"splitCount\":{},\"splitTensors\":{},\"vendor\":{},",
             "\"swaLayers\":[{}],\"headKvLayers\":[{}],\"keyLengthSwa\":{},\"valueLengthSwa\":{},\"sharedKvLayers\":{},\"swaPatternStated\":{},",
+            "\"loopStart\":{},\"loopEnd\":{},\"loopCount\":{},",
             "\"layers\":[{}]}}"
         ),
         g.version,
@@ -789,6 +811,9 @@ pub fn to_json(g: &Gguf) -> String {
         g.value_length_swa,
         g.shared_kv_layers,
         g.swa_pattern_stated,
+        g.loop_start,
+        g.loop_end,
+        g.loop_count,
         layers
     )
 }
@@ -1028,6 +1053,34 @@ mod tests {
         b.kv_u32("qwen4exp.block_count", 48);
         b.kv_u32("qwen4exp.full_attention_interval", 6);
         assert_eq!(parse(&b.0).unwrap().full_attn_interval, 6);
+    }
+
+    /// Inkling-2's looped core: the keys are read, and a loop llama.cpp would
+    /// refuse (one pass, an end past the layers) is dropped rather than billed.
+    #[test]
+    fn inkling_loop_keys() {
+        let mk = |start: u32, end: u32, count: u32| {
+            let mut b = Buf::new();
+            b.u64(0);
+            b.u64(5);
+            b.kv_str("general.architecture", "inkling2_loop");
+            b.kv_u32("inkling2_loop.block_count", 24);
+            b.kv_u32("inkling2_loop.loop.start", start);
+            b.kv_u32("inkling2_loop.loop.end", end);
+            b.kv_u32("inkling2_loop.loop.count", count);
+            let g = parse(&b.0).unwrap();
+            (g.loop_start, g.loop_end, g.loop_count)
+        };
+        assert_eq!(mk(6, 18, 3), (6, 18, 3));
+        assert_eq!(mk(6, 18, 1), (0, 0, 0), "one pass is not a loop");
+        assert_eq!(mk(6, 30, 3), (0, 0, 0), "end past block_count");
+        assert!(to_json(&parse(&{
+            let mut b = Buf::new();
+            b.u64(0);
+            b.u64(1);
+            b.kv_str("general.architecture", "llama");
+            b.0
+        }).unwrap()).contains("\"loopCount\":0"));
     }
 
     /// qwen4exp's PLE n-gram gather table is an INPUT tensor —

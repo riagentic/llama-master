@@ -443,6 +443,21 @@ Data flow worth knowing:
   a real child: the variable reaches the process and the inherited environment
   survives (Deno MERGES `env` over the parent's — a replace would strand the
   loader's PATH).
+- **A looped model has more cache SLOTS than layers, and `-ngl`/`-ts` count
+  slots.** Inkling-2 (`inkling2_loop`) runs layers `[loop.start, loop.end)`
+  `loop.count` times on shared weights; `models/inkling2-loop.cpp` expands
+  `n_layer` to `block_count + (count−1)·(end−start)` = 48 for Inkling-2-Mini's
+  24, each slot with its own KV and conv state, and the WEIGHTS stay with the
+  physical slots 0..23 — so a plain two-card split puts every weight on card 0
+  and only loop caches on card 1. `rust/src/gguf.rs` reads the three keys,
+  `plan.ts:cacheSlots/physLayer` follow llama.cpp's `layer_phys`, `speed.ts`
+  reads a looped layer once per pass. Its GPU compute buffer is its own and was
+  under-billed ~5x: `plan.ts:loopGraphB` (measured 6 points, +0.0..1.4%) — the
+  relative-position attention costs ~200 B per (context × micro-batch) pair, and
+  each LOOPED layer whose experts are in RAM adds ~615 MiB while a prelude or
+  tail layer adds nothing. Live check, Inkling-2-Mini Q4_K_M, one card,
+  `--n-cpu-moe 6`, 32K: plan 18,156 MiB, nvidia-smi 18,130. Inkling has no MTP
+  head (llama.cpp requires `n_layer_nextn == 0` for the loop).
 - **`-ngl` counts the output head, and never moves the embeddings.** There are
   `nLayer + 1` slots, so `-ngl 43` on a 43-layer model offloads layers 1..42 AND
   the output, leaving layer 0 on the host; only `-ngl > nLayer` takes every

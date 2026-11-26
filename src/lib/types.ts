@@ -60,6 +60,12 @@ export type ModelMeta = {
    *  llama.cpp substitutes a per-architecture default when it is absent
    *  (Gemma-3: 6), so the two must be told apart. */
   swaPatternStated?: boolean;
+  /** A looped core (Inkling-2, `<arch>.loop.*`): layers `[loopStart, loopEnd)`
+   *  run `loopCount` times per token on shared weights, each pass with its own
+   *  cache slot. 0/absent = no loop (`plan.ts:cacheSlots`). */
+  loopStart?: number;
+  loopEnd?: number;
+  loopCount?: number;
   /** Per-layer KV head counts when the file states them as an array. */
   headKvLayers?: number[];
   /** Head sizes of the windowed layers, when they differ (Gemma-4: 256

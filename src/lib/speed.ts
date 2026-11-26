@@ -22,7 +22,7 @@
 // Pure: bytes and bandwidths in, tokens per second out.
 
 import type { ModelMeta, Settings } from "./types.ts";
-import { kvTotal, whole } from "./plan.ts";
+import { cacheSlots, kvTotal, layerPasses, whole } from "./plan.ts";
 import type { Plan } from "./plan.ts";
 import { offloadRange, slotOnGpu } from "./devsplit.ts";
 import { num, str } from "./params.ts";
@@ -69,14 +69,17 @@ export function bytesPerToken(
     const expert = Math.min(whole(layer.expert), bytes);
     // `bytes` includes the expert bytes; the rest is attention and MLP.
     const dense = bytes - expert;
-    const activeExpert = expert * used;
+    // A looped layer runs once per pass, and each pass reads its weights again
+    // (and routes its own experts) — Inkling-2 reads 12 of its 24 layers 3x.
+    const passes = layerPasses(meta, i);
+    const activeExpert = expert * used * passes;
     // Layers are placed from the END of the model (see plan.ts), so the last
     // `onGpu` indices are the resident ones.
     const layerOnGpu = i >= nLayer - onGpu;
     // `--n-cpu-moe` holds the FIRST N layers' experts in RAM.
     const expertOnGpu = layerOnGpu && i >= moeOnCpu;
-    if (layerOnGpu) gpuB += dense;
-    else ramB += dense;
+    if (layerOnGpu) gpuB += dense * passes;
+    else ramB += dense * passes;
     if (expertOnGpu) gpuB += activeExpert;
     else ramB += activeExpert;
   }
@@ -96,7 +99,8 @@ export function bytesPerToken(
   // planner uses makes the speed projection describe the placement the bars
   // draw, whatever the `-ngl`.
   const ends = whole(meta.outputBytes);
-  if (nLayer > 0 && slotOnGpu(nLayer, offloadRange(nLayer, s))) gpuB += ends;
+  const nSlot = cacheSlots(meta);
+  if (nLayer > 0 && slotOnGpu(nSlot, offloadRange(nSlot, s))) gpuB += ends;
   else ramB += ends;
 
   // The KV cache is read in whole every token — except a sliding-window

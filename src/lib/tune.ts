@@ -22,7 +22,7 @@
 // can show all three placements side by side and the user can see what each one
 // costs before choosing.
 
-import { plan } from "./plan.ts";
+import { cacheSlots, plan } from "./plan.ts";
 import { isMtpName, type MtpSibling } from "./mtp.ts";
 import { offloadRange } from "./devsplit.ts";
 import { supportsFlag } from "./caps.ts";
@@ -339,9 +339,10 @@ function fitsRam(meta: ModelMeta, hw: Hw, s: Settings): boolean {
   return p.ram.overB === 0 && p.ram.freeB >= ramMarginB(availB);
 }
 
-/** Largest `-ngl` that still fits in VRAM (nLayer ≤ 1000, so a scan is fine). */
+/** Largest `-ngl` that still fits in VRAM (nLayer ≤ 1000, so a scan is fine).
+ *  Over the cache SLOTS, which is what `-ngl` counts (`plan.ts:cacheSlots`). */
 function maxLayers(meta: ModelMeta, hw: Hw, s: Settings): number {
-  for (let n = meta.nLayer; n >= 0; n--) {
+  for (let n = cacheSlots(meta); n >= 0; n--) {
     if (fitsVram(meta, hw, { ...s, ngl: n })) return n;
   }
   return 0;
@@ -453,14 +454,19 @@ function place(
   let n = maxLayers(meta, hw, withExperts);
   let ubatch = num(s, "ubatchSize");
   // A smaller micro-batch buys back the last few hundred MB of compute buffer.
-  if (n < meta.nLayer && ubatch > 256) {
+  // `-ngl` counts cache SLOTS, which on a looped model outnumber the layers.
+  const nSlot = cacheSlots(meta);
+  if (n < nSlot && ubatch > 256) {
     const n2 = maxLayers(meta, hw, { ...withExperts, ubatchSize: 256 });
     if (n2 > n) {
       n = n2;
       ubatch = 256;
     }
   }
-  if (n === 0) return null; // nothing on the GPU is not a hybrid placement
+  // Nothing on the GPU is not a hybrid placement — and on a looped model the
+  // first slots offloaded are pass caches, which hold no weights at all.
+  const physOnGpu = meta.nLayer - offloadRange(nSlot, { ...s, ngl: n }).start;
+  if (n === 0 || (nSlot > meta.nLayer && physOnGpu <= 0)) return null;
   const split: Settings = {
     ...s,
     ngl: n,
@@ -477,7 +483,7 @@ function place(
   // layers are ones that never reached the GPU at all. "The routed experts of
   // 32 of them" about 29 layers on the card was two numbers that could not both
   // be true (`devsplit.ts:offloadRange`).
-  const off = offloadRange(meta.nLayer, split);
+  const off = offloadRange(nSlot, split);
   const onGpu = Math.max(0, meta.nLayer - off.start);
   const movedExperts = Math.max(
     0,
@@ -959,7 +965,7 @@ export function tune(
   // Ternary-Bonsai-27B on PrismML's fork 1,966 against 1,212 — with ~3 GB
   // more VRAM spent per card at 4096. Generation identical throughout.
   const hostWeights = num(settings, "nCpuMoe") > 0 ||
-    num(settings, "ngl") <= meta.nLayer;
+    num(settings, "ngl") <= cacheSlots(meta);
   if (usesGpu && hostWeights && num(settings, "ubatchSize") === 512) {
     let grown = 0;
     for (const ub of [1024, 2048, 4096]) {
