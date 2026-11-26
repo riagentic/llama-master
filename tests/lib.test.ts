@@ -8357,3 +8357,20 @@ Deno.test("auth: the key is read off the argv the server runs with", async () =>
   assertEquals(authHeaders(""), {});
   assertEquals(authHeaders("a,b"), { authorization: "Bearer a" });
 });
+
+Deno.test("stability: a concrete LAN address or hostname with no key is as open as 0.0.0.0", () => {
+  for (const host of ["192.168.1.20", "my-box.local", "::ffff:0.0.0.0"]) {
+    const st = stability(meta(), hw(), { ...defaults(), host, apiKey: "" });
+    assert(
+      st.warnings.some((w) => w.key === "host" && w.severity === "risk"),
+      host,
+    );
+    assert(st.warnings.some((w) => w.key === "slots"), host);
+    const keyed = stability(meta(), hw(), { ...defaults(), host, apiKey: "k" });
+    assertEquals(keyed.warnings.some((w) => w.key === "host"), false, host);
+  }
+  for (const host of ["127.0.0.1", "localhost", "::1"]) {
+    const st = stability(meta(), hw(), { ...defaults(), host, apiKey: "" });
+    assertEquals(st.warnings.some((w) => w.key === "host"), false, host);
+  }
+});

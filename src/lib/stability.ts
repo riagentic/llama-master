@@ -11,6 +11,7 @@
 import { effectiveCtx, plan } from "./plan.ts";
 import { bool, num, str } from "./params.ts";
 import type { Hw, ModelMeta, Settings } from "./types.ts";
+import { isLanExposed } from "./lan.ts";
 
 export type Severity = "risk" | "caution";
 
@@ -259,14 +260,20 @@ export function stability(
     });
   }
 
-  const host = String(s.host ?? "");
-  const open = (host === "0.0.0.0" || host === "::") && !String(s.apiKey ?? "");
+  // The LAN switch's own definition of "exposed" (anything but loopback) —
+  // a concrete LAN address or a hostname is as reachable as the wildcard,
+  // and judging only 0.0.0.0/:: here left those reading "ok".
+  const open = isLanExposed(s) && !String(s.apiKey ?? "").trim();
   if (open) {
+    const host = String(s.host ?? "").trim();
     warnings.push({
       severity: "risk",
       key: "host",
-      message:
-        "Bound to every interface with no API key: anyone on the network can use this model, and read every prompt.",
+      message: `${
+        host === "0.0.0.0" || host === "::"
+          ? "Bound to every interface"
+          : `Reachable from the network at ${host}`
+      } with no API key: anyone on the network can use this model, and read every prompt.`,
     });
   }
   // /slots is on by default upstream and shows every prompt in flight — on a
