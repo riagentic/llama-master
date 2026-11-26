@@ -71,9 +71,10 @@ deno task am state hw.gpus       # question the running app
 cd client && deno task verify    # the client has its own gate
 ```
 
-**Tests:** 555 TypeScript (`deno task test`, plus 1 skipped) and 31 Rust
-(`deno task test:rust`), run locally — there is no CI. On a GPU-less Linux VM,
-552 of the 555 pass; the other 3 read the real machine's GPU and drivers.
+**Tests:** 593 TypeScript (`deno task test`, plus 1 skipped), 32 Rust
+(`deno task test:rust`) and 52 in the client, run locally — there is no CI.
+Three of them read the real machine's GPU and drivers, so a GPU-less machine
+fails those (seen on a Linux VM at v0.13).
 
 Everything the app writes lives in `~/.llama-master/`; set `LLAMA_MASTER_HOME`
 to move it (builds are gigabytes). The decisions worth knowing before changing
