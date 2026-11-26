@@ -331,3 +331,30 @@ Deno.test("highlight: the four distinctions, and their precedence", () => {
   assertEquals(kinds("value 42 'q'", "cobol"), ["number:42", "string:'q'"]);
   assertEquals(kinds("// not a comment here", "cobol"), []);
 });
+
+Deno.test("discover: a typed scheme or default port is kept, not replaced by the picker port", () => {
+  // A llama-server behind a TLS reverse proxy, or on port 80.
+  assertEquals(
+    baseUrl("https://llm.example.com", 18080),
+    "https://llm.example.com",
+  );
+  assert(hasPort("https://llm.example.com:443"));
+  assertEquals(
+    baseUrl("https://llm.example.com:443", 18080),
+    "https://llm.example.com",
+  );
+  assert(hasPort("myhost:80"));
+  assertEquals(baseUrl("myhost:80", 18080), "http://myhost");
+  assertEquals(baseUrl("http://myhost", 18080), "http://myhost");
+  assert(hasPort("[::1]:8080"));
+  assert(!hasPort("[::1]"));
+  assert(!hasPort("https://llm.example.com/v1"));
+  // The exact call conn.ts makes.
+  const connect = (h: string) => baseUrl(h, hasPort(h) ? undefined : 18080);
+  assertEquals(
+    connect("https://llm.example.com:443"),
+    "https://llm.example.com",
+  );
+  assertEquals(connect("myhost:80"), "http://myhost");
+  assertEquals(connect("192.168.1.9"), "http://192.168.1.9:18080");
+});

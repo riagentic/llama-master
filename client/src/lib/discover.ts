@@ -73,32 +73,36 @@ export function sweepHosts(ip: string): string[] {
 
 /** A base URL, normalised: scheme filled in, trailing slash removed, port
  *  applied when the text did not carry one. What the user typed is never used
- *  raw — "192.168.1.9" and "http://192.168.1.9:8080/" must reach one server. */
+ *  raw — "192.168.1.9" and "http://192.168.1.9:8080/" must reach one server.
+ *
+ *  The picker port is applied only to a BARE address — no scheme, no port. A
+ *  typed `https://` or `http://` already says where to go (443 / 80, the
+ *  reverse proxy in front of llama-server), and `URL` normalises a typed
+ *  `:443`/`:80` to no port at all, so asking it "was a port given?" erased
+ *  exactly the ports someone spells out and sent them to the picker's. */
 export function baseUrl(host: string, port?: number): string {
   const text = host.trim();
   if (!text) return "";
-  const withScheme = /^https?:\/\//i.test(text) ? text : `http://${text}`;
+  const schemed = /^https?:\/\//i.test(text);
+  const withScheme = schemed ? text : `http://${text}`;
   let u: URL;
   try {
     u = new URL(withScheme);
   } catch {
     return "";
   }
-  if (!u.port && port && port > 0) u.port = String(port);
+  if (!schemed && !hasPort(text) && port && port > 0) u.port = String(port);
   return `${u.protocol}//${u.host}`;
 }
 
-/** Does this text already name a port? Then a port picker must not override it. */
+/** Does this text already name a port? Then a port picker must not override it.
+ *
+ *  Read from the TEXT, not from `URL.port`: the parser drops a port that is the
+ *  scheme's default, so `myhost:80` and `https://x:443` read as "no port". */
 export function hasPort(host: string): boolean {
-  const text = host.trim();
-  if (!text) return false;
-  try {
-    return new URL(/^https?:\/\//i.test(text) ? text : `http://${text}`)
-      .port !==
-      "";
-  } catch {
-    return false;
-  }
+  const text = host.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const authority = (text.split(/[/?#]/)[0] ?? "").replace(/^.*@/, "");
+  return /^(?:\[[^\]]*\]|[^:\[\]]+):\d+$/.test(authority);
 }
 
 /**
