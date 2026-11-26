@@ -111,10 +111,13 @@ Deno.test({
     );
     assertEquals(srv.loadedModel(), "/models/fixture.gguf");
     assertEquals(srv.props?.n_ctx, 8192);
-    assert(
-      srv.log.some((l) => l.includes("listening")),
-      `the child's stdout reaches the log; got ${JSON.stringify(srv.log)}`,
-    );
+    // The pipe is read on its own schedule, and the stub can answer /health
+    // before its "listening" line is through it: wait for the line, as the
+    // log on screen does.
+    await waitFor(async () => {
+      await srv.poll();
+      return srv.log.some((l) => l.includes("listening"));
+    }, `the child's stdout to reach the log (${JSON.stringify(srv.log)})`);
     assert(
       srv.log[0]?.startsWith("$ "),
       "the log opens with the exact command",
