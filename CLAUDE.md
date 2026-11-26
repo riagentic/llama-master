@@ -458,6 +458,16 @@ Data flow worth knowing:
   tail layer adds nothing. Live check, Inkling-2-Mini Q4_K_M, one card,
   `--n-cpu-moe 6`, 32K: plan 18,156 MiB, nvidia-smi 18,130. Inkling has no MTP
   head (llama.cpp requires `n_layer_nextn == 0` for the loop).
+- **llama.cpp 1.0's expert cache pays only with its CPU share at 1.**
+  `--moe-cache-mib` keeps the most-used of the experts `--n-cpu-moe` holds in
+  RAM on the card. Upstream's default `--moe-cache-cpu-share 0` uploads every
+  miss over PCIe and was a LOSS (Flash-Next, all experts in RAM, one card, 5 GB:
+  16.5 → 13.6 tok/s, ~49% hit rate, 382 GB copied in one bench); at 1 it is a
+  gain, two interleaved pairs: 15.6 → 17.6 prose, 16.1 → 17.7 code. So `tune.ts`
+  sets both together, only for a build that declares both, from whole GiB the
+  placement left free AFTER it kept whole expert layers on the card (a resident
+  layer always hits; the cache is the remainder), and `plan.ts` bills it once to
+  the pool and whole to each card's budget.
 - **`-ngl` counts the output head, and never moves the embeddings.** There are
   `nLayer + 1` slots, so `-ngl 43` on a 43-layer model offloads layers 1..42 AND
   the output, leaving layer 0 on the host; only `-ngl > nLayer` takes every

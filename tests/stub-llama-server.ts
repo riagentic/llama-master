@@ -53,6 +53,8 @@ if (args.includes("--help")) {
     "--cpu-strict <0|1>                      use strict CPU placement (default: 0)",
     "-ngl N                                  gpu layers",
     "--n-cpu-moe N                           moe layers on cpu",
+    "--moe-cache-mib N                       moe expert cache",
+    "--moe-cache-cpu-share F                 moe cache misses on cpu",
     "--fit TYPE                              llama.cpp auto-fit",
     "-sm TYPE                                split mode",
     "-ts FNAME                               tensor split",

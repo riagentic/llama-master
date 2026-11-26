@@ -810,8 +810,13 @@ export function plan(
   // to stay that way: one number for the bar and a different one for the packer
   // is how a plan came to say "fits" on one line and "nowhere to go" on the
   // next. Per-device costs times the devices, plus the scratch once.
+  // llama.cpp 1.0's `--moe-cache-mib`: VRAM for host experts, counted once.
+  const moeCacheB = usingGpu && moeOnCpu > 0
+    ? Math.max(0, num(s, "moeCacheMib")) * 1024 * 1024
+    : 0;
   const gpuCompute = usingGpu
-    ? ((sparse ? activation * 4 : 0) + gpuGraphB + BACKEND_CONTEXT_B +
+    ? moeCacheB +
+      ((sparse ? activation * 4 : 0) + gpuGraphB + BACKEND_CONTEXT_B +
           scratchFloor(meta) + hybridB + mtp.perDeviceB) *
         Math.max(1, hw.gpus.length) +
       mtp.onceB + computeScratch(meta, ubatch, ctx, slots)
@@ -858,9 +863,11 @@ export function plan(
   // "can this card hold whatever share it is handed", and the only share that
   // is safe to promise is all of it.
   const scratchB = computeScratch(meta, ubatch, ctx, slots);
+  // The expert cache is divided between the cards like the layers, and each
+  // card is budgeted for all of it — the same pessimism as the scratch above.
   const fixedPerDeviceB = usingGpu
     ? BACKEND_CONTEXT_B + (sparse ? activation * 4 : 0) + gpuGraphB +
-      scratchFloor(meta) + hybridB + mtp.perDeviceB
+      scratchFloor(meta) + hybridB + mtp.perDeviceB + moeCacheB
     : 0;
   const perDeviceOverheadB = usingGpu ? fixedPerDeviceB + scratchB : 0;
 
